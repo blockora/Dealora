@@ -1,0 +1,9 @@
+# Build output and dependencies
+dist/
+node_modules/
+coverage/
+bun.lock
+
+# Markdown is hand-maintained (including the source-of-truth documents
+# DEALORA_BLUEPRINT.md and ROADMAP.md) and must not be auto-formatted.
+**/*.md

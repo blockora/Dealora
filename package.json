@@ -1,0 +1,39 @@
+{
+  "name": "dealora",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DEALORA — AI Revenue Operating System. Turns a revenue goal into an evidence-backed, permission-controlled, measurable and continuously optimized revenue workflow.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/blockora/Dealora.git"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22",
+    "bun": ">=1.1.0"
+  },
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "typecheck": "tsc -b --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "sh ./scripts/verify.sh"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.11.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.9",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.71.0",
+    "vitest": "^5.0.3"
+  }
+}

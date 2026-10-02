@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Environment — never commit real secrets.
+# Local environment files are provided by the host environment;
+# only .env.example (a placeholder template) belongs in the repository.
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
