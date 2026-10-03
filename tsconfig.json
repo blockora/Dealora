@@ -9,6 +9,7 @@
     { "path": "packages/goal" },
     { "path": "packages/plan" },
     { "path": "packages/account" },
+    { "path": "packages/research" },
     { "path": "packages/api" }
   ]
 }

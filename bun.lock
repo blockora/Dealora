@@ -34,6 +34,7 @@
         "@dealora/db": "workspace:*",
         "@dealora/goal": "workspace:*",
         "@dealora/plan": "workspace:*",
+        "@dealora/research": "workspace:*",
       },
     },
     "packages/auth": {
@@ -79,6 +80,15 @@
         "@dealora/db": "workspace:*",
       },
     },
+    "packages/research": {
+      "name": "@dealora/research",
+      "version": "0.1.0",
+      "dependencies": {
+        "@dealora/account": "workspace:*",
+        "@dealora/core": "workspace:*",
+        "@dealora/db": "workspace:*",
+      },
+    },
   },
   "packages": {
     "@cacheable/memory": ["@cacheable/memory@2.2.0", "", { "dependencies": { "@cacheable/utils": "^2.5.0", "@keyv/bigmap": "^1.3.1", "hookified": "^1.15.1", "keyv": "^5.6.0" } }, "sha512-CTLKqLItRCEixEAewD3/j9DB3/o96gpTPD4eJ1v+DGOlxZRZncRQkGYqqnAGCscYd6RNeXfGeiuCphsPtqyIfQ=="],
@@ -100,6 +110,8 @@
     "@dealora/goal": ["@dealora/goal@workspace:packages/goal"],
 
     "@dealora/plan": ["@dealora/plan@workspace:packages/plan"],
+
+    "@dealora/research": ["@dealora/research@workspace:packages/research"],
 
     "@eslint-community/eslint-utils": ["@eslint-community/eslint-utils@4.10.1", "", { "dependencies": { "eslint-visitor-keys": "^3.4.3" }, "peerDependencies": { "eslint": "^6.0.0 || ^7.0.0 || >=8.0.0" } }, "sha512-cuadcxVFE8sDK6iWJbs8Sn0av2Nrh2QSGQhVlBW9AaAHqHwjWsZHT8LJ4hFGPh7ASBV2deFdM7H/DPjulmh8rg=="],
 
