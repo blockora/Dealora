@@ -35,6 +35,7 @@
         "@dealora/evidence": "workspace:*",
         "@dealora/goal": "workspace:*",
         "@dealora/plan": "workspace:*",
+        "@dealora/qualification": "workspace:*",
         "@dealora/research": "workspace:*",
       },
     },
@@ -91,6 +92,17 @@
         "@dealora/db": "workspace:*",
       },
     },
+    "packages/qualification": {
+      "name": "@dealora/qualification",
+      "version": "0.1.0",
+      "dependencies": {
+        "@dealora/account": "workspace:*",
+        "@dealora/core": "workspace:*",
+        "@dealora/db": "workspace:*",
+        "@dealora/evidence": "workspace:*",
+        "@dealora/research": "workspace:*",
+      },
+    },
     "packages/research": {
       "name": "@dealora/research",
       "version": "0.1.0",
@@ -123,6 +135,8 @@
     "@dealora/goal": ["@dealora/goal@workspace:packages/goal"],
 
     "@dealora/plan": ["@dealora/plan@workspace:packages/plan"],
+
+    "@dealora/qualification": ["@dealora/qualification@workspace:packages/qualification"],
 
     "@dealora/research": ["@dealora/research@workspace:packages/research"],
 

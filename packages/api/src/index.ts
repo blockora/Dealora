@@ -28,3 +28,18 @@ export { createDefaultHandlers } from "./wiring.js";
  * a response without depending on the domain package directly.
  */
 export type { Evidence, EvidenceError, EvidenceStatus, AccountClaim } from "@dealora/evidence";
+
+/**
+ * The Qualification domain's public surface, re-exported so API consumers can
+ * type a qualification response without depending on the domain package
+ * directly.
+ */
+export type {
+  Qualification,
+  QualificationCriteriaView,
+  QualificationCriterionResult,
+  QualificationDimension,
+  QualificationDimensionResult,
+  QualificationError,
+  QualificationState,
+} from "@dealora/qualification";

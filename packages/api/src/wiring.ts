@@ -9,6 +9,12 @@ import { createAccountService } from "@dealora/account";
 import { AccountRecordProvider, createResearchService } from "@dealora/research";
 import type { ResearchProvider } from "@dealora/research";
 import { createEvidenceService } from "@dealora/evidence";
+import {
+  createQualificationService,
+  toGoalSnapshot,
+  toIcpSnapshot,
+  toPlanReader,
+} from "@dealora/qualification";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -203,6 +209,35 @@ export function createDefaultHandlers(options?: {
      * scoring, ranking and outreach are Phases 8-11.
      */
     evidence: createEvidenceService(store as never),
+    /**
+     * Qualification reads three narrow things from the rest of the system: the
+     * canonical ICP's target terms, the time window of a Revenue Goal, and the
+     * provenance of the plan an account was sourced against.
+     *
+     * Each read is authorized before it is used, so an evaluation can never be
+     * measured against another tenant's target, and the engine never sees a
+     * whole Business Brain or a whole plan.
+     */
+    qualification: createQualificationService(
+      store as never,
+      (workspaceId, userId) => {
+        const auth = store.authorize(workspaceId, userId);
+        if (!auth.ok) {
+          throw new Error(`business brain unavailable: ${auth.error.code}`);
+        }
+        const icp = store.getIcp(workspaceId, userId);
+        if (!icp.ok) throw new Error(`icp unavailable: ${icp.error.code}`);
+        return icp.value === null ? null : toIcpSnapshot(icp.value);
+      },
+      (goalId, userId) => {
+        const goal = store.getRevenueGoal(goalId, userId);
+        return goal.ok ? { ok: true, value: toGoalSnapshot(goal.value) } : goal;
+      },
+      toPlanReader((planId, userId) => {
+        const plan = store.getRevenuePlan(planId, userId);
+        return plan.ok ? plan.value : null;
+      }),
+    ),
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());

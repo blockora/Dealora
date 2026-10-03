@@ -18,6 +18,8 @@ import { RESEARCH_REQUEST_STATUSES } from "@dealora/research";
 import type { ResearchError, ResearchService } from "@dealora/research";
 import { ACCOUNT_CLAIM_STATUSES, EVIDENCE_STATUSES } from "@dealora/evidence";
 import type { EvidenceError, EvidenceService } from "@dealora/evidence";
+import { SUPPORTED_RULE_VERSIONS } from "@dealora/qualification";
+import type { QualificationError, QualificationService } from "@dealora/qualification";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -176,6 +178,25 @@ function fromEvidenceError(error: EvidenceError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `QualificationError` into the safe API error envelope.
+ *
+ * `UNAVAILABLE` is an internal condition and is never surfaced verbatim. An
+ * `UNSUPPORTED_RULE_VERSION` is the caller's mistake rather than ours, so it
+ * reads as a validation failure; an `INVALID_TRANSITION` conflicts with the
+ * record's current state, exactly as the goal, plan and research layers do.
+ */
+function fromQualificationError(error: QualificationError): ApiError {
+  if (error.code === "UNAVAILABLE") {
+    return { code: "SERVER_ERROR", message: "unexpected failure" };
+  }
+  const code: ApiErrorCode =
+    error.code === "UNSUPPORTED_RULE_VERSION" ? "VALIDATION_ERROR" : (error.code as ApiErrorCode);
+  const mapped: ApiError = { code, message: error.message };
+  if (error.details) mapped.details = error.details;
+  return mapped;
+}
+
 /** Parse a JSON body, tolerating already-parsed objects. */
 async function parseBody(req: RequestBody): Promise<Record<string, unknown> | ApiError> {
   const raw = req.body;
@@ -207,6 +228,7 @@ export interface HandlerDeps {
   account: AccountService;
   research: ResearchService;
   evidence: EvidenceService;
+  qualification: QualificationService;
   resolveSession: SessionResolver;
 }
 
@@ -1436,6 +1458,145 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok({ claim: result.value }) };
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 8 — Qualification Engine
+  //
+  // These handlers decide nothing. They resolve the authenticated actor,
+  // take the account from the route, and hand the work to the qualification
+  // service, which reads the criteria from the canonical Business Brain and
+  // the account's own Phase 7 evidence.
+  //
+  // Nothing about the outcome is accepted from a caller. A `score`, `state`,
+  // `confidence`, `priority` or `qualification` field in a body is not read:
+  // the server computes the result or there is no result. The two fields a body
+  // may carry — `revenueGoalId` and `ruleVersion` — select *which of the
+  // workspace's own context* to measure against, and both are validated
+  // server-side against the real goal and the rule versions this deployment
+  // implements.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Evaluate an account and return the explainable result.
+   *
+   * Evaluation creates a new versioned record; it never overwrites an earlier
+   * one, so a score a user acted on stays readable after the rules move on.
+   */
+  const createQualificationHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const accountId = param(req, "accountId");
+      if (isApiError(accountId)) return { ok: false, error: accountId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      // Only the context selectors are read. `workspaceId`, `userId` and
+      // `accountId` in the body are ignored in favour of the route's and the
+      // token's.
+      const result = deps.qualification.evaluateAccount(workspaceId, actor.userId, accountId, {
+        revenueGoalId: body.revenueGoalId,
+        ruleVersion: body.ruleVersion,
+      });
+      if (!result.ok) return { ok: false, error: fromQualificationError(result.error) };
+      return { ok: true, value: ok({ qualification: result.value }) };
+    });
+
+  /**
+   * The criteria this workspace would be measured against, before any
+   * evaluation.
+   *
+   * A `ruleVersion` may be asked for explicitly and is validated against what
+   * this deployment implements; when it is omitted the current rule set is
+   * described, so a caller never has to know a version number to inspect the
+   * rules.
+   */
+  const getQualificationCriteriaHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+
+      const requested = req.query.ruleVersion;
+      if (requested !== undefined && typeof requested !== "string") {
+        return Promise.resolve({
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "ruleVersion must be one of: " + SUPPORTED_RULE_VERSIONS.join(", "),
+          },
+        });
+      }
+      const result = deps.qualification.describeQualificationCriteria(workspaceId, actor.userId, {
+        ruleVersion: requested,
+      });
+      if (!result.ok)
+        return Promise.resolve({ ok: false, error: fromQualificationError(result.error) });
+      return Promise.resolve({ ok: true, value: ok(result.value) });
+    });
+
+  /** One evaluation, with its per-criterion results intact. */
+  const getQualificationHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.qualification.getQualification(id, actor.userId);
+      if (!result.ok)
+        return Promise.resolve({ ok: false, error: fromQualificationError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ qualification: result.value }) });
+    });
+
+  /**
+   * A workspace's evaluations, newest first, optionally narrowed to one
+   * account, state or rule version.
+   */
+  const listQualificationsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+
+      const accountId =
+        typeof req.query.accountId === "string" && req.query.accountId !== ""
+          ? req.query.accountId
+          : undefined;
+      const state =
+        typeof req.query.state === "string" && req.query.state !== "" ? req.query.state : undefined;
+      const ruleVersion =
+        typeof req.query.ruleVersion === "string" && req.query.ruleVersion !== ""
+          ? req.query.ruleVersion
+          : undefined;
+
+      const filter: { accountId?: string; state?: string; ruleVersion?: string } = {};
+      if (accountId) filter.accountId = accountId;
+      if (state) filter.state = state;
+      if (ruleVersion) filter.ruleVersion = ruleVersion;
+
+      const result = deps.qualification.listQualifications(
+        workspaceId,
+        actor.userId,
+        Object.keys(filter).length > 0 ? filter : undefined,
+      );
+      if (!result.ok)
+        return Promise.resolve({ ok: false, error: fromQualificationError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ qualifications: result.value }) });
+    });
+
+  /**
+   * Why an account received a score: the evaluation together with the claim and
+   * evidence records each criterion actually read.
+   *
+   * This is the phase's gate in one read — "a user can inspect why an account
+   * received a score" — and it is a join over Phase 7's records rather than a
+   * copy of them.
+   */
+  const getQualificationExplanationHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.qualification.inspectQualification(id, actor.userId);
+      if (!result.ok)
+        return Promise.resolve({ ok: false, error: fromQualificationError(result.error) });
+      return Promise.resolve({ ok: true, value: ok(result.value) });
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -1507,6 +1668,11 @@ export function createHandlers(deps: HandlerDeps) {
     listAccountClaimsHandler,
     listClaimEvidenceHandler,
     changeAccountClaimStatusHandler,
+    createQualificationHandler,
+    getQualificationCriteriaHandler,
+    getQualificationHandler,
+    listQualificationsHandler,
+    getQualificationExplanationHandler,
   };
 }
 

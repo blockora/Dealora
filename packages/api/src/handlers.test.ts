@@ -17,11 +17,46 @@ import {
 } from "@dealora/research";
 import type { ResearchProvider } from "@dealora/research";
 import { createEvidenceService } from "@dealora/evidence";
+import {
+  createQualificationService,
+  toGoalSnapshot,
+  toIcpSnapshot,
+  toPlanReader,
+} from "@dealora/qualification";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
 import type { RevenueGoal } from "@dealora/db";
 import type { ApiError, ApiResponse, RequestBody } from "./types.js";
+
+/**
+ * Wire the Qualification service the way the production wiring does.
+ *
+ * The readers are the same narrow ones `createDefaultHandlers` builds: the ICP's
+ * target terms, a goal's time window, and a plan's provenance. Route tests then
+ * exercise the real service rather than a stand-in.
+ */
+function qualificationService(store: Store, clock?: () => Date) {
+  return createQualificationService(
+    store as never,
+    (workspaceId, userId) => {
+      const auth = store.authorize(workspaceId, userId);
+      if (!auth.ok) throw new Error("business brain unavailable");
+      const icp = store.getIcp(workspaceId, userId);
+      if (!icp.ok) throw new Error("icp unavailable");
+      return icp.value === null ? null : toIcpSnapshot(icp.value);
+    },
+    (goalId, userId) => {
+      const goal = store.getRevenueGoal(goalId, userId);
+      return goal.ok ? { ok: true, value: toGoalSnapshot(goal.value) } : goal;
+    },
+    toPlanReader((planId, userId) => {
+      const plan = store.getRevenuePlan(planId, userId);
+      return plan.ok ? plan.value : null;
+    }),
+    clock,
+  );
+}
 
 /**
  * Two tenants with real sessions. The session resolver maps tokens to a user
@@ -123,6 +158,7 @@ function fixture(options?: {
       ...(options?.researchProviders ?? []),
     ]),
     evidence: createEvidenceService(store as never, options?.evidenceClock),
+    qualification: qualificationService(store, options?.evidenceClock),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -599,6 +635,7 @@ describe("API Revenue Goal routes", () => {
       ),
       research: createResearchService(store as never),
       evidence: createEvidenceService(store as never),
+      qualification: qualificationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -929,6 +966,7 @@ describe("API Revenue Plan routes", () => {
       ),
       research: createResearchService(store as never),
       evidence: createEvidenceService(store as never),
+      qualification: qualificationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1089,6 +1127,7 @@ describe("API Business Brain routes", () => {
   });
 
   it("maps a storage failure to SERVER_ERROR without leaking internals", async () => {
+    const failingStore = new Store(emptyState());
     const failing = {
       identity: {
         signup: () => ({ user: {} as never, token: "" }),
@@ -1139,6 +1178,7 @@ describe("API Business Brain routes", () => {
       evidence: createEvidenceService({
         authorize: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       } as never),
+      qualification: qualificationService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1475,6 +1515,7 @@ describe("API Account & Contact routes", () => {
       ),
       research: createResearchService(store as never),
       evidence: createEvidenceService(store as never),
+      qualification: qualificationService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1778,6 +1819,7 @@ describe("API Research routes", () => {
         authorize: () => ({ ok: true as const, value: {} }),
         listEvidence: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       } as never),
+      qualification: qualificationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -1825,6 +1867,7 @@ describe("API Research routes", () => {
         authorize: () => ({ ok: true as const, value: {} }),
         listEvidence: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       } as never),
+      qualification: qualificationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -2379,5 +2422,583 @@ describe("API Evidence routes", () => {
       ),
     ]);
     for (const denial of denials) expect(denial.code).toBe("UNAUTHENTICATED");
+  });
+});
+
+describe("API Qualification routes", () => {
+  type QualificationRow = {
+    id: string;
+    workspaceId: string;
+    accountId: string;
+    createdBy: string;
+    version: number;
+    ruleVersion: string;
+    revenuePlanId: string | null;
+    revenueGoalId: string | null;
+    icpId: string | null;
+    contextDigest: string;
+    state: string;
+    score: number | null;
+    confidence: string | null;
+    reason: string;
+    evidenceIds: string[];
+    claimIds: string[];
+    conflictedClaimIds: string[];
+    evaluatedAt: string;
+    dimensions: {
+      dimension: string;
+      score: number | null;
+      result: string;
+      reason: string;
+      confidence: string | null;
+      resolvedCriteria: number;
+      criteria: {
+        criterion: string;
+        expectation: string;
+        observed: string | null;
+        result: string;
+        reason: string;
+        confidence: string | null;
+        evidenceIds: string[];
+        claimIds: string[];
+      }[];
+    }[];
+  };
+
+  /** A workspace with an ICP, a goal, a plan and an account, all real. */
+  async function qualifyFixture(options?: { evidenceClock?: () => Date }) {
+    const context = fixture(options);
+    const { handlers, tokenA, workspaceA } = context;
+    const icp = (await dataOf(
+      handlers.upsertIcpHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: {
+            industries: ["saas"],
+            companySizes: ["120 employees"],
+            geographies: ["united kingdom"],
+            businessModels: ["subscription"],
+            disqualifiers: ["agency"],
+          },
+        }),
+      ),
+    )) as { icp: { id: string } };
+    const offer = (await dataOf(
+      handlers.createOfferHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: { name: "AI automation", description: "Automates the revenue motion" },
+        }),
+      ),
+    )) as { offer: { id: string } };
+    const goal = (await dataOf(
+      handlers.createRevenueGoalHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: {
+            objective: "Generate $80,000 of pipeline from US SaaS companies",
+            targetMetric: "pipeline",
+            targetValue: 80000,
+            currency: "USD",
+            timeWindow: { start: "2026-07-01", end: "2026-12-31" },
+            market: "B2B SaaS",
+            offerId: offer.offer.id,
+            icpId: icp.icp.id,
+            successMetrics: [{ kind: "pipeline", target: 80000, unit: "USD" }],
+          },
+        }),
+      ),
+    )) as { goal: RevenueGoal };
+    const plan = (await dataOf(
+      handlers.compileRevenuePlanHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: { revenueGoalId: goal.goal.id },
+        }),
+      ),
+    )) as { plan: { id: string } };
+    const account = (await dataOf(
+      handlers.createAccountHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: {
+            name: "Northwind Trading",
+            website: "https://northwind.example",
+            revenuePlanId: plan.plan.id,
+          },
+        }),
+      ),
+    )) as { account: { id: string } };
+    return {
+      ...context,
+      icpId: icp.icp.id,
+      goalId: goal.goal.id,
+      planId: plan.plan.id,
+      accountId: account.account.id,
+    };
+  }
+
+  /** Record evidence for one account field, exactly as Phase 7 stores it. */
+  async function evidenceFor(
+    handlers: ReturnType<typeof createHandlers>,
+    token: string,
+    workspaceId: string,
+    accountId: string,
+    body: Record<string, unknown>,
+  ) {
+    return dataOf(
+      handlers.recordUserEvidenceHandler(
+        request({ token, params: { workspaceId, accountId }, body }),
+      ),
+    );
+  }
+
+  const completeEvidence = (
+    handlers: ReturnType<typeof createHandlers>,
+    token: string,
+    workspaceId: string,
+    accountId: string,
+  ) =>
+    Promise.all([
+      evidenceFor(handlers, token, workspaceId, accountId, {
+        category: "industry",
+        field: "industry",
+        value: "B2B SaaS",
+        claimKind: "fact",
+        sourceName: "company_registry",
+        confidence: "high",
+        relevance: "high",
+      }),
+      evidenceFor(handlers, token, workspaceId, accountId, {
+        category: "company_overview",
+        field: "geography",
+        value: "United Kingdom",
+        claimKind: "fact",
+        sourceName: "company_registry",
+        confidence: "high",
+        relevance: "high",
+      }),
+      evidenceFor(handlers, token, workspaceId, accountId, {
+        category: "company_overview",
+        field: "company_size",
+        value: "120 employees",
+        claimKind: "fact",
+        sourceName: "company_registry",
+        confidence: "high",
+        relevance: "high",
+      }),
+      evidenceFor(handlers, token, workspaceId, accountId, {
+        category: "business_model",
+        field: "model",
+        value: "Subscription",
+        claimKind: "fact",
+        sourceName: "company_registry",
+        confidence: "high",
+        relevance: "high",
+      }),
+      evidenceFor(handlers, token, workspaceId, accountId, {
+        category: "hiring",
+        field: "open_roles",
+        value: "Hiring a support operations lead.",
+        claimKind: "fact",
+        sourceName: "company_registry",
+        confidence: "high",
+        relevance: "high",
+        observedAt: "2026-09-15T00:00:00.000Z",
+      }),
+      evidenceFor(handlers, token, workspaceId, accountId, {
+        category: "technology_signals",
+        field: "stack_change",
+        value: "Moved its helpdesk to a new vendor.",
+        claimKind: "fact",
+        sourceName: "company_registry",
+        confidence: "high",
+        relevance: "high",
+        observedAt: "2026-09-15T00:00:00.000Z",
+      }),
+      evidenceFor(handlers, token, workspaceId, accountId, {
+        category: "leadership_changes",
+        field: "new_leader",
+        value: "Appointed a VP of Revenue in September.",
+        claimKind: "fact",
+        sourceName: "company_registry",
+        confidence: "high",
+        relevance: "high",
+        observedAt: "2026-09-15T00:00:00.000Z",
+      }),
+      evidenceFor(handlers, token, workspaceId, accountId, {
+        category: "expansion",
+        field: "new_region",
+        value: "Opened a new region in October.",
+        claimKind: "fact",
+        sourceName: "company_registry",
+        confidence: "high",
+        relevance: "high",
+        observedAt: "2026-09-15T00:00:00.000Z",
+      }),
+    ]);
+
+  it("evaluates an account and returns an explainable, evidence-backed score", async () => {
+    const { handlers, tokenA, workspaceA, accountId, goalId, icpId } = await qualifyFixture({
+      evidenceClock: () => new Date("2026-10-03T12:00:00.000Z"),
+    });
+    await completeEvidence(handlers, tokenA, workspaceA, accountId);
+
+    const created = (await dataOf(
+      handlers.createQualificationHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA, accountId }, body: {} }),
+      ),
+    )) as { qualification: QualificationRow };
+
+    const qualification = created.qualification;
+    expect(qualification.state).toBe("qualified");
+    expect(qualification.score).toBe(100);
+    expect(qualification.confidence).toBe("high");
+    expect(qualification.version).toBe(1);
+    expect(qualification.workspaceId).toBe(workspaceA);
+    expect(qualification.icpId).toBe(icpId);
+    expect(qualification.revenueGoalId).toBe(goalId);
+    expect(qualification.ruleVersion).toBe("deterministic-1.0.0");
+    expect(qualification.contextDigest).toMatch(/^fnv1a-/);
+    expect(qualification.evaluatedAt).toBe("2026-10-03T12:00:00.000Z");
+    expect(qualification.dimensions).toHaveLength(5);
+    expect(qualification.dimensions.map((dimension) => dimension.dimension)).toEqual([
+      "icp_fit",
+      "need_fit",
+      "buying_signal",
+      "timing",
+      "company_fit",
+    ]);
+    // ROADMAP.md §15: every score carries a reason, its evidence and a confidence.
+    for (const dimension of qualification.dimensions) {
+      expect(dimension.reason.length).toBeGreaterThan(0);
+      expect(["pass", "fail", "unknown"]).toContain(dimension.result);
+      for (const criterion of dimension.criteria) {
+        expect(criterion.reason.length).toBeGreaterThan(0);
+        expect(criterion.expectation.length).toBeGreaterThan(0);
+        expect(["pass", "fail", "unknown"]).toContain(criterion.result);
+      }
+    }
+    expect(qualification.evidenceIds.length).toBeGreaterThan(0);
+    expect(qualification.claimIds.length).toBeGreaterThan(0);
+  });
+
+  it("returns insufficient_data, with no score, for an un-researched account", async () => {
+    const { handlers, tokenA, workspaceA, accountId } = await qualifyFixture();
+    const created = (await dataOf(
+      handlers.createQualificationHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA, accountId }, body: {} }),
+      ),
+    )) as { qualification: QualificationRow };
+
+    expect(created.qualification.state).toBe("insufficient_data");
+    expect(created.qualification.score).toBeNull();
+    expect(created.qualification.confidence).toBeNull();
+    expect(created.qualification.evidenceIds).toEqual([]);
+    for (const dimension of created.qualification.dimensions) {
+      expect(dimension.result).toBe("unknown");
+      expect(dimension.score).toBeNull();
+    }
+  });
+
+  it("lets a user inspect why an account received a score", async () => {
+    const { handlers, tokenA, workspaceA, accountId } = await qualifyFixture({
+      evidenceClock: () => new Date("2026-10-03T12:00:00.000Z"),
+    });
+    await completeEvidence(handlers, tokenA, workspaceA, accountId);
+    const created = (await dataOf(
+      handlers.createQualificationHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA, accountId }, body: {} }),
+      ),
+    )) as { qualification: QualificationRow };
+
+    const explained = (await dataOf(
+      handlers.getQualificationExplanationHandler(
+        request({ token: tokenA, params: { id: created.qualification.id } }),
+      ),
+    )) as {
+      qualification: QualificationRow;
+      claims: { id: string; value: string }[];
+      evidence: { id: string; sourceName: string; confidence: string }[];
+    };
+
+    expect(explained.qualification.id).toBe(created.qualification.id);
+    // Every claim and evidence record the decision read comes back with it.
+    expect(explained.claims).toHaveLength(created.qualification.claimIds.length);
+    expect(explained.evidence).toHaveLength(created.qualification.evidenceIds.length);
+    expect(explained.claims.some((claim) => claim.value === "B2B SaaS")).toBe(true);
+    expect(explained.evidence.every((record) => record.sourceName === "company_registry")).toBe(
+      true,
+    );
+    // And the criterion that read them points at exactly those records.
+    const icpFit = explained.qualification.dimensions.find(
+      (dimension) => dimension.dimension === "icp_fit",
+    );
+    const industry = icpFit?.criteria.find((criterion) => criterion.criterion === "industry_match");
+    expect(industry?.evidenceIds[0]).toBeDefined();
+    expect(explained.evidence.some((record) => record.id === industry?.evidenceIds[0])).toBe(true);
+  });
+
+  it("exposes the criteria before an account is evaluated", async () => {
+    const { handlers, tokenA, workspaceA, icpId } = await qualifyFixture();
+    const view = (await dataOf(
+      handlers.getQualificationCriteriaHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA } }),
+      ),
+    )) as {
+      ruleVersion: string;
+      supportedRuleVersions: string[];
+      dimensions: {
+        dimension: string;
+        label: string;
+        criteria: { criterion: string; expectation: string }[];
+      }[];
+    };
+
+    expect(view.ruleVersion).toBe("deterministic-1.0.0");
+    expect(view.supportedRuleVersions).toContain("deterministic-1.0.0");
+    expect(view.dimensions.map((dimension) => dimension.label)).toEqual([
+      "ICP Fit",
+      "Need Fit",
+      "Buying Signal",
+      "Timing",
+      "Company Fit",
+    ]);
+    expect(icpId.length).toBeGreaterThan(0);
+    const industry = view.dimensions
+      .flatMap((dimension) => dimension.criteria)
+      .find((criterion) => criterion.criterion === "industry_match");
+    expect(industry?.expectation).toContain("saas");
+  });
+
+  it("keeps a historical evaluation readable and adds a new one on re-evaluation", async () => {
+    const { handlers, tokenA, workspaceA, accountId } = await qualifyFixture({
+      evidenceClock: () => new Date("2026-10-03T12:00:00.000Z"),
+    });
+    const first = (await dataOf(
+      handlers.createQualificationHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA, accountId }, body: {} }),
+      ),
+    )) as { qualification: QualificationRow };
+    expect(first.qualification.state).toBe("insufficient_data");
+
+    await completeEvidence(handlers, tokenA, workspaceA, accountId);
+    const second = (await dataOf(
+      handlers.createQualificationHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA, accountId }, body: {} }),
+      ),
+    )) as { qualification: QualificationRow };
+    expect(second.qualification.version).toBe(2);
+    expect(second.qualification.state).toBe("qualified");
+
+    // The earlier record is untouched.
+    const reread = (await dataOf(
+      handlers.getQualificationHandler(
+        request({ token: tokenA, params: { id: first.qualification.id } }),
+      ),
+    )) as { qualification: QualificationRow };
+    expect(reread.qualification.state).toBe("insufficient_data");
+    expect(reread.qualification.version).toBe(1);
+
+    const listed = (await dataOf(
+      handlers.listQualificationsHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA }, query: { accountId } }),
+      ),
+    )) as { qualifications: QualificationRow[] };
+    expect(listed.qualifications.map((entry) => entry.version)).toEqual([2, 1]);
+  });
+
+  it("never lets a caller supply the score, the state or the criteria", async () => {
+    const { handlers, tokenA, workspaceA, accountId } = await qualifyFixture({
+      evidenceClock: () => new Date("2026-10-03T12:00:00.000Z"),
+    });
+    const injected = (await dataOf(
+      handlers.createQualificationHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, accountId },
+          body: {
+            score: 100,
+            state: "qualified",
+            confidence: "high",
+            priority: 10,
+            dimensions: [{ dimension: "icp_fit", score: 100, result: "pass" }],
+            ruleVersion: "deterministic-1.0.0",
+            workspaceId: "some-other-workspace",
+            userId: "some-other-user",
+          },
+        }),
+      ),
+    )) as { qualification: QualificationRow };
+
+    // Nothing asserted was accepted: with no evidence the result is still the
+    // honest one, and it is attributed to the route's workspace.
+    expect(injected.qualification.state).toBe("insufficient_data");
+    expect(injected.qualification.score).toBeNull();
+    expect(injected.qualification.workspaceId).toBe(workspaceA);
+    expect(injected.qualification.createdBy).not.toBe("some-other-user");
+    expect(
+      injected.qualification.dimensions[0]?.criteria.every(
+        (criterion) => criterion.result === "unknown",
+      ),
+    ).toBe(true);
+  });
+
+  it("refuses an unsupported rule version", async () => {
+    const { handlers, tokenA, workspaceA, accountId } = await qualifyFixture();
+    const error = await errorOf(
+      handlers.createQualificationHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, accountId },
+          body: { ruleVersion: "llm-ranked-1" },
+        }),
+      ),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("rejects an unknown state filter rather than silently ignoring it", async () => {
+    const { handlers, tokenA, workspaceA } = await qualifyFixture();
+    const error = await errorOf(
+      handlers.listQualificationsHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA }, query: { state: "hot" } }),
+      ),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("enforces workspace authorization on every qualification route", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB, accountId, goalId } =
+      await qualifyFixture({
+        evidenceClock: () => new Date("2026-10-03T12:00:00.000Z"),
+      });
+    await completeEvidence(handlers, tokenA, workspaceA, accountId);
+    const created = (await dataOf(
+      handlers.createQualificationHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA, accountId }, body: {} }),
+      ),
+    )) as { qualification: QualificationRow };
+
+    const denials = await Promise.all([
+      errorOf(
+        handlers.createQualificationHandler(
+          request({ token: tokenB, params: { workspaceId: workspaceB, accountId }, body: {} }),
+        ),
+      ),
+      errorOf(
+        handlers.getQualificationHandler(
+          request({ token: tokenB, params: { id: created.qualification.id } }),
+        ),
+      ),
+      errorOf(
+        handlers.getQualificationExplanationHandler(
+          request({ token: tokenB, params: { id: created.qualification.id } }),
+        ),
+      ),
+      errorOf(
+        handlers.listQualificationsHandler(
+          request({ token: tokenB, params: { workspaceId: workspaceA } }),
+        ),
+      ),
+      errorOf(
+        handlers.getQualificationCriteriaHandler(
+          request({ token: tokenB, params: { workspaceId: workspaceA } }),
+        ),
+      ),
+      // A goal from another tenant cannot be borrowed as context.
+      errorOf(
+        handlers.createQualificationHandler(
+          request({
+            token: tokenB,
+            params: { workspaceId: workspaceB, accountId },
+            body: { revenueGoalId: goalId },
+          }),
+        ),
+      ),
+    ]);
+
+    for (const denial of denials) {
+      expect(["UNAUTHORIZED", "NOT_FOUND", "VALIDATION_ERROR"]).toContain(denial.code);
+      expect(JSON.stringify(denial)).not.toContain("Northwind");
+      expect(JSON.stringify(denial)).not.toContain("company_registry");
+    }
+
+    // And tenant B sees an empty world.
+    const listed = (await dataOf(
+      handlers.listQualificationsHandler(
+        request({ token: tokenB, params: { workspaceId: workspaceB } }),
+      ),
+    )) as { qualifications: QualificationRow[] };
+    expect(listed.qualifications).toEqual([]);
+  });
+
+  it("requires an unauthenticated caller to authenticate first", async () => {
+    const { handlers, workspaceA, accountId } = await qualifyFixture();
+    const error = await errorOf(
+      handlers.createQualificationHandler(
+        request({ token: "", params: { workspaceId: workspaceA, accountId }, body: {} }),
+      ),
+    );
+    expect(error.code).toBe("UNAUTHENTICATED");
+  });
+
+  it("never surfaces a qualification storage failure to the caller", async () => {
+    const store = new Store(emptyState());
+    const handlers = createHandlers({
+      identity: {
+        signup: () => ({ user: {} as never, token: "" }),
+        authenticate: () => ({ user: {} as never, token: "" }),
+        listWorkspaces: () => ({ ok: true as const, value: [] }),
+        getWorkspace: () => ({ ok: true as const, value: {} as never }),
+        authorize: () => ({ ok: true as const, value: {} as never }),
+        updateWorkspace: () => ({ ok: true as const, value: {} as never }),
+        getUser: () => ({ ok: true as const, value: {} as never }),
+      },
+      brain: new BusinessBrainService(store as unknown as BrainRepository),
+      goal: new RevenueGoalService(store as unknown as GoalRepository, deterministicGoalParser),
+      brainContext: () => ({
+        workspaceId: "w1",
+        company: null,
+        offers: [],
+        icp: null,
+        personas: [],
+      }),
+      planContext: () => readPlanBrain(store, "w1", "u1"),
+      plan: new RevenuePlanService(
+        store as unknown as PlanRepository,
+        deterministicPlanCompiler,
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        () => readPlanBrain(store, "w1", "u1"),
+      ),
+      account: new AccountService(store as unknown as AccountRepository, () => ({
+        ok: false,
+        error: { code: "UNAVAILABLE" },
+      })),
+      research: createResearchService(store as never),
+      evidence: createEvidenceService(store as never),
+      qualification: createQualificationService(
+        {
+          authorize: () => ({ ok: true as const, value: {} }),
+          listQualifications: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as never,
+        () => null,
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      ),
+      resolveSession: () => ({ userId: "u1" }),
+    });
+
+    const error = await errorOf(
+      handlers.listQualificationsHandler(request({ token: "t", params: { workspaceId: "w1" } })),
+    );
+    expect(error.code).toBe("SERVER_ERROR");
+    expect(error.message).toBe("unexpected failure");
+    expect(JSON.stringify(error)).not.toContain("UNAVAILABLE");
   });
 });
