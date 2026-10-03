@@ -11,6 +11,9 @@
     ".": "./dist/index.js",
     "./types": "./dist/types.js"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@dealora/core": "workspace:*",
+    "@dealora/db": "workspace:*"
+  },
   "devDependencies": {}
 }
