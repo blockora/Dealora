@@ -5,6 +5,7 @@ import { createBusinessBrainService } from "@dealora/brain";
 import { createRevenueGoalService } from "@dealora/goal";
 import { createRevenuePlanService } from "@dealora/plan";
 import type { PlanBrainSnapshot } from "@dealora/plan";
+import { createAccountService } from "@dealora/account";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -168,6 +169,15 @@ export function createDefaultHandlers(): ReturnType<typeof createHandlers> {
         personas: personas.value.map((p) => ({ id: p.id, title: p.title })),
       };
     },
+    /**
+     * The Account domain reads one narrow thing from the plan layer: which
+     * workspace a plan belongs to. It never compiles, approves or executes a
+     * plan, so an account can never make a plan run.
+     */
+    account: createAccountService(
+      store as never,
+      (revenuePlanId, userId) => store.getRevenuePlan(revenuePlanId, userId) as never,
+    ),
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());

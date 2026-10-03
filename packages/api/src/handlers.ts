@@ -12,8 +12,11 @@ import { GOAL_STATUSES } from "@dealora/goal";
 import type { GoalError, RevenueGoalService } from "@dealora/goal";
 import { PLAN_STATUSES } from "@dealora/plan";
 import type { PlanBrainReader, PlanError, RevenuePlanService } from "@dealora/plan";
+import { ACCOUNT_STATUSES, CONTACT_STATUSES } from "@dealora/account";
+import type { AccountError, AccountService } from "@dealora/account";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
+import type { AccountStatus, ContactStatus } from "@dealora/db";
 
 import type {
   ApiError,
@@ -107,6 +110,21 @@ function fromPlanError(error: PlanError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `AccountError` into the safe API error envelope.
+ *
+ * `UNAVAILABLE` is an internal condition and is never surfaced verbatim: the
+ * caller learns only that something unexpected happened.
+ */
+function fromAccountError(error: AccountError): ApiError {
+  if (error.code === "UNAVAILABLE") {
+    return { code: "SERVER_ERROR", message: "unexpected failure" };
+  }
+  const mapped: ApiError = { code: error.code as ApiErrorCode, message: error.message };
+  if (error.details) mapped.details = error.details;
+  return mapped;
+}
+
 /** Parse a JSON body, tolerating already-parsed objects. */
 async function parseBody(req: RequestBody): Promise<Record<string, unknown> | ApiError> {
   const raw = req.body;
@@ -135,6 +153,7 @@ export interface HandlerDeps {
   brainContext: BrainContextReader;
   plan: RevenuePlanService;
   planContext: PlanBrainReader;
+  account: AccountService;
   resolveSession: SessionResolver;
 }
 
@@ -791,6 +810,235 @@ export function createHandlers(deps: HandlerDeps) {
       return Promise.resolve({ ok: true, value: ok({ context: result.value }) });
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 5 — Account & Prospect Input
+  //
+  // Input only. These handlers store what the user supplies: they never look
+  // anything up externally, never score a record and never contact anyone.
+  // -------------------------------------------------------------------------
+
+  /** Create a target account from user-supplied fields. */
+  const createAccountHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      // Only the account fields are read. A `workspaceId` or `userId` in the
+      // body is ignored: the workspace is the route's, the identity the token's.
+      const result = deps.account.createAccount(workspaceId, actor.userId, body);
+      if (!result.ok) return { ok: false, error: fromAccountError(result.error) };
+      return { ok: true, value: ok({ account: result.value }) };
+    });
+
+  const listAccountsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const rawStatus = req.query.status;
+      let status: AccountStatus | undefined;
+      if (typeof rawStatus === "string" && rawStatus !== "") {
+        if (!ACCOUNT_STATUSES.includes(rawStatus as AccountStatus)) {
+          return Promise.resolve({
+            ok: false,
+            error: { code: "VALIDATION_ERROR", message: "invalid status filter" },
+          });
+        }
+        status = rawStatus as AccountStatus;
+      }
+      const revenuePlanId =
+        typeof req.query.revenuePlanId === "string" && req.query.revenuePlanId !== ""
+          ? req.query.revenuePlanId
+          : undefined;
+
+      const result = deps.account.listAccounts(
+        workspaceId,
+        actor.userId,
+        status ? { status } : revenuePlanId ? { revenuePlanId } : undefined,
+      );
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromAccountError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ accounts: result.value }) });
+    });
+
+  const getAccountHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.account.getAccount(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromAccountError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ account: result.value }) });
+    });
+
+  const updateAccountHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const result = deps.account.updateAccount(id, actor.userId, body);
+      if (!result.ok) return { ok: false, error: fromAccountError(result.error) };
+      return { ok: true, value: ok({ account: result.value }) };
+    });
+
+  /** Archive an account. Its contacts are archived with it; nothing is deleted. */
+  const archiveAccountHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.account.archiveAccount(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromAccountError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ account: result.value }) });
+    });
+
+  /** The accounts one revenue plan targeted. */
+  const listPlanAccountsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const revenuePlanId = param(req, "revenuePlanId");
+      if (isApiError(revenuePlanId)) return Promise.resolve({ ok: false, error: revenuePlanId });
+      const result = deps.account.listAccountsForPlan(revenuePlanId, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromAccountError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ accounts: result.value }) });
+    });
+
+  /**
+   * Import accounts from CSV.
+   *
+   * The response reports every row; a caller is told what landed, what updated,
+   * what was skipped and what failed, so nothing is ever dropped silently.
+   */
+  const importAccountsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const csv = body.csv;
+      if (typeof csv !== "string") {
+        return {
+          ok: false,
+          error: { code: "VALIDATION_ERROR", message: "csv must be a string" },
+        };
+      }
+      const options: { sourceReference?: string; revenuePlanId?: string } = {};
+      if (typeof body.sourceReference === "string") options.sourceReference = body.sourceReference;
+      if (typeof body.revenuePlanId === "string") options.revenuePlanId = body.revenuePlanId;
+      const result = deps.account.importAccountsCsv(workspaceId, actor.userId, csv, options);
+      if (!result.ok) return { ok: false, error: fromAccountError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  const importContactsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const csv = body.csv;
+      if (typeof csv !== "string") {
+        return {
+          ok: false,
+          error: { code: "VALIDATION_ERROR", message: "csv must be a string" },
+        };
+      }
+      const contactOptions: { sourceReference?: string } = {};
+      if (typeof body.sourceReference === "string")
+        contactOptions.sourceReference = body.sourceReference;
+      const result = deps.account.importContactsCsv(workspaceId, actor.userId, csv, contactOptions);
+      if (!result.ok) return { ok: false, error: fromAccountError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * Add a contact to an account.
+   *
+   * The account may come from the route (`POST /accounts/:id/contacts`) or the
+   * body. Either way the account must belong to the caller's workspace, which
+   * the service checks against the authenticated identity.
+   */
+  const createContactHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const accountId = req.params.accountId ?? body.accountId;
+
+      const result = deps.account.createContact(workspaceId, actor.userId, {
+        ...body,
+        accountId,
+      });
+      if (!result.ok) return { ok: false, error: fromAccountError(result.error) };
+      return { ok: true, value: ok({ contact: result.value }) };
+    });
+
+  const listAccountContactsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const accountId = param(req, "accountId");
+      if (isApiError(accountId)) return Promise.resolve({ ok: false, error: accountId });
+      const result = deps.account.listContactsForAccount(accountId, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromAccountError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ contacts: result.value }) });
+    });
+
+  const listContactsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const rawStatus = req.query.status;
+      let status: ContactStatus | undefined;
+      if (typeof rawStatus === "string" && rawStatus !== "") {
+        if (!CONTACT_STATUSES.includes(rawStatus as ContactStatus)) {
+          return Promise.resolve({
+            ok: false,
+            error: { code: "VALIDATION_ERROR", message: "invalid status filter" },
+          });
+        }
+        status = rawStatus as ContactStatus;
+      }
+      const accountId =
+        typeof req.query.accountId === "string" && req.query.accountId !== ""
+          ? req.query.accountId
+          : undefined;
+
+      const result = deps.account.listContacts(
+        workspaceId,
+        actor.userId,
+        status ? { status } : accountId ? { accountId } : undefined,
+      );
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromAccountError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ contacts: result.value }) });
+    });
+
+  const getContactHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.account.getContact(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromAccountError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ contact: result.value }) });
+    });
+
+  const updateContactHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const result = deps.account.updateContact(id, actor.userId, body);
+      if (!result.ok) return { ok: false, error: fromAccountError(result.error) };
+      return { ok: true, value: ok({ contact: result.value }) };
+    });
+
+  const archiveContactHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.account.archiveContact(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromAccountError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ contact: result.value }) });
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -832,6 +1080,20 @@ export function createHandlers(deps: HandlerDeps) {
     getRevenuePlanHistoryHandler,
     changeRevenuePlanStatusHandler,
     archiveRevenuePlanHandler,
+    createAccountHandler,
+    listAccountsHandler,
+    getAccountHandler,
+    updateAccountHandler,
+    archiveAccountHandler,
+    listPlanAccountsHandler,
+    importAccountsHandler,
+    importContactsHandler,
+    createContactHandler,
+    listAccountContactsHandler,
+    listContactsHandler,
+    getContactHandler,
+    updateContactHandler,
+    archiveContactHandler,
   };
 }
 

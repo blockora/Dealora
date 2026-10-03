@@ -8,6 +8,8 @@ import { RevenueGoalService, deterministicGoalParser } from "@dealora/goal";
 import type { GoalRepository } from "@dealora/goal";
 import { RevenuePlanService, deterministicPlanCompiler } from "@dealora/plan";
 import type { PlanBrainSnapshot, PlanRepository } from "@dealora/plan";
+import { AccountService } from "@dealora/account";
+import type { AccountRepository } from "@dealora/account";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -99,6 +101,10 @@ function fixture(): {
       deterministicPlanCompiler,
       (goalId, userId) => store.getRevenueGoal(goalId, userId) as never,
       (workspaceId, userId) => readPlanBrain(store, workspaceId, userId),
+    ),
+    account: new AccountService(
+      store as unknown as AccountRepository,
+      (revenuePlanId, userId) => store.getRevenuePlan(revenuePlanId, userId) as never,
     ),
     resolveSession: (token) => {
       const userId = sessions.get(token);
@@ -567,6 +573,12 @@ describe("API Revenue Goal routes", () => {
           throw new Error("business brain unavailable");
         },
       ),
+      account: new AccountService(
+        {
+          authorize: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as unknown as AccountRepository,
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      ),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -891,6 +903,10 @@ describe("API Revenue Plan routes", () => {
           throw new Error("business brain unavailable");
         },
       ),
+      account: new AccountService(
+        { authorize: () => ({ ok: true as const, value: {} }) } as unknown as AccountRepository,
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      ),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1086,6 +1102,12 @@ describe("API Business Brain routes", () => {
           throw new Error("business brain unavailable");
         },
       ),
+      account: new AccountService(
+        {
+          authorize: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as unknown as AccountRepository,
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      ),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1093,5 +1115,342 @@ describe("API Business Brain routes", () => {
     const error = await errorOf(handlers.listWorkspacesHandler(request({ token: "t" })));
     expect(error.code).toBe("SERVER_ERROR");
     expect(error.message).toBe("unexpected failure");
+  });
+});
+
+describe("API Account & Contact routes", () => {
+  type AccountRow = {
+    id: string;
+    name: string;
+    domain: string | null;
+    source: string;
+    sourceReference: string | null;
+    status: string;
+    workspaceId: string;
+    revenuePlanId: string | null;
+  };
+  type ContactRow = {
+    id: string;
+    accountId: string;
+    fullName: string;
+    email: string | null;
+    status: string;
+    workspaceId: string;
+  };
+
+  const accountFrom = (data: unknown): AccountRow => (data as { account: AccountRow }).account;
+  const contactFrom = (data: unknown): ContactRow => (data as { contact: ContactRow }).contact;
+
+  it("creates, reads, updates and archives an account", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+
+    const created = accountFrom(
+      await dataOf(
+        handlers.createAccountHandler(
+          request({
+            token: tokenA,
+            params: { workspaceId: workspaceA },
+            body: { name: "Northwind Trading", website: "https://northwind.example" },
+          }),
+        ),
+      ),
+    );
+    expect(created.domain).toBe("northwind.example");
+    expect(created.source).toBe("manual");
+    expect(created.workspaceId).toBe(workspaceA);
+
+    const fetched = accountFrom(
+      await dataOf(
+        handlers.getAccountHandler(request({ token: tokenA, params: { id: created.id } })),
+      ),
+    );
+    expect(fetched.name).toBe("Northwind Trading");
+
+    const updated = accountFrom(
+      await dataOf(
+        handlers.updateAccountHandler(
+          request({ token: tokenA, params: { id: created.id }, body: { geography: "UK" } }),
+        ),
+      ),
+    );
+    expect((updated as unknown as Record<string, unknown>).geography).toBe("UK");
+
+    const archived = accountFrom(
+      await dataOf(
+        handlers.archiveAccountHandler(request({ token: tokenA, params: { id: created.id } })),
+      ),
+    );
+    expect(archived.status).toBe("archived");
+
+    const listed = (await dataOf(
+      handlers.listAccountsHandler(request({ token: tokenA, params: { workspaceId: workspaceA } })),
+    )) as { accounts: AccountRow[] };
+    expect(listed.accounts.length).toBe(1);
+  });
+
+  it("never trusts a workspaceId or userId supplied in the body", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB, userB } = fixture();
+
+    const created = accountFrom(
+      await dataOf(
+        handlers.createAccountHandler(
+          request({
+            token: tokenA,
+            params: { workspaceId: workspaceA },
+            body: {
+              name: "Northwind",
+              domain: "northwind.example",
+              workspaceId: workspaceB,
+              userId: userB,
+              createdBy: userB,
+            },
+          }),
+        ),
+      ),
+    );
+
+    // The account landed in the route's workspace, owned by the token's user.
+    expect(created.workspaceId).toBe(workspaceA);
+    const fromB = (await dataOf(
+      handlers.listAccountsHandler(request({ token: tokenB, params: { workspaceId: workspaceB } })),
+    )) as { accounts: AccountRow[] };
+    expect(fromB.accounts).toEqual([]);
+  });
+
+  it("denies another tenant's account and contact", async () => {
+    const { handlers, tokenA, tokenB, workspaceA } = fixture();
+    const account = accountFrom(
+      await dataOf(
+        handlers.createAccountHandler(
+          request({
+            token: tokenA,
+            params: { workspaceId: workspaceA },
+            body: { name: "Private Co", domain: "private.example" },
+          }),
+        ),
+      ),
+    );
+    const contact = contactFrom(
+      await dataOf(
+        handlers.createContactHandler(
+          request({
+            token: tokenA,
+            params: { workspaceId: workspaceA, accountId: account.id },
+            body: { firstName: "Ada", email: "ada@private.example" },
+          }),
+        ),
+      ),
+    );
+
+    const read = await errorOf(
+      handlers.getAccountHandler(request({ token: tokenB, params: { id: account.id } })),
+    );
+    expect(read.code).toBe("UNAUTHORIZED");
+
+    const readContact = await errorOf(
+      handlers.getContactHandler(request({ token: tokenB, params: { id: contact.id } })),
+    );
+    expect(readContact.code).toBe("UNAUTHORIZED");
+
+    const update = await errorOf(
+      handlers.updateAccountHandler(
+        request({ token: tokenB, params: { id: account.id }, body: { industry: "Retail" } }),
+      ),
+    );
+    expect(update.code).toBe("UNAUTHORIZED");
+
+    const list = await errorOf(
+      handlers.listAccountsHandler(request({ token: tokenB, params: { workspaceId: workspaceA } })),
+    );
+    expect(list.code).toBe("UNAUTHORIZED");
+  });
+
+  it("refuses a contact on an account outside the caller's workspace", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB } = fixture();
+    const account = accountFrom(
+      await dataOf(
+        handlers.createAccountHandler(
+          request({
+            token: tokenA,
+            params: { workspaceId: workspaceA },
+            body: { name: "Northwind", domain: "northwind.example" },
+          }),
+        ),
+      ),
+    );
+
+    // B points its own workspace at A's account id.
+    const error = await errorOf(
+      handlers.createContactHandler(
+        request({
+          token: tokenB,
+          params: { workspaceId: workspaceA },
+          body: { accountId: account.id, firstName: "Mallory", email: "m@evil.example" },
+        }),
+      ),
+    );
+    // Denied before the account is even resolved, so nothing is disclosed.
+    expect(error.code).toBe("UNAUTHORIZED");
+
+    // In B's own workspace the same account id simply does not exist.
+    const ownWorkspace = await errorOf(
+      handlers.createContactHandler(
+        request({
+          token: tokenB,
+          params: { workspaceId: workspaceB },
+          body: { accountId: account.id, firstName: "Mallory", email: "m@evil.example" },
+        }),
+      ),
+    );
+    expect(ownWorkspace.code).toBe("NOT_FOUND");
+  });
+
+  it("imports accounts and contacts from CSV with a per-row result", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+
+    const accounts = (await dataOf(
+      handlers.importAccountsHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: {
+            csv: [
+              "name,website,industry,source_reference",
+              "Northwind,https://northwind.example,Wholesale,q1-list.csv",
+              ",https://nameless.example,Wholesale,q1-list.csv",
+            ].join("\n"),
+            sourceReference: "q1-list.csv",
+          },
+        }),
+      ),
+    )) as {
+      total: number;
+      created: number;
+      updated: number;
+      skipped: number;
+      failed: number;
+      results: { row: number; status: string; reason?: string }[];
+    };
+    expect(accounts.total).toBe(2);
+    expect(accounts.created).toBe(1);
+    expect(accounts.failed).toBe(1);
+    expect(accounts.results[1]?.reason).toBe("invalid");
+
+    const listed = (await dataOf(
+      handlers.listAccountsHandler(request({ token: tokenA, params: { workspaceId: workspaceA } })),
+    )) as { accounts: AccountRow[] };
+    expect(listed.accounts).toHaveLength(1);
+    expect(listed.accounts[0]?.source).toBe("csv");
+    expect(listed.accounts[0]?.sourceReference).toBe("q1-list.csv");
+
+    const contacts = (await dataOf(
+      handlers.importContactsHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: {
+            csv: [
+              "account,first_name,last_name,email",
+              `${listed.accounts[0]?.id ?? ""},Ada,Wong,ada@northwind.example`,
+              ",Nobody,Here,nobody@nowhere.example",
+            ].join("\n"),
+          },
+        }),
+      ),
+    )) as { created: number; failed: number; results: { reason?: string }[] };
+    expect(contacts.created).toBe(1);
+    expect(contacts.failed).toBe(1);
+    expect(contacts.results[1]?.reason).toBe("missing_account_reference");
+
+    const atAccount = (await dataOf(
+      handlers.listAccountContactsHandler(
+        request({ token: tokenA, params: { accountId: listed.accounts[0]?.id ?? "" } }),
+      ),
+    )) as { contacts: ContactRow[] };
+    expect(atAccount.contacts.map((c) => c.fullName)).toEqual(["Ada Wong"]);
+
+    const all = (await dataOf(
+      handlers.listContactsHandler(request({ token: tokenA, params: { workspaceId: workspaceA } })),
+    )) as { contacts: ContactRow[] };
+    expect(all.contacts).toHaveLength(1);
+  });
+
+  it("rejects a non-CSV import body and a bad filter", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+
+    const notCsv = await errorOf(
+      handlers.importAccountsHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA }, body: { csv: 42 } }),
+      ),
+    );
+    expect(notCsv.code).toBe("VALIDATION_ERROR");
+
+    const badStatus = await errorOf(
+      handlers.listAccountsHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA }, query: { status: "hot" } }),
+      ),
+    );
+    expect(badStatus.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("maps an account storage failure to SERVER_ERROR", async () => {
+    const store = new Store(emptyState());
+    const failing = {
+      identity: {
+        signup: () => ({ user: {} as never, token: "" }),
+        authenticate: () => ({ user: {} as never, token: "" }),
+        listWorkspaces: () => ({ ok: true as const, value: [] }),
+        getWorkspace: () => ({ ok: true as const, value: {} as never }),
+        authorize: () => ({ ok: true as const, value: {} as never }),
+        updateWorkspace: () => ({ ok: true as const, value: {} as never }),
+        getUser: () => ({ ok: true as const, value: {} as never }),
+      },
+      brain: new BusinessBrainService(store as unknown as BrainRepository),
+      goal: new RevenueGoalService(store as unknown as GoalRepository, deterministicGoalParser),
+      brainContext: () => ({
+        workspaceId: "w1",
+        company: null,
+        offers: [],
+        icp: null,
+        personas: [],
+      }),
+      planContext: () => ({
+        workspaceId: "w1",
+        company: null,
+        offers: [],
+        icp: null,
+        personas: [],
+        positioning: null,
+        brandVoice: null,
+        approvedClaims: [],
+        withheldClaims: { unverified: 0, restricted: 0 },
+      }),
+      plan: new RevenuePlanService(
+        {
+          authorize: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as unknown as PlanRepository,
+        deterministicPlanCompiler,
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        () => {
+          throw new Error("business brain unavailable");
+        },
+      ),
+      account: new AccountService(
+        {
+          authorize: () => ({ ok: true as const, value: {} }),
+          listAccounts: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as unknown as AccountRepository,
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      ),
+      resolveSession: () => ({ userId: "u1" }),
+    };
+
+    const handlers = createHandlers(failing);
+    const error = await errorOf(
+      handlers.listAccountsHandler(request({ token: "t", params: { workspaceId: "w1" } })),
+    );
+    expect(error.code).toBe("SERVER_ERROR");
+    expect(error.message).toBe("unexpected failure");
+    expect(JSON.stringify(error)).not.toContain("UNAVAILABLE");
   });
 });

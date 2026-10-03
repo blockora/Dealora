@@ -12,6 +12,7 @@
     "./types": "./dist/types.js"
   },
   "dependencies": {
+    "@dealora/account": "workspace:*",
     "@dealora/auth": "workspace:*",
     "@dealora/brain": "workspace:*",
     "@dealora/core": "workspace:*",
