@@ -13,6 +13,8 @@ import type {
   Positioning,
   RevenueGoal,
   RevenueGoalEvent,
+  RevenuePlan,
+  RevenuePlanStatus,
   User,
   Workspace,
   WorkspaceMember,
@@ -91,7 +93,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 3;
+export const LATEST_SCHEMA_VERSION = 4;
 
 export interface DbState {
   schemaVersion?: number;
@@ -107,6 +109,7 @@ export interface DbState {
   claims?: Claim[];
   revenueGoals?: RevenueGoal[];
   revenueGoalEvents?: RevenueGoalEvent[];
+  revenuePlans?: RevenuePlan[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -127,6 +130,7 @@ export function emptyState(): CompleteDbState {
     claims: [],
     revenueGoals: [],
     revenueGoalEvents: [],
+    revenuePlans: [],
   };
 }
 
@@ -173,6 +177,11 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.revenueGoalEvents;
   }
 
+  // Phase 4 adds plan storage. Additive: existing goal rows are untouched.
+  if (version >= 4) {
+    state.revenuePlans = Array.isArray(input.revenuePlans) ? input.revenuePlans : base.revenuePlans;
+  }
+
   return state;
 }
 
@@ -204,6 +213,7 @@ type RowTable =
   | "profiles"
   | "revenueGoals"
   | "revenueGoalEvents"
+  | "revenuePlans"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -1165,6 +1175,140 @@ export class Store {
     this.save();
   }
 
+  // --- Revenue plans (Phase 4) ---
+
+  /**
+   * The next version number for a goal's plan lineage.
+   *
+   * Versions are 1-based and never reused, so recompiling a goal produces a
+   * new version instead of overwriting the previous plan.
+   */
+  nextRevenuePlanVersion(revenueGoalId: EntityId): Result<number, StorageError> {
+    const versions = this.rows("revenuePlans")
+      .filter((p) => p.revenueGoalId === revenueGoalId)
+      .map((p) => p.version);
+    return { ok: true, value: versions.length === 0 ? 1 : Math.max(...versions) + 1 };
+  }
+
+  createRevenuePlan(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    plan: Omit<
+      RevenuePlan,
+      "id" | "workspaceId" | "createdBy" | "version" | "createdAt" | "updatedAt"
+    >;
+  }): Result<RevenuePlan, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+    // The plan may only reference a goal in its own workspace.
+    const goal = this.findById("revenueGoals", input.plan.revenueGoalId);
+    if (!goal || goal.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("NOT_FOUND", "revenue goal not found") };
+    }
+    const next = this.nextRevenuePlanVersion(input.plan.revenueGoalId);
+    if (!next.ok) return next;
+
+    const plan: RevenuePlan = {
+      ...input.plan,
+      id: newId(),
+      workspaceId: input.workspaceId,
+      createdBy: input.createdBy,
+      version: next.value,
+      createdAt: toDateTime(now()),
+      updatedAt: toDateTime(now()),
+    };
+    this.mutate("revenuePlans", (rows) => rows.push(plan));
+    return { ok: true, value: plan };
+  }
+
+  /** Authorized list of a workspace's plans, newest first. */
+  listRevenuePlans(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: { revenueGoalId?: EntityId; status?: RevenuePlanStatus },
+  ): Result<RevenuePlan[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("revenuePlans").filter((p) => p.workspaceId === workspaceId);
+    const filtered = scoped.filter((p) => {
+      if (filter?.revenueGoalId && p.revenueGoalId !== filter.revenueGoalId) return false;
+      if (filter?.status && p.status !== filter.status) return false;
+      return true;
+    });
+    // Deterministic ordering: newest first, id as a stable tiebreaker.
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) =>
+        a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : a.id.localeCompare(b.id),
+      ),
+    };
+  }
+
+  getRevenuePlan(id: EntityId, userId: EntityId): Result<RevenuePlan, StorageError> {
+    const plan = this.findById("revenuePlans", id);
+    if (!plan) return { ok: false, error: toError("NOT_FOUND", "revenue plan not found") };
+    const auth = this.requireWorkspace(plan.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: plan };
+  }
+
+  /**
+   * Every version compiled from one goal, oldest first.
+   *
+   * This is the plan history: recompiling never destroys a previous version,
+   * so the lineage stays inspectable.
+   */
+  listRevenuePlansForGoal(
+    revenueGoalId: EntityId,
+    userId: EntityId,
+  ): Result<RevenuePlan[], StorageError> {
+    const goal = this.findById("revenueGoals", revenueGoalId);
+    if (!goal) return { ok: false, error: toError("NOT_FOUND", "revenue goal not found") };
+    const auth = this.requireWorkspace(goal.workspaceId, userId);
+    if (!auth.ok) return auth;
+    const plans = this.rows("revenuePlans").filter((p) => p.revenueGoalId === revenueGoalId);
+    return {
+      ok: true,
+      value: [...plans].sort((a, b) =>
+        a.version < b.version ? -1 : a.version > b.version ? 1 : a.id.localeCompare(b.id),
+      ),
+    };
+  }
+
+  updateRevenuePlan(
+    id: EntityId,
+    input: {
+      userId: EntityId;
+      patch: Partial<
+        Omit<RevenuePlan, "id" | "workspaceId" | "createdBy" | "version" | "createdAt">
+      >;
+    },
+  ): Result<RevenuePlan, StorageError> {
+    const plan = this.findById("revenuePlans", id);
+    if (!plan) return { ok: false, error: toError("NOT_FOUND", "revenue plan not found") };
+    const auth = this.requireWorkspace(plan.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    Object.assign(plan, input.patch);
+    plan.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: plan };
+  }
+
+  setRevenuePlanStatus(
+    id: EntityId,
+    userId: EntityId,
+    status: RevenuePlanStatus,
+  ): Result<RevenuePlan, StorageError> {
+    const plan = this.findById("revenuePlans", id);
+    if (!plan) return { ok: false, error: toError("NOT_FOUND", "revenue plan not found") };
+    const auth = this.requireWorkspace(plan.workspaceId, userId);
+    if (!auth.ok) return auth;
+    plan.status = status;
+    plan.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: plan };
+  }
+
   /** Cleanup helper so tests and local runs do not leave files behind. */
   destroy(): void {
     try {
@@ -1220,6 +1364,14 @@ export const db = {
   updateRevenueGoal: store.updateRevenueGoal.bind(store),
   setRevenueGoalStatus: store.setRevenueGoalStatus.bind(store),
   listRevenueGoalEvents: store.listRevenueGoalEvents.bind(store),
+
+  nextRevenuePlanVersion: store.nextRevenuePlanVersion.bind(store),
+  createRevenuePlan: store.createRevenuePlan.bind(store),
+  listRevenuePlans: store.listRevenuePlans.bind(store),
+  getRevenuePlan: store.getRevenuePlan.bind(store),
+  listRevenuePlansForGoal: store.listRevenuePlansForGoal.bind(store),
+  updateRevenuePlan: store.updateRevenuePlan.bind(store),
+  setRevenuePlanStatus: store.setRevenuePlanStatus.bind(store),
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),
   workspaceOwner: store.workspaceOwner.bind(store),

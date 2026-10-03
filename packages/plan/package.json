@@ -1,8 +1,8 @@
 {
-  "name": "@dealora/api",
+  "name": "@dealora/plan",
   "version": "0.1.0",
   "private": true,
-  "description": "DEALORA transport handlers and application-service wiring.",
+  "description": "DEALORA Revenue Plan Compiler: compiles a RevenueGoal into an inspectable, evidence-aware, deterministic RevenuePlan.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -12,12 +12,8 @@
     "./types": "./dist/types.js"
   },
   "dependencies": {
-    "@dealora/auth": "workspace:*",
-    "@dealora/brain": "workspace:*",
     "@dealora/core": "workspace:*",
-    "@dealora/db": "workspace:*",
-    "@dealora/goal": "workspace:*",
-    "@dealora/plan": "workspace:*"
+    "@dealora/db": "workspace:*"
   },
   "devDependencies": {}
 }

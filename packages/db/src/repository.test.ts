@@ -12,7 +12,7 @@ import {
 } from "./repository.js";
 import type { DbState } from "./repository.js";
 import { toDateTime } from "./types.js";
-import type { Claim, User } from "./types.js";
+import type { Claim, RevenueGoal, RevenuePlan, User } from "./types.js";
 
 function seed(): Store {
   return new Store(emptyState());
@@ -568,6 +568,127 @@ describe("repository", () => {
   });
 });
 
+/** A minimal valid goal row for migration fixtures. */
+function seedGoal(
+  _state: DbState,
+  id: string,
+  workspaceId: string,
+  createdBy: string,
+): RevenueGoal {
+  return {
+    id,
+    workspaceId,
+    createdBy,
+    objective: "Generate pipeline",
+    targetMetric: "pipeline",
+    targetValue: 100000,
+    currency: "USD",
+    timeWindow: { start: "2026-01-01", end: "2026-04-01" },
+    market: "B2B SaaS",
+    icpId: null,
+    buyerPersonaIds: [],
+    offerId: null,
+    economics: {
+      averageDealValue: null,
+      minimumContractValue: null,
+      targetCustomers: null,
+      currency: "USD",
+    },
+    constraints: {
+      geographies: [],
+      industries: [],
+      companySizes: [],
+      channels: [],
+      budget: null,
+      maxOutreachPerDay: null,
+      notes: null,
+    },
+    approvalPolicy: {
+      maxRiskLevel: "level_2_external_action",
+      externalActionsRequireApproval: true,
+      approverUserId: null,
+    },
+    successMetrics: [{ kind: "pipeline", target: 100000, unit: "USD" }],
+    status: "draft",
+    completeness: "complete",
+    unknowns: [],
+    assumptions: [],
+    createdAt: toDateTime(new Date("2026-01-01T00:00:00.000Z")),
+    updatedAt: toDateTime(new Date("2026-01-01T00:00:00.000Z")),
+  };
+}
+
+/** A minimal valid plan row for migration fixtures. */
+function seedPlan(
+  _state: DbState,
+  id: string,
+  revenueGoalId: string,
+  workspaceId: string,
+  createdBy: string,
+  version: number,
+): RevenuePlan {
+  return {
+    id,
+    workspaceId,
+    createdBy,
+    revenueGoalId,
+    version,
+    compilerVersion: "deterministic-1.0.0",
+    brainSnapshotDigest: "digest-1",
+    references: { offerId: null, icpId: null, personaIds: [] },
+    strategies: {
+      icp: {
+        targetMarket: "B2B SaaS",
+        industries: [],
+        companySizes: [],
+        geographies: [],
+        characteristics: [],
+        disqualifiers: [],
+        statements: [],
+      },
+      buyer: { personas: [], statements: [] },
+      sourcing: { accountProfile: "", approach: [], constraints: [], statements: [] },
+      signal: { signals: [], excludedSources: [], statements: [] },
+      qualification: { criteria: [], statements: [] },
+      outreach: {
+        channels: [],
+        messagingAngles: [],
+        valueProposition: null,
+        personalizationPrinciple: null,
+        frequencyCap: null,
+        stopPrinciples: [],
+        approvalRequired: true,
+        statements: [],
+      },
+      followUp: {
+        principles: [],
+        responseStates: [],
+        stopConditions: [],
+        escalationConditions: [],
+        statements: [],
+      },
+      meeting: { objective: null, qualificationPurpose: "", preparation: [], statements: [] },
+      crm: { recordFields: [], prohibitedWrites: [], statements: [] },
+      measurement: { kpis: [], reviewCadence: null, statements: [] },
+      optimization: { levers: [], guardrails: [], statements: [] },
+    },
+    facts: [],
+    inferences: [],
+    assumptions: [],
+    recommendations: [],
+    unknowns: [],
+    approval: {
+      approvesExternalActions: false,
+      requiredFor: ["level_2_external_action"],
+      statements: [],
+    },
+    status: "proposed",
+    rationale: "Seeded plan",
+    createdAt: toDateTime(new Date("2026-02-01T00:00:00.000Z")),
+    updatedAt: toDateTime(new Date("2026-02-01T00:00:00.000Z")),
+  };
+}
+
 describe("Phase 1 -> Phase 2 migration", () => {
   it("upgrades a Phase 1 document without losing data", () => {
     const legacy: DbState = {
@@ -635,6 +756,8 @@ describe("Phase 1 -> Phase 2 migration", () => {
     // Phase 3 tables are added by the same additive migration.
     expect(migrated.revenueGoals).toEqual([]);
     expect(migrated.revenueGoalEvents).toEqual([]);
+    // Phase 4 table is added by the same additive migration.
+    expect(migrated.revenuePlans).toEqual([]);
   });
 
   it("preserves Phase 2 data when migrating a v2 document to v3", () => {
@@ -656,10 +779,40 @@ describe("Phase 1 -> Phase 2 migration", () => {
     ];
 
     const migrated = migrateState(v2);
-    expect(migrated.schemaVersion).toBe(3);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
     expect(migrated.claims).toHaveLength(1);
     expect(migrated.claims[0]?.text).toBe("Preserved across the Phase 3 migration");
     expect(migrated.claims[0]?.approvedBy).toBe("u1");
+    expect(migrated.revenueGoals).toEqual([]);
+    // The Phase 4 table is additive: an older document gains it empty.
+    expect(migrated.revenuePlans).toEqual([]);
+  });
+
+  it("preserves Phase 3 goals when migrating a v3 document to v4", () => {
+    const v3 = emptyState();
+    v3.schemaVersion = 3;
+    const state = structuredClone(v3);
+    const goal = seedGoal(state, "goal-keep", "w1", "u1");
+    v3.revenueGoals = [goal];
+
+    const migrated = migrateState(v3);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    expect(migrated.revenueGoals).toHaveLength(1);
+    expect(migrated.revenueGoals[0]?.id).toBe("goal-keep");
+    expect(migrated.revenueGoals[0]?.objective).toBe(goal.objective);
+    expect(migrated.revenueGoalEvents).toEqual([]);
+    expect(migrated.revenuePlans).toEqual([]);
+  });
+
+  it("keeps Phase 4 plan rows across a repeat migration", () => {
+    const state = emptyState();
+    state.revenuePlans = [seedPlan(state, "plan-1", "goal-keep", "w1", "u1", 1)];
+
+    const migrated = migrateState(state);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    expect(migrated.revenuePlans).toHaveLength(1);
+    expect(migrated.revenuePlans[0]?.id).toBe("plan-1");
+    expect(migrated.revenuePlans[0]?.version).toBe(1);
     expect(migrated.revenueGoals).toEqual([]);
   });
 

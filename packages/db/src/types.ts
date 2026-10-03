@@ -370,3 +370,263 @@ export interface RevenueGoalEvent {
   toStatus: RevenueGoalStatus;
   createdAt: DateTime;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4 — Revenue Plan Compiler (DEALORA_BLUEPRINT.md §8, ROADMAP.md §11)
+// ---------------------------------------------------------------------------
+
+/**
+ * Plan lifecycle.
+ *
+ * Deliberately minimal. `approved` records that a human accepted the
+ * *proposal*; it never authorizes an external action.
+ */
+export type RevenuePlanStatus = "draft" | "proposed" | "approved" | "archived";
+
+/**
+ * How a plan statement is supported.
+ *
+ * This is the core safety property of Phase 4 (ROADMAP.md §11: "separate
+ * facts from recommendations"). A recommendation must never be presented as a
+ * fact, and no evidence may be fabricated to justify one.
+ */
+export type PlanStatementKind =
+  /** Recorded verbatim from the goal or the canonical Business Brain. */
+  | "fact"
+  /** Derived by combining known facts; the derivation is stated. */
+  | "inference"
+  /** A rule the compiler applied; recorded so it can be challenged. */
+  | "assumption"
+  /** What the compiler proposes. Never a statement of reality. */
+  | "recommendation"
+  /** Not determinable from the goal or the Business Brain. */
+  | "unknown";
+
+/** Where a statement's support comes from. */
+export type PlanBasis =
+  | "goal"
+  | "goal:success_metrics"
+  | "goal:economics"
+  | "goal:constraints"
+  | "goal:approval_policy"
+  | "brain:company"
+  | "brain:offer"
+  | "brain:icp"
+  | "brain:persona"
+  | "brain:positioning"
+  | "brain:brand_voice"
+  | "brain:claims"
+  | "compiler"
+  | "none";
+
+/** A single classified statement inside the plan. */
+export interface PlanStatement {
+  kind: PlanStatementKind;
+  /** The statement itself, in plain language. */
+  text: string;
+  /** What supports it. `none` for an unknown. */
+  basis: PlanBasis;
+  /** Canonical record ids the statement depends on, when applicable. */
+  references?: string[];
+}
+
+/** Who the plan is aimed at. */
+export interface RevenuePlanIcpStrategy {
+  targetMarket: string | null;
+  industries: string[];
+  companySizes: string[];
+  geographies: string[];
+  characteristics: string[];
+  disqualifiers: string[];
+  statements: PlanStatement[];
+}
+
+/** One persona the plan addresses. References the canonical persona. */
+export interface RevenuePlanBuyerTarget {
+  personaId: string | null;
+  title: string;
+  buyerContext: string | null;
+  painPoints: string[];
+  goals: string[];
+  statements: PlanStatement[];
+}
+
+export interface RevenuePlanBuyerStrategy {
+  personas: RevenuePlanBuyerTarget[];
+  statements: PlanStatement[];
+}
+
+/**
+ * What accounts will eventually be sourced, and how.
+ *
+ * Phase 4 sources nothing: this describes the target account profile and the
+ * permitted approach only.
+ */
+export interface RevenuePlanSourcingStrategy {
+  accountProfile: string;
+  approach: string[];
+  constraints: string[];
+  statements: PlanStatement[];
+}
+
+/** A signal category the plan would watch for. Never a claim about a real company. */
+export interface RevenuePlanSignal {
+  kind: string;
+  description: string;
+  statements: PlanStatement[];
+}
+
+export interface RevenuePlanSignalStrategy {
+  signals: RevenuePlanSignal[];
+  excludedSources: string[];
+  statements: PlanStatement[];
+}
+
+/** A criterion the later Qualification Engine would apply. */
+export interface RevenuePlanQualificationCriterion {
+  name: string;
+  description: string;
+  statements: PlanStatement[];
+}
+
+export interface RevenuePlanQualificationStrategy {
+  criteria: RevenuePlanQualificationCriterion[];
+  statements: PlanStatement[];
+}
+
+/**
+ * How outreach would be conducted.
+ *
+ * Nothing is sent in Phase 4. `approvalRequired` records that any future send
+ * is an external action needing separate approval.
+ */
+export interface RevenuePlanOutreachStrategy {
+  channels: string[];
+  messagingAngles: string[];
+  valueProposition: string | null;
+  personalizationPrinciple: string | null;
+  frequencyCap: string | null;
+  stopPrinciples: string[];
+  approvalRequired: boolean;
+  statements: PlanStatement[];
+}
+
+export interface RevenuePlanFollowUpStrategy {
+  principles: string[];
+  responseStates: string[];
+  stopConditions: string[];
+  escalationConditions: string[];
+  statements: PlanStatement[];
+}
+
+export interface RevenuePlanMeetingStrategy {
+  objective: string | null;
+  qualificationPurpose: string;
+  preparation: string[];
+  statements: PlanStatement[];
+}
+
+/** What future CRM handling would record. Phase 4 writes nothing. */
+export interface RevenuePlanCrmPolicy {
+  recordFields: string[];
+  prohibitedWrites: string[];
+  statements: PlanStatement[];
+}
+
+/** A measurable KPI the later Measurement phases would record against. */
+export interface RevenuePlanKpi {
+  name: string;
+  metricKind: GoalMetricKind;
+  target: number;
+  unit: string;
+  statements: PlanStatement[];
+}
+
+export interface RevenuePlanMeasurementPlan {
+  kpis: RevenuePlanKpi[];
+  reviewCadence: string | null;
+  statements: PlanStatement[];
+}
+
+/** A dimension that a later Optimization phase could tune. */
+export interface RevenuePlanOptimizationLever {
+  name: string;
+  description: string;
+  requiresData: boolean;
+  statements: PlanStatement[];
+}
+
+export interface RevenuePlanOptimizationPlan {
+  levers: RevenuePlanOptimizationLever[];
+  guardrails: string[];
+  statements: PlanStatement[];
+}
+
+/**
+ * Approval context for the plan.
+ *
+ * `approvesExternalActions` is typed as the literal `false`: approving a plan
+ * is not approving an email, a CRM write, or a calendar action. Those belong
+ * to the later phases and carry their own risk levels.
+ */
+export interface RevenuePlanApproval {
+  approvesExternalActions: false;
+  /** Blueprint §17 risk levels later phases must clear before acting. */
+  requiredFor: RevenueGoalApprovalPolicy["maxRiskLevel"][];
+  statements: PlanStatement[];
+}
+
+/** Every strategy section of the plan, each with its classified statements. */
+export interface RevenuePlanStrategies {
+  icp: RevenuePlanIcpStrategy;
+  buyer: RevenuePlanBuyerStrategy;
+  sourcing: RevenuePlanSourcingStrategy;
+  signal: RevenuePlanSignalStrategy;
+  qualification: RevenuePlanQualificationStrategy;
+  outreach: RevenuePlanOutreachStrategy;
+  followUp: RevenuePlanFollowUpStrategy;
+  meeting: RevenuePlanMeetingStrategy;
+  crm: RevenuePlanCrmPolicy;
+  measurement: RevenuePlanMeasurementPlan;
+  optimization: RevenuePlanOptimizationPlan;
+}
+
+/**
+ * The compiled proposal: how DEALORA proposes to pursue a RevenueGoal.
+ *
+ * A plan references its goal and the canonical Business Brain records it used
+ * rather than copying them, and carries a digest of the Brain state so a
+ * historical plan stays interpretable without embedding the whole Brain.
+ */
+export interface RevenuePlan {
+  id: EntityId;
+  workspaceId: EntityId;
+  createdBy: EntityId;
+  /** The goal this plan was compiled from. */
+  revenueGoalId: EntityId;
+  /** 1-based version within the goal's lineage. Never reused. */
+  version: number;
+  /** Which compiler produced this plan. */
+  compilerVersion: string;
+  /** Digest of the Business Brain state the plan was compiled against. */
+  brainSnapshotDigest: string;
+  /** Canonical Business Brain records this plan depends on. */
+  references: {
+    offerId: string | null;
+    icpId: string | null;
+    personaIds: string[];
+  };
+  strategies: RevenuePlanStrategies;
+  /** Roll-ups across every section, for review. */
+  facts: PlanStatement[];
+  inferences: PlanStatement[];
+  assumptions: PlanStatement[];
+  recommendations: PlanStatement[];
+  unknowns: PlanStatement[];
+  approval: RevenuePlanApproval;
+  status: RevenuePlanStatus;
+  /** Why this plan was proposed, in one sentence. */
+  rationale: string;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}
