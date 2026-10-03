@@ -19,8 +19,8 @@ intelligence and execution layer around the revenue stack.
 
 The repository has completed **Phase 0 — Repository & Engineering Foundation**,
 **Phase 1 — Application Foundation**, **Phase 2 — Business Brain**,
-**Phase 3 — Revenue Goal Engine**, and **Phase 4 — Revenue Plan Compiler**
-(see [`ROADMAP.md`](./ROADMAP.md)).
+**Phase 3 — Revenue Goal Engine**, **Phase 4 — Revenue Plan Compiler**, and
+**Phase 5 — Account & Prospect Input** (see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
 with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
@@ -55,7 +55,22 @@ never claims that approving it authorizes sending anything. Recompiling
 produces a new version and never destroys the previous one. Its gate — compile a
 goal into an inspectable plan — is covered by `tests/phase4-gate.test.ts`.
 
-Next is **Phase 5 — Account & Prospect Input**.
+Phase 5 adds the input layer the Revenue Plan's sourcing section promised: a
+workspace-isolated way to bring target accounts and the contacts at them into
+DEALORA, by hand or from CSV. Accounts and contacts are stored as **user input,
+never as research** — each record carries where it came from (`manual`, `csv`,
+`approved_integration`) and its source reference, deduplication is
+deterministic (a normalized domain for accounts, account plus normalized email
+for contacts) and a shared name with a different domain is reported as
+ambiguous and preserved rather than silently merged. CSV import validates every
+row with the same rules as manual entry and reports each row's outcome, so a
+bad row is never dropped and never corrupts its neighbours. Archiving is soft
+and cascades from an account to its contacts. Nothing is researched, enriched,
+scored, qualified or contacted. Its gate — import and create target accounts
+and contacts, persist, reload and keep the relationship — is covered by
+`tests/phase5-gate.test.ts`.
+
+Next is **Phase 6 — Research & Evidence**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -69,18 +84,19 @@ Next is **Phase 5 — Account & Prospect Input**.
 apps/           Web / API applications (Phase 2+)
 packages/       Shared TypeScript packages (built with project references)
   core/         Result types and cross-cutting helpers
-  db/           Schema, repository, tenant-isolated persistence (Phases 1-4)
+  db/           Schema, repository, tenant-isolated persistence (Phases 1-5)
   auth/         Identity, sessions, server-side authentication (Phase 1)
   brain/        Business Brain domain, claim safety, agent context (Phase 2)
   goal/         Revenue Goal domain, validation, lifecycle, goal parsing (Phase 3)
   plan/         Revenue Plan compiler, provenance, validation, lifecycle (Phase 4)
+  account/      Account & contact input, validation, dedup, CSV import (Phase 5)
   api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 11+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests (Phase 1-4 gates)
+tests/          Cross-package integration tests (Phase 1-5 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
@@ -91,7 +107,9 @@ toolchain ([0001](./docs/adr/0001-development-toolchain.md)), the Phase 1
 foundation ([0002](./docs/adr/0002-phase-1-application-foundation.md)), the
 Business Brain ([0003](./docs/adr/0003-business-brain.md)), the Revenue Goal
 Engine ([0004](./docs/adr/0004-revenue-goal-engine.md)), and the Revenue Plan
-Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)).
+Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)), and the Account
+& Prospect Input layer
+([0006](./docs/adr/0006-account-prospect-input.md)).
 
 ## Getting started
 
@@ -131,9 +149,10 @@ convention and the currently supported keys are documented in
 
 The only key is `DB_DIR` — the directory the local store writes
 `dealora.json` into (defaults to `packages/db/src/data`, which is
-git-ignored). Phases 1-4 need no credential: passwords are hashed with
-scrypt, goal parsing and plan compilation are deterministic and take no model
-provider, and no secret is ever hardcoded or read at module scope.
+git-ignored). Phases 1-5 need no credential: passwords are hashed with
+scrypt, goal parsing, plan compilation and account deduplication are
+deterministic and take no model provider, and no secret is ever hardcoded or
+read at module scope.
 
 ## License
 

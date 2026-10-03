@@ -12,6 +12,7 @@ the actual code — never document functionality that does not exist.
 | `../README.md`                 | Repository overview and getting started.             |
 | `../CONTRIBUTING.md`           | Development workflow and quality gates.              |
 | `../SECURITY.md`               | Security constraints and vulnerability reporting.    |
+| [csv-import.md](./csv-import.md) | Supported CSV columns, validation, duplicate policy and import results. |
 
 ## Architecture decisions
 
@@ -26,6 +27,7 @@ alternatives considered, and the consequences.
 | [0003 — Business Brain](./adr/0003-business-brain.md) | `@dealora/brain` domain, single canonical company record, six workspace-scoped tables, additive migration, claim-approval safety, agent-facing `getBusinessContext`. |
 | [0004 — Revenue Goal Engine](./adr/0004-revenue-goal-engine.md) | `@dealora/goal` domain, structured goal fields, provenance (explicit/inferred/assumption/unknown), deterministic replaceable `GoalParser`, validated lifecycle transitions, Business Brain references, goal history. |
 | [0005 — Revenue Plan Compiler](./adr/0005-revenue-plan-compiler.md) | `@dealora/plan` domain, eleven typed strategy sections, statement provenance (fact/inference/assumption/recommendation/unknown), deterministic replaceable compiler, goal preconditions, per-goal versioning, plan approval separated from action approval. |
+| [0006 — Account & Prospect Input](./adr/0006-account-prospect-input.md) | `@dealora/account` domain, input-not-evidence provenance (`manual`/`csv`/`approved_integration`), deterministic deduplication (normalized domain; account + normalized email), ambiguity preserved rather than merged, row-level CSV import with a per-row result, soft archive cascading to contacts, optional validated plan association. |
 
 ## Conventions
 
