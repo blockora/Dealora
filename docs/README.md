@@ -22,6 +22,8 @@ alternatives considered, and the consequences.
 | ADR                                      | Decision                                |
 | ---------------------------------------- | --------------------------------------- |
 | [0001 — Development toolchain](./adr/0001-development-toolchain.md) | Bun workspaces, strict TypeScript, ESLint + Prettier, Vitest, GitHub Actions CI. |
+| [0002 — Phase 1 application foundation](./adr/0002-phase-1-application-foundation.md) | `db` / `auth` / `api` packages, evolvable schema, scrypt credentials, opaque sessions, server-side workspace authorization. |
+| [0003 — Business Brain](./adr/0003-business-brain.md) | `@dealora/brain` domain, single canonical company record, six workspace-scoped tables, additive migration, claim-approval safety, agent-facing `getBusinessContext`. |
 
 ## Conventions
 
@@ -29,5 +31,7 @@ alternatives considered, and the consequences.
   update the roadmap when a phase gate is met.
 - New environment keys are documented in `CONTRIBUTING.md` as they are
   introduced by the corresponding phase; secrets are never committed.
+- Phase status is summarized in `README.md`; when a phase gate is met, update
+  both so the roadmap and the overview agree.
 - Public module interfaces carry doc comments; decisions that shape the
   architecture get an ADR.

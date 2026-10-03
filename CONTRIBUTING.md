@@ -31,11 +31,21 @@ bun run check   # run every quality gate locally
 | `bun run lint:fix`     | ESLint with autofix                        |
 | `bun run format`       | Prettier write (code only)                 |
 | `bun run format:check` | Prettier verification                      |
-| `bun run typecheck`    | Strict TypeScript check (`tsc -b --noEmit`) |
-| `bun run test`         | Vitest (`vitest run`)                      |
+| `bun run typecheck`    | Strict TypeScript check of the whole workspace |
+| `bun run test`         | Vitest (`vitest run -c vitest.workspace.ts`) |
 | `bun run test:watch`   | Vitest in watch mode                       |
 | `bun run build`        | Build all packages (`tsc -b`)              |
 | `bun run check`        | All gates in CI order (`scripts/verify.sh`) |
+
+`typecheck` and `build` both run `tsc -b tsconfig.json`. TypeScript 6 rejects
+`--noEmit` in build mode when composite project references exist (TS6310), so
+the typecheck gate uses build mode: `tsc` reports every type error and exits
+non-zero. The second invocation in `verify.sh` is an incremental no-op thanks to
+`.tsbuildinfo`.
+
+Every workspace package must have a `tsconfig.json` **and** an entry in the root
+`tsconfig.json` `references` array. A package missing from `references` is
+silently skipped by both `tsc -b` and the typecheck gate.
 
 ### Environment configuration
 
@@ -44,6 +54,19 @@ bun run check   # run every quality gate locally
 - Required keys are documented as they are introduced; secrets are provisioned
   through the hosting environment's secret store, not the repository.
 - Never hardcode secrets, API keys, or tokens in source, tests, or fixtures.
+
+### Environment keys (Phase 1)
+
+| Key      | Required | Purpose                                                                                          |
+| -------- | -------- | ------------------------------------------------------------------------------------------------ |
+| `DB_DIR` | No       | Directory the local store writes `dealora.json` into. Defaults to `packages/db/src/data` (git-ignored). |
+
+Phase 1 needs no credential: passwords are hashed with scrypt and a per-user
+salt, sessions are opaque random tokens, and the test suite runs without any
+secret. Add new keys to this table in the same commit that introduces them.
+
+Phases 1 and 2 add no further keys and require no LLM provider key: the
+Business Brain is a deterministic data layer.
 
 ## Quality gates
 

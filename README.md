@@ -17,10 +17,23 @@ intelligence and execution layer around the revenue stack.
 
 ## Repository status
 
-The repository is in **Phase 0 — Repository & Engineering Foundation**
-(see [`ROADMAP.md`](./ROADMAP.md)). Application phases (auth, workspace,
-Business Brain, revenue loop) are intentionally not started until the Phase 0
-gate is met.
+The repository has completed **Phase 0 — Repository & Engineering Foundation**,
+**Phase 1 — Application Foundation**, and **Phase 2 — Business Brain** (see
+[`ROADMAP.md`](./ROADMAP.md)).
+
+Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
+with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
+tenant boundary, business profiles, a tenant-isolated repository, an API layer,
+and server-side authorization. The Phase 1 gate — sign up → create workspace →
+create business profile → persist → reload → see the persisted workspace — is
+covered by `tests/phase1-gate.test.ts`.
+
+Phase 2 adds the canonical business-context layer: company, offers with
+approved-gated pricing, ICP, personas, positioning, brand voice, and claims with
+explicit approval status. Its gate — create and edit Brain data, then retrieve
+it as structured context — is covered by `tests/phase2-gate.test.ts`.
+
+Next is **Phase 3 — Revenue Goal Engine**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -31,18 +44,28 @@ gate is met.
 ## Repository layout
 
 ```
-apps/           Web / API applications (Phase 1+)
+apps/           Web / API applications (Phase 2+)
 packages/       Shared TypeScript packages (built with project references)
+  core/         Result types and cross-cutting helpers
+  db/           Schema, repository, tenant-isolated persistence (Phases 1-2)
+  auth/         Identity, sessions, server-side authentication (Phase 1)
+  brain/        Business Brain domain, claim safety, agent context (Phase 2)
+  api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 11+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests
+tests/          Cross-package integration tests (Phase 1 and Phase 2 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
 ```
+
+Architecture decisions are recorded in [`docs/adr/`](./docs/adr/): the
+toolchain ([0001](./docs/adr/0001-development-toolchain.md)), the Phase 1
+foundation ([0002](./docs/adr/0002-phase-1-application-foundation.md)), and the
+Business Brain ([0003](./docs/adr/0003-business-brain.md)).
 
 ## Getting started
 
@@ -62,6 +85,7 @@ bun run check      # run every quality gate (lint, format, typecheck, test, buil
 | `bun run format:check`  | Prettier verification                    |
 | `bun run typecheck`     | Strict TypeScript project-reference check |
 | `bun run test`          | Vitest test suite                        |
+| `bun run test:watch`    | Vitest in watch mode                     |
 | `bun run build`         | Build all packages (`tsc -b`)            |
 | `bun run check`         | All gates, in CI order (`scripts/verify.sh`) |
 
@@ -76,7 +100,13 @@ bun run check      # run every quality gate (lint, format, typecheck, test, buil
 
 Real environment values live in `.env` / `.env.local` and are **never
 committed**; secrets are provisioned through the hosting environment. The
-convention is documented in [`CONTRIBUTING.md`](./CONTRIBUTING.md#environment-configuration).
+convention and the currently supported keys are documented in
+[`CONTRIBUTING.md`](./CONTRIBUTING.md#environment-configuration).
+
+The only key is `DB_DIR` — the directory the local store writes
+`dealora.json` into (defaults to `packages/db/src/data`, which is
+git-ignored). Phases 1 and 2 need no credential: passwords are hashed with
+scrypt and no secret is ever hardcoded or read at module scope.
 
 ## License
 
