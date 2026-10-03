@@ -102,7 +102,7 @@ Next is **Phase 7 — Evidence System**.
 apps/           Web / API applications (Phase 2+)
 packages/       Shared TypeScript packages (built with project references)
   core/         Result types and cross-cutting helpers
-  db/           Schema, repository, tenant-isolated persistence (Phases 1-5)
+  db/           Schema, repository, tenant-isolated persistence (Phases 1-6)
   auth/         Identity, sessions, server-side authentication (Phase 1)
   brain/        Business Brain domain, claim safety, agent context (Phase 2)
   goal/         Revenue Goal domain, validation, lifecycle, goal parsing (Phase 3)
