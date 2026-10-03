@@ -1,8 +1,8 @@
 {
-  "name": "@dealora/api",
+  "name": "@dealora/brain",
   "version": "0.1.0",
   "private": true,
-  "description": "DEALORA transport handlers and application-service wiring.",
+  "description": "DEALORA Business Brain: canonical, workspace-scoped business context and claim safety for agents.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -12,8 +12,6 @@
     "./types": "./dist/types.js"
   },
   "dependencies": {
-    "@dealora/auth": "workspace:*",
-    "@dealora/brain": "workspace:*",
     "@dealora/core": "workspace:*",
     "@dealora/db": "workspace:*"
   },

@@ -1,37 +1,518 @@
-import { store } from "@dealora/db";
-import { verifySession, signup, authenticate, changePassword } from "@dealora/auth";
-import type { RequestBody, ApiResponse, ApiError, ApiHandler, DbStore } from "./types.js";
+import type {
+  BrandVoice,
+  BusinessProfile,
+  Claim,
+  Icp,
+  Offer,
+  Persona,
+  Positioning,
+} from "@dealora/db";
+import type { BrainError, BusinessBrainService } from "@dealora/brain";
+
+import type {
+  ApiError,
+  ApiHandler,
+  ApiResponse,
+  AuthenticatedActor,
+  IdentityService,
+  RequestBody,
+  SessionResolver,
+} from "./types.js";
+import type { Result } from "@dealora/core";
 
 /**
  * Transport layer.
  *
- * Handlers contain ONLY parsing and translation. All business rules,
- * authorization, and persistence live in the application/db layers. A handler
- * never orders a decision on its own — it asks a service or the store which
- * performs authorization server-side.
+ * Handlers do four things and nothing else:
+ *   1. parse the request body,
+ *   2. resolve the authenticated actor from the session token,
+ *   3. call an application service,
+ *   4. translate the result into an `ApiResponse`.
+ *
+ * Authorization is always performed inside the application service against the
+ * server-side identity, so a handler can never grant access a client asked
+ * for (ADR 0003).
  */
 
-const app = applicationService(store);
-
-const bodyParser: ApiHandler = async (req) => {
-  const raw = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return { ok: false, error: { code: "VALIDATION_ERROR", message: "invalid JSON body" } };
+/** Translate a service/identity error code into the safe API vocabulary. */
+function toApiError(code: string, message: string): ApiError {
+  switch (code) {
+    case "UNAUTHENTICATED":
+      return { code: "UNAUTHENTICATED", message: "authentication required" };
+    case "UNAUTHORIZED":
+      return { code: "UNAUTHORIZED", message: "workspace access denied" };
+    case "NOT_FOUND":
+      return { code: "NOT_FOUND", message };
+    case "VALIDATION_ERROR":
+      return { code: "VALIDATION_ERROR", message };
+    case "CONFLICT":
+      return { code: "CONFLICT", message };
+    default:
+      // Never surface an internal storage message.
+      return { code: "SERVER_ERROR", message: "unexpected failure" };
   }
-  return { ok: true, value: parsed as Record<string, unknown> };
-};
-
-function stringParam(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw { code: "VALIDATION_ERROR", message: `${field} must be a non-empty string` };
-  }
-  return value.trim();
 }
 
-function toUserSafe(user: User): Record<string, unknown> {
+/** Translate a domain `BrainError` into the safe API error envelope. */
+function fromBrainError(error: BrainError): ApiError {
+  // `UNAVAILABLE` is an internal condition and is never surfaced verbatim.
+  if (error.code === "UNAVAILABLE") {
+    return { code: "SERVER_ERROR", message: "unexpected failure" };
+  }
+  const mapped: ApiError = { code: error.code, message: error.message };
+  if (error.details) mapped.details = error.details;
+  return mapped;
+}
+
+/** Parse a JSON body, tolerating already-parsed objects. */
+async function parseBody(req: RequestBody): Promise<Record<string, unknown> | ApiError> {
+  const raw = req.body;
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw === "object") return raw as Record<string, unknown>;
+  if (typeof raw !== "string") return { code: "VALIDATION_ERROR", message: "invalid JSON body" };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object") {
+      return { code: "VALIDATION_ERROR", message: "invalid JSON body" };
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return { code: "VALIDATION_ERROR", message: "invalid JSON body" };
+  }
+}
+
+function isApiError(value: unknown): value is ApiError {
+  return typeof value === "object" && value !== null && "code" in value && "message" in value;
+}
+
+export interface HandlerDeps {
+  identity: IdentityService;
+  brain: BusinessBrainService;
+  resolveSession: SessionResolver;
+}
+
+/**
+ * Resolve the authenticated actor from the bearer token.
+ *
+ * The user id always comes from the session. A `workspaceId` in the body or
+ * query is never treated as proof of access — the application service
+ * re-authorizes every call against this identity.
+ */
+function actorFrom(req: RequestBody, deps: HandlerDeps): AuthenticatedActor | null {
+  const token = req.query.sessionToken;
+  if (typeof token !== "string" || token === "") return null;
+  return deps.resolveSession(token);
+}
+
+function ok<T>(data: T): ApiResponse<T> {
+  return { status: "ok", data };
+}
+
+/** Wrap a handler body that requires an authenticated actor. */
+function authenticated<T>(
+  req: RequestBody,
+  deps: HandlerDeps,
+  run: (actor: AuthenticatedActor) => Promise<Result<ApiResponse<T>, ApiError>>,
+): Promise<Result<ApiResponse<T>, ApiError>> {
+  const actor = actorFrom(req, deps);
+  if (!actor) {
+    return Promise.resolve({
+      ok: false,
+      error: { code: "UNAUTHENTICATED", message: "authentication required" },
+    });
+  }
+  return run(actor).catch((err: unknown) => ({
+    ok: false,
+    error: toApiError(
+      typeof err === "object" && err !== null && "code" in err
+        ? String((err as { code: unknown }).code)
+        : "SERVER_ERROR",
+      "unexpected failure",
+    ),
+  }));
+}
+
+/** Read a required route parameter. */
+function param(req: RequestBody, name: string): string | ApiError {
+  const value = req.params[name];
+  if (typeof value !== "string" || value.trim() === "") {
+    return { code: "VALIDATION_ERROR", message: `${name} is required` };
+  }
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 — identity and workspaces
+// ---------------------------------------------------------------------------
+
+export function createHandlers(deps: HandlerDeps) {
+  const signupHandler: ApiHandler = async (req) => {
+    const body = await parseBody(req);
+    if (isApiError(body)) return { ok: false, error: body };
+
+    const email = typeof body.email === "string" ? body.email : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    const displayName = typeof body.displayName === "string" ? body.displayName : "";
+    if (!email || !password || !displayName) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "email, password and displayName are required",
+        },
+      };
+    }
+    try {
+      const created = deps.identity.signup(email, password, displayName);
+      return { ok: true, value: ok({ user: publicUser(created.user), token: created.token }) };
+    } catch (err: unknown) {
+      const code =
+        typeof err === "object" && err !== null && "code" in err
+          ? String((err as { code: unknown }).code)
+          : "SERVER_ERROR";
+      return { ok: false, error: toApiError(code, "signup failed") };
+    }
+  };
+
+  const authenticateHandler: ApiHandler = async (req) => {
+    const body = await parseBody(req);
+    if (isApiError(body)) return { ok: false, error: body };
+
+    const email = typeof body.email === "string" ? body.email : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    if (!email || !password) {
+      return {
+        ok: false,
+        error: { code: "VALIDATION_ERROR", message: "email and password are required" },
+      };
+    }
+    try {
+      const found = deps.identity.authenticate(email, password);
+      return { ok: true, value: ok({ user: publicUser(found.user), token: found.token }) };
+    } catch (err: unknown) {
+      const code =
+        typeof err === "object" && err !== null && "code" in err
+          ? String((err as { code: unknown }).code)
+          : "SERVER_ERROR";
+      return { ok: false, error: toApiError(code, "invalid credentials") };
+    }
+  };
+
+  const listWorkspacesHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const result = deps.identity.listWorkspaces(actor.userId);
+      if (!result.ok) {
+        return Promise.resolve({
+          ok: false,
+          error: toApiError(result.error.code, "workspaces unavailable"),
+        });
+      }
+      return Promise.resolve({ ok: true, value: ok({ workspaces: result.value }) });
+    });
+
+  const getWorkspaceHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.identity.getWorkspace(id, actor.userId);
+      if (!result.ok) {
+        return Promise.resolve({
+          ok: false,
+          error: toApiError(result.error.code, "workspace not found"),
+        });
+      }
+      return Promise.resolve({ ok: true, value: ok({ workspace: result.value }) });
+    });
+
+  const updateWorkspaceHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const input: { name?: string; timezone?: string } = {};
+      if (typeof body.name === "string" && body.name.trim() !== "") input.name = body.name.trim();
+      if (typeof body.timezone === "string" && body.timezone.trim() !== "")
+        input.timezone = body.timezone.trim();
+
+      const result = deps.identity.updateWorkspace(id, actor.userId, input);
+      if (!result.ok) {
+        return { ok: false, error: toApiError(result.error.code, "workspace not found") };
+      }
+      return { ok: true, value: ok({ workspace: result.value }) };
+    });
+
+  const meHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const result = deps.identity.getUser(actor.userId);
+      if (!result.ok) {
+        return Promise.resolve({
+          ok: false,
+          error: toApiError(result.error.code, "user not found"),
+        });
+      }
+      return Promise.resolve({ ok: true, value: ok({ user: publicUser(result.value) }) });
+    });
+
+  // -------------------------------------------------------------------------
+  // Phase 2 — Business Brain
+  //
+  // The workspace id always comes from the route; the acting user always comes
+  // from the session. The service authorizes that pair server-side, so a
+  // handler never decides access itself.
+  // -------------------------------------------------------------------------
+
+  /** Company section (Phase 1 business profile, canonical for the Brain). */
+  const getCompanyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const result = deps.brain.getCompany(workspaceId, actor.userId);
+      if (!result.ok) {
+        return Promise.resolve({ ok: false, error: fromBrainError(result.error) });
+      }
+      return Promise.resolve({ ok: true, value: ok({ company: result.value }) });
+    });
+
+  const upsertCompanyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const result = deps.brain.upsertCompany(workspaceId, actor.userId, body);
+      if (!result.ok) return { ok: false, error: fromBrainError(result.error) };
+      return { ok: true, value: ok({ company: result.value }) };
+    });
+
+  const createOfferHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const result = deps.brain.createOffer(workspaceId, actor.userId, body);
+      if (!result.ok) return { ok: false, error: fromBrainError(result.error) };
+      return { ok: true, value: ok({ offer: result.value }) };
+    });
+
+  const listOffersHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const result = deps.brain.listOffers(workspaceId, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromBrainError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ offers: result.value }) });
+    });
+
+  const updateOfferHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const result = deps.brain.updateOffer(id, actor.userId, body);
+      if (!result.ok) return { ok: false, error: fromBrainError(result.error) };
+      return { ok: true, value: ok({ offer: result.value }) };
+    });
+
+  const deleteOfferHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.brain.deleteOffer(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromBrainError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ deleted: true }) });
+    });
+
+  const upsertIcpHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const result = deps.brain.upsertIcp(workspaceId, actor.userId, body);
+      if (!result.ok) return { ok: false, error: fromBrainError(result.error) };
+      return { ok: true, value: ok({ icp: result.value }) };
+    });
+
+  const getIcpHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const result = deps.brain.getIcp(workspaceId, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromBrainError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ icp: result.value }) });
+    });
+
+  const createPersonaHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const result = deps.brain.createPersona(workspaceId, actor.userId, body);
+      if (!result.ok) return { ok: false, error: fromBrainError(result.error) };
+      return { ok: true, value: ok({ persona: result.value }) };
+    });
+
+  const listPersonasHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const result = deps.brain.listPersonas(workspaceId, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromBrainError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ personas: result.value }) });
+    });
+
+  const upsertPositioningHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const result = deps.brain.upsertPositioning(workspaceId, actor.userId, body);
+      if (!result.ok) return { ok: false, error: fromBrainError(result.error) };
+      return { ok: true, value: ok({ positioning: result.value }) };
+    });
+
+  const getPositioningHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const result = deps.brain.getPositioning(workspaceId, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromBrainError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ positioning: result.value }) });
+    });
+
+  const upsertBrandVoiceHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const result = deps.brain.upsertBrandVoice(workspaceId, actor.userId, body);
+      if (!result.ok) return { ok: false, error: fromBrainError(result.error) };
+      return { ok: true, value: ok({ brandVoice: result.value }) };
+    });
+
+  const getBrandVoiceHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const result = deps.brain.getBrandVoice(workspaceId, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromBrainError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ brandVoice: result.value }) });
+    });
+
+  const createClaimHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const result = deps.brain.createClaim(workspaceId, actor.userId, body);
+      if (!result.ok) return { ok: false, error: fromBrainError(result.error) };
+      return { ok: true, value: ok({ claim: result.value }) };
+    });
+
+  const listClaimsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const rawStatus = req.query.status;
+      let status: "approved" | "unverified" | "restricted" | undefined;
+      if (typeof rawStatus === "string" && rawStatus !== "") {
+        if (!["approved", "unverified", "restricted"].includes(rawStatus)) {
+          return Promise.resolve({
+            ok: false,
+            error: { code: "VALIDATION_ERROR", message: "invalid status filter" } as ApiError,
+          });
+        }
+        status = rawStatus as "approved" | "unverified" | "restricted";
+      }
+      const result = deps.brain.listClaims(
+        workspaceId,
+        actor.userId,
+        status ? { status } : undefined,
+      );
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromBrainError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ claims: result.value }) });
+    });
+
+  const approveClaimHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.brain.approveClaim(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromBrainError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ claim: result.value }) });
+    });
+
+  const updateClaimHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const result = deps.brain.updateClaim(id, actor.userId, body);
+      if (!result.ok) return { ok: false, error: fromBrainError(result.error) };
+      return { ok: true, value: ok({ claim: result.value }) };
+    });
+
+  /**
+   * The agent-facing Business Brain context.
+   *
+   * Returns the structured snapshot; pricing is included only when approved.
+   */
+  const getBusinessContextHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const result = deps.brain.getBusinessContext(workspaceId, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromBrainError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ context: result.value }) });
+    });
+
+  return {
+    signupHandler,
+    authenticateHandler,
+    listWorkspacesHandler,
+    getWorkspaceHandler,
+    updateWorkspaceHandler,
+    meHandler,
+    getCompanyHandler,
+    upsertCompanyHandler,
+    createOfferHandler,
+    listOffersHandler,
+    updateOfferHandler,
+    deleteOfferHandler,
+    upsertIcpHandler,
+    getIcpHandler,
+    createPersonaHandler,
+    listPersonasHandler,
+    upsertPositioningHandler,
+    getPositioningHandler,
+    upsertBrandVoiceHandler,
+    getBrandVoiceHandler,
+    createClaimHandler,
+    listClaimsHandler,
+    updateClaimHandler,
+    approveClaimHandler,
+    getBusinessContextHandler,
+  };
+}
+
+/** Strip the password hash from any user leaving the API boundary. */
+export function publicUser(user: {
+  id: string;
+  email: string;
+  displayName: string;
+  role: string;
+  createdAt: string;
+  updatedAt: string;
+}): Record<string, unknown> {
   return {
     id: user.id,
     email: user.email,
@@ -42,347 +523,4 @@ function toUserSafe(user: User): Record<string, unknown> {
   };
 }
 
-function serializeWorkspace(ws: Workspace): Record<string, unknown> {
-  return {
-    id: ws.id,
-    ownerId: ws.ownerId,
-    name: ws.name,
-    slug: ws.slug,
-    logoUrl: ws.logoUrl,
-    timezone: ws.timezone,
-    settings: ws.settings,
-    createdAt: ws.createdAt,
-    updatedAt: ws.updatedAt,
-  };
-}
-
-function serializeProfile(p: BusinessProfile): Record<string, unknown> {
-  return {
-    id: p.id,
-    workspaceId: p.workspaceId,
-    ownerId: p.ownerId,
-    name: p.name,
-    description: p.description,
-    website: p.website,
-    type: p.type,
-    offer: p.offer,
-    industry: p.industry,
-    size: p.size,
-    createdAt: p.createdAt,
-    updatedAt: p.updatedAt,
-  };
-}
-
-/** Application service that owns business logic and authorization. */
-function applicationService(s: DbStore) {
-  return {
-    signup: (email: string, password: string, displayName: string) => {
-      const result = signup(email, password, displayName);
-      return result;
-    },
-    authenticate: (email: string, password: string) => {
-      const result = authenticate(email, password);
-      return result;
-    },
-    getWorkspaces: (userId: string) => {
-      return s.getWorkspaces(userId);
-    },
-    createWorkspace: (ownerId: string, name: string, timezone?: string) => {
-      return s.createWorkspace({ ownerId, name, timezone });
-    },
-    getWorkspace: (id: string) => {
-      return store.getWorkspace(id);
-    },
-    authorize: (workspaceId: string, userId: string) => {
-      return s.authorize(workspaceId, userId);
-    },
-    getBusinessProfile: (workspaceId: string) => {
-      return s.getBusinessProfile(workspaceId);
-    },
-    createBusinessProfile: (input: {
-      workspaceId: string;
-      ownerId: string;
-      name: string;
-      description: string;
-      website?: string | null;
-      type?: string | null;
-      offer?: string | null;
-      industry?: string | null;
-      size?: string | null;
-    }) => {
-      return s.createBusinessProfile(input);
-    },
-    updateBusinessProfile: (
-      id: string,
-      input: {
-        workspaceId: string;
-        name?: string;
-        description?: string;
-        website?: string | null;
-        type?: string | null;
-        offer?: string | null;
-        industry?: string | null;
-        size?: string | null;
-      },
-    ) => {
-      return s.updateBusinessProfile(id, input);
-    },
-    changePassword: (userId: string, current: string, next: string) => {
-      return changePassword(userId, current, next);
-    },
-    me: (userId: string) => {
-      return s.getUser(userId);
-    },
-  };
-}
-
-import type { DbStore as _DbStore } from "./types.js";
-
-function toErrorBody(err: unknown): ApiError {
-  if (
-    err &&
-    typeof err === "object" &&
-    "code" in err &&
-    typeof (err as { code: string }).code === "string"
-  ) {
-    const typed = err as ApiError;
-    return typed;
-  }
-  return { code: "SERVER_ERROR", message: "unexpected failure" };
-}
-
-function withSession<T>(
-  req: RequestBody,
-  resolve: (ctx: { userId: string; token: string }) => Promise<Result<T, ApiError>>,
-): Promise<Result<ApiResponse<T>, ApiError>> {
-  const { sessionToken } = req.query as { sessionToken?: string };
-  if (!sessionToken) {
-    return Promise.resolve({
-      ok: false,
-      error: { code: "UNAUTHENTICATED", message: "authentication required" },
-    });
-  }
-  return verifySession(sessionToken, { map: new Map(), userIndex: new Map() })
-    .then((v) => resolve({ userId: v.userId, token: sessionToken }))
-    .then((r) => r.map((data) => ({ status: "ok", data })))
-    .catch((err: unknown) => {
-      const apiErr = toErrorBody(err);
-      return { ok: false, error: apiErr };
-    });
-}
-
-export const signupHandler: ApiHandler = async (req) => {
-  const body = await bodyParser(req);
-  if (!body.ok) return body;
-  const b = body.value as Record<string, unknown>;
-  const email = typeof b.email === "string" ? b.email : "";
-  const password = typeof b.password === "string" ? b.password : "";
-  const displayName = typeof b.displayName === "string" ? b.displayName : "";
-
-  if (!email || !password || !displayName) {
-    return {
-      ok: false,
-      error: { code: "VALIDATION_ERROR", message: "email, password and displayName are required" },
-    };
-  }
-  const result = app.signup(email, password, displayName);
-  if (!result.ok) return { ok: false, error: toErrorBody(result.error) };
-  return {
-    ok: true,
-    value: {
-      status: "ok",
-      data: { user: toUserSafe(result.value.user), token: result.value.token },
-    },
-  };
-};
-
-export const authenticateHandler: ApiHandler = async (req) => {
-  const body = await bodyParser(req);
-  if (!body.ok) return body;
-  const b = body.value as Record<string, unknown>;
-  const email = typeof b.email === "string" ? b.email : "";
-  const password = typeof b.password === "string" ? b.password : "";
-
-  if (!email || !password) {
-    return {
-      ok: false,
-      error: { code: "VALIDATION_ERROR", message: "email and password are required" },
-    };
-  }
-  const result = app.authenticate(email, password);
-  if (!result.ok) return { ok: false, error: toErrorBody(result.error) };
-  return {
-    ok: true,
-    value: {
-      status: "ok",
-      data: { user: toUserSafe(result.value.user), token: result.value.token },
-    },
-  };
-};
-
-export const createWorkspaceHandler: ApiHandler = async (req) => {
-  const body = await bodyParser(req);
-  if (!body.ok) return body;
-  const b = body.value as Record<string, unknown>;
-  const name = typeof b.name === "string" ? b.name : "";
-
-  if (!name) {
-    return { ok: false, error: { code: "VALIDATION_ERROR", message: "name is required" } };
-  }
-
-  const result = app.createWorkspace(name, typeof b.timezone === "string" ? b.timezone : undefined);
-  if (!result.ok) return { ok: false, error: toErrorBody(result.error) };
-  return {
-    ok: true,
-    value: { status: "ok", data: { workspace: serializeWorkspace(result.value) } },
-  };
-};
-
-export const getWorkspaceHandler: ApiHandler = async (req) => {
-  return withSession(req, async ({ userId }) => {
-    const result = app.authorize(req.params.id as string, userId);
-    if (!result.ok) return { ok: false, error: toErrorBody(result.error) };
-    return { ok: true, value: { workspace: serializeWorkspace(result.value) } };
-  });
-};
-
-export const updateWorkspaceHandler: ApiHandler = async (req) => {
-  return withSession(req, async ({ userId }) => {
-    const { name, timezone } = req.body as { name?: string; timezone?: string };
-    const authResult = app.authorize(req.params.id as string, userId);
-    if (!authResult.ok) return { ok: false, error: toErrorBody(authResult.error) };
-
-    const update: { name?: string; timezone?: string } = {};
-    if (typeof name === "string" && name.trim() !== "") update.name = name.trim();
-    if (typeof timezone === "string") update.timezone = timezone;
-
-    const updated = app.updateWorkspace(req.params.id as string, update);
-    if (!updated.ok) return { ok: false, error: toErrorBody(updated.error) };
-    return { ok: true, value: { workspace: serializeWorkspace(updated.value) } };
-  });
-};
-
-export const listWorkspacesHandler: ApiHandler = async (req) => {
-  return withSession(req, async ({ userId }) => {
-    const result = app.getWorkspaces(userId);
-    if (!result.ok) return { ok: false, error: toErrorBody(result.error) };
-    return { ok: true, value: { workspaces: result.value.map(serializeWorkspace) } };
-  });
-};
-
-export const createBusinessProfileHandler: ApiHandler = async (req) => {
-  return withSession(req, async ({ userId }) => {
-    const body = req.body as Record<string, unknown>;
-
-    const authResult = app.authorize(req.params.id as string, userId);
-    if (!authResult.ok) return { ok: false, error: toErrorBody(authResult.error) };
-
-    if (!body.name || !body.description) {
-      return {
-        ok: false,
-        error: { code: "VALIDATION_ERROR", message: "name and description are required" },
-      };
-    }
-
-    const name = stringParam(body.name, "name");
-    const description = stringParam(body.description, "description");
-
-    const result = app.createBusinessProfile({
-      workspaceId: req.params.id as string,
-      ownerId: userId,
-      name,
-      description,
-      website: body.website ?? null,
-      type: body.type ?? null,
-      offer: body.offer ?? null,
-      industry: body.industry ?? null,
-      size: body.size ?? null,
-    });
-    if (!result.ok) return { ok: false, error: toErrorBody(result.error) };
-    return { ok: true, value: { profile: serializeProfile(result.value) } };
-  });
-};
-
-export const getBusinessProfileHandler: ApiHandler = async (req) => {
-  return withSession(req, async ({ userId }) => {
-    const authResult = app.authorize(req.params.id as string, userId);
-    if (!authResult.ok) return { ok: false, error: toErrorBody(authResult.error) };
-
-    const result = app.getBusinessProfile(req.params.id as string);
-    if (!result.ok) return { ok: false, error: toErrorBody(result.error) };
-    const profile = result.value;
-    if (!profile)
-      return { ok: false, error: { code: "NOT_FOUND", message: "business profile not found" } };
-    return { ok: true, value: { profile: serializeProfile(profile) } };
-  });
-};
-
-export const updateBusinessProfileHandler: ApiHandler = async (req) => {
-  return withSession(req, async ({ userId }) => {
-    const body = req.body as Record<string, unknown>;
-
-    const authResult = app.authorize(req.params.id as string, userId);
-    if (!authResult.ok) return { ok: false, error: toErrorBody(authResult.error) };
-
-    const result = app.getBusinessProfile(req.params.id as string);
-    if (!result.ok) return { ok: false, error: toErrorBody(result.error) };
-    const profile = result.value;
-    if (!profile)
-      return { ok: false, error: { code: "NOT_FOUND", message: "business profile not found" } };
-
-    const update: {
-      name?: string;
-      description?: string;
-      website?: string | null;
-      type?: string | null;
-      offer?: string | null;
-      industry?: string | null;
-      size?: string | null;
-    } = {};
-    if (typeof body.name === "string" && body.name.trim() !== "") update.name = body.name.trim();
-    if (typeof body.description === "string" && body.description.trim() !== "")
-      update.description = body.description.trim();
-    if (body.website !== undefined) update.website = body.website ?? null;
-    if (body.type !== undefined) update.type = body.type ?? null;
-    if (body.offer !== undefined) update.offer = body.offer ?? null;
-    if (body.industry !== undefined) update.industry = body.industry ?? null;
-    if (body.size !== undefined) update.size = body.size ?? null;
-
-    const updated = app.updateBusinessProfile(req.params.id as string, {
-      workspaceId: req.params.id as string,
-      ...update,
-    });
-    if (!updated.ok) return { ok: false, error: toErrorBody(updated.error) };
-    return { ok: true, value: { profile: serializeProfile(updated.value) } };
-  });
-};
-
-export const listBusinessProfilesHandler: ApiHandler = async (req) => {
-  return withSession(req, async ({ userId }) => {
-    const authResult = app.authorize(req.params.id as string, userId);
-    if (!authResult.ok) return { ok: false, error: toErrorBody(authResult.error) };
-
-    const result = app.getBusinessProfile(req.params.id as string);
-    if (!result.ok) return { ok: false, error: toErrorBody(result.error) };
-    const profile = result.value;
-    if (!profile)
-      return { ok: false, error: { code: "NOT_FOUND", message: "business profile not found" } };
-    return { ok: true, value: { profile: serializeProfile(profile) } };
-  });
-};
-
-export const authorizeHandler: ApiHandler = async (req) => {
-  return withSession(req, async ({ userId }) => {
-    const result = app.authorize(req.params.id as string, userId);
-    if (!result.ok) return { ok: false, error: toErrorBody(result.error) };
-    return { ok: true, value: { authorized: true, workspace: serializeWorkspace(result.value) } };
-  });
-};
-
-export const meHandler: ApiHandler = async (req) => {
-  return withSession(req, async ({ userId }) => {
-    const result = app.me(userId);
-    if (!result.ok) return { ok: false, error: toErrorBody(result.error) };
-    return { ok: true, value: { user: toUserSafe(result.value) } };
-  });
-};
+export type { BrandVoice, BusinessProfile, Claim, Icp, Offer, Persona, Positioning };

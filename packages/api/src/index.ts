@@ -1,31 +1,24 @@
-/** @dealora/api — transport handlers and application service. */
-export type { ApiError, ApiResponse, Pagination, RequestBody, ApiHandler } from "./types.js";
-export {
-  authenticateHandler,
-  signupHandler,
-  createWorkspaceHandler,
-  getWorkspaceHandler,
-  updateWorkspaceHandler,
-  listWorkspacesHandler,
-  createBusinessProfileHandler,
-  getBusinessProfileHandler,
-  updateBusinessProfileHandler,
-  listBusinessProfilesHandler,
-  authorizeHandler,
-  meHandler,
-} from "./handlers.js";
-export {
-  authenticate,
-  signup,
-  changePassword,
-  authenticatePassword,
-  setSessionIndex,
-  createSession,
-  getSession,
-  invalidateSession,
-  listSessions,
-  verifySession,
-  assertSignedIn,
-  requireOwnership,
-} from "@dealora/auth";
-export { store, db } from "@dealora/db";
+/** @dealora/api — transport handlers and application-service wiring. */
+export { createHandlers, publicUser } from "./handlers.js";
+export type { HandlerDeps } from "./handlers.js";
+
+export type {
+  ApiError,
+  ApiErrorCode,
+  ApiHandler,
+  ApiResponse,
+  ApiSuccess,
+  AuthenticatedActor,
+  IdentityService,
+  RequestBody,
+  SessionResolver,
+} from "./types.js";
+
+/**
+ * Build the default handler set wired to the real identity service, Business
+ * Brain service, and session index.
+ *
+ * The session resolver is derived from the auth package's session index, so a
+ * handler can never accept a client-supplied user id.
+ */
+export { createDefaultHandlers } from "./wiring.js";
