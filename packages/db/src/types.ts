@@ -1019,3 +1019,167 @@ export interface Evidence {
   createdAt: DateTime;
   updatedAt: DateTime;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 8 — Qualification Engine (DEALORA_BLUEPRINT.md §12.5, ROADMAP.md §15)
+// ---------------------------------------------------------------------------
+
+/**
+ * The five scoring dimensions `ROADMAP.md` §15 names for Phase 8, spelled
+ * exactly as the Qualification Agent responsibilities in
+ * `DEALORA_BLUEPRINT.md` §12.5 ("evaluate ICP fit, evaluate need, evaluate
+ * company fit, evaluate potential timing, evaluate buying signals").
+ *
+ * These are the only dimensions the engine evaluates. The list is closed: no
+ * dimension may be added, removed or renamed without a new `ruleVersion`, so a
+ * historical score stays interpretable against the rules that produced it.
+ */
+export type QualificationDimension =
+  "icp_fit" | "need_fit" | "buying_signal" | "timing" | "company_fit";
+
+/**
+ * The outcome of one criterion.
+ *
+ * Deliberately exactly three, and the third one is load-bearing:
+ *
+ * - `pass`    — every requirement of the criterion is satisfied by evidence
+ *               that is present, current and unopposed.
+ * - `fail`    — evidence is present and contradicts the criterion.
+ * - `unknown` — the criterion could not be resolved.
+ *
+ * `unknown` covers both "nothing was researched yet" and "the sources
+ * disagree". It never becomes `fail`, so an un-researched account is not
+ * penalised, and it never becomes `pass`, so a missing fact is never read as
+ * a fit. There is no `conflicted` outcome: a disagreement is an `unknown` with
+ * a reason that names the conflict, so the conflict can never hide inside a
+ * status nobody looks for.
+ */
+export type QualificationCriterionOutcome = "pass" | "fail" | "unknown";
+
+/**
+ * The state of a whole evaluation.
+ *
+ * Four states, and only one of them is a verdict:
+ *
+ * - `qualified`        — every dimension resolved and every criterion passed.
+ * - `unqualified`      — every dimension resolved and at least one criterion
+ *                        failed against the criteria the business defined.
+ * - `insufficient_data`— at least one criterion is `unknown`, so no verdict
+ *                        is issued. This is a first-class outcome, not an
+ *                        error and not a failure.
+ * - `contested`        — at least one criterion is `unknown` because its
+ *                        sources disagree. Strictly stronger than
+ *                        `insufficient_data`: the data exists and conflicts,
+ *                        and DEALORA does not resolve it. Checked first.
+ *
+ * There is deliberately no `approved`, `picked`, `contacted` or `prioritised`
+ * member. Approval is Phase 10 (`ROADMAP.md` §17) and prioritization is
+ * Phase 14; a qualification result is an input to both and never their output.
+ */
+export type QualificationState = "qualified" | "unqualified" | "insufficient_data" | "contested";
+
+/**
+ * One criterion evaluation.
+ *
+ * `ROADMAP.md` §15 requires every score to carry a score, a reason, its
+ * evidence and a confidence. This record is that unit, and it is the smallest
+ * thing a user can inspect: `expectation` states the rule as the business's own
+ * ICP defines it, `observed` states what the account's evidence actually said,
+ * and `evidenceIds`/`claimIds` name exactly which records were compared.
+ *
+ * `confidence` is `null` only when `result` is `unknown`, because there is no
+ * agreed value to be confident about. It is the weakest supporting evidence
+ * band, not a new scale.
+ */
+export interface QualificationCriterionResult {
+  dimension: QualificationDimension;
+  /** The stable criterion key, unique within the rule version. */
+  criterion: string;
+  /** What the ICP, plan or goal this rule reads requires, rendered. */
+  expectation: string;
+  /** The claim value the comparison actually used. `null` when unresolved. */
+  observed: string | null;
+  result: QualificationCriterionOutcome;
+  reason: string;
+  confidence: ResearchConfidence | null;
+  /** The evidence records this criterion read. References, never copies. */
+  evidenceIds: EntityId[];
+  /** The claims this criterion read. References, never copies. */
+  claimIds: EntityId[];
+}
+
+/**
+ * One dimension's roll-up over its criteria.
+ *
+ * `score` is `null` whenever the dimension is `unknown`: a partially-evidenced
+ * dimension has no honest number, and reporting one is how a missing fact
+ * becomes a fake pass. When the dimension did resolve, the score is the share
+ * of its criteria that passed, weighted equally — a ratio of counts, not a
+ * calibrated probability.
+ */
+export interface QualificationDimensionResult {
+  dimension: QualificationDimension;
+  score: number | null;
+  result: QualificationCriterionOutcome;
+  reason: string;
+  confidence: ResearchConfidence | null;
+  /** How many of the dimension's criteria could be resolved at all. */
+  resolvedCriteria: number;
+  criteria: QualificationCriterionResult[];
+}
+
+/**
+ * One qualification evaluation: the "why" behind a score, persisted.
+ *
+ * The record is an immutable, versioned snapshot. Re-evaluating inserts a new
+ * `version` for the account rather than rewriting this one, so a score a user
+ * acted on last quarter is still explainable after the rules change — and it
+ * stays explainable because the record names the `ruleVersion`, the Business
+ * Brain `icpId` and the `contextDigest` of the exact ICP and goal state that
+ * produced it, rather than copying the Business Brain into itself.
+ */
+export interface Qualification {
+  id: EntityId;
+  workspaceId: EntityId;
+  accountId: EntityId;
+  createdBy: EntityId;
+  /** 1-based version within the account's lineage. Never reused. */
+  version: number;
+  /** Which rule set produced this evaluation. Never overwritten. */
+  ruleVersion: string;
+  /** The plan this account was sourced against, when it has one. */
+  revenuePlanId: EntityId | null;
+  /** The goal whose time window the timing criterion read. */
+  revenueGoalId: EntityId | null;
+  /** The canonical ICP record this evaluation was measured against. */
+  icpId: EntityId | null;
+  /** Digest of the ICP and goal context actually used. Never the objects. */
+  contextDigest: string;
+  state: QualificationState;
+  /**
+   * The Dealora Score, 0-100, or `null` when any dimension is unresolved.
+   *
+   * All-or-nothing on purpose: a score averaged over a partially-researched
+   * account would let missing evidence read as a fit.
+   */
+  score: number | null;
+  /** Weakest confidence band across the scored dimensions. `null` with `null`. */
+  confidence: ResearchConfidence | null;
+  reason: string;
+  /** Every evidence record the evaluation read, for one-hop traceability. */
+  evidenceIds: EntityId[];
+  /** Every claim the evaluation read. */
+  claimIds: EntityId[];
+  /**
+   * Claims whose sources disagree.
+   *
+   * Named explicitly so a conflict can never be resolved quietly: this list is
+   * why `state` can be `contested` rather than being flattened into
+   * `insufficient_data`.
+   */
+  conflictedClaimIds: EntityId[];
+  dimensions: QualificationDimensionResult[];
+  evaluatedAt: DateTime;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}

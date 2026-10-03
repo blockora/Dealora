@@ -26,6 +26,8 @@ import type {
   AccountClaimStatus,
   Evidence,
   EvidenceStatus,
+  Qualification,
+  QualificationState,
   User,
   Workspace,
   WorkspaceMember,
@@ -104,7 +106,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 7;
+export const LATEST_SCHEMA_VERSION = 8;
 
 export interface DbState {
   schemaVersion?: number;
@@ -127,6 +129,7 @@ export interface DbState {
   researchFindings?: ResearchFinding[];
   accountClaims?: AccountClaim[];
   evidence?: Evidence[];
+  qualifications?: Qualification[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -154,6 +157,7 @@ export function emptyState(): CompleteDbState {
     researchFindings: [],
     accountClaims: [],
     evidence: [],
+    qualifications: [],
   };
 }
 
@@ -172,6 +176,11 @@ export function emptyState(): CompleteDbState {
  *
  * Step 7 (Phase 7 — Evidence System): add `account_claims` and `evidence`.
  * Additive like every step before it, and no existing row is rewritten.
+ *
+ * Step 8 (Phase 8 — Qualification Engine): add `qualifications`. Purely
+ * additive: a Phase 7 document gains one empty table and keeps every account,
+ * claim and evidence record it already had, so an account that was qualified
+ * before the upgrade can be qualified again afterwards.
  */
 export function migrateState(input: DbState): CompleteDbState {
   const base = emptyState();
@@ -239,6 +248,15 @@ export function migrateState(input: DbState): CompleteDbState {
     state.evidence = Array.isArray(input.evidence) ? input.evidence : base.evidence;
   }
 
+  // Phase 8 adds qualification evaluations. Additive: nothing before it is
+  // touched, so a document written by Phase 7 loads with an empty qualification
+  // table and every account, claim and evidence record exactly as it was.
+  if (version >= 8) {
+    state.qualifications = Array.isArray(input.qualifications)
+      ? input.qualifications
+      : base.qualifications;
+  }
+
   return state;
 }
 
@@ -277,6 +295,7 @@ type RowTable =
   | "researchFindings"
   | "accountClaims"
   | "evidence"
+  | "qualifications"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -2092,6 +2111,145 @@ export class Store {
     return { ok: true, value: record };
   }
 
+  // -------------------------------------------------------------------------
+  // Phase 8 — Qualification Engine
+  // -------------------------------------------------------------------------
+
+  /**
+   * The next 1-based version within an account's qualification lineage.
+   *
+   * Counted from stored rows rather than from a counter, so a restored backup
+   * cannot reissue a version that a user has already seen.
+   */
+  nextQualificationVersion(accountId: EntityId): Result<number, StorageError> {
+    const versions = this.rows("qualifications")
+      .filter((q) => q.accountId === accountId)
+      .map((q) => q.version);
+    return { ok: true, value: versions.length === 0 ? 1 : Math.max(...versions) + 1 };
+  }
+
+  /**
+   * Record one qualification evaluation.
+   *
+   * The account must live in the same workspace as the evaluation, so the
+   * invariant `Qualification.workspaceId === Account.workspaceId` holds at
+   * write time rather than resting on the caller. The plan and goal references
+   * must belong to that same workspace too: a qualification can never point at
+   * another tenant's plan or goal, which would let one workspace's target be
+   * measured against another's business context.
+   *
+   * The version is computed here rather than accepted, so two concurrent
+   * evaluations cannot claim the same slot in the account's history.
+   */
+  createQualification(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    accountId: EntityId;
+    qualification: Omit<
+      Qualification,
+      "id" | "workspaceId" | "accountId" | "createdBy" | "version" | "createdAt" | "updatedAt"
+    >;
+  }): Result<Qualification, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+    const account = this.findById("accounts", input.accountId);
+    if (!account || account.workspaceId !== input.workspaceId) {
+      return {
+        ok: false,
+        error: toError("INVALID", "account does not exist in this workspace"),
+      };
+    }
+    if (input.qualification.revenuePlanId !== null) {
+      const plan = this.findById("revenuePlans", input.qualification.revenuePlanId);
+      if (!plan || plan.workspaceId !== input.workspaceId) {
+        return {
+          ok: false,
+          error: toError("INVALID", "revenue plan does not exist in this workspace"),
+        };
+      }
+    }
+    if (input.qualification.revenueGoalId !== null) {
+      const goal = this.findById("revenueGoals", input.qualification.revenueGoalId);
+      if (!goal || goal.workspaceId !== input.workspaceId) {
+        return {
+          ok: false,
+          error: toError("INVALID", "revenue goal does not exist in this workspace"),
+        };
+      }
+    }
+    if (input.qualification.icpId !== null) {
+      const icp = this.findById("icps", input.qualification.icpId);
+      if (!icp || icp.workspaceId !== input.workspaceId) {
+        return {
+          ok: false,
+          error: toError("INVALID", "icp does not exist in this workspace"),
+        };
+      }
+    }
+
+    const next = this.nextQualificationVersion(account.id);
+    if (!next.ok) return next;
+    const stamp = toDateTime(now());
+    const qualification: Qualification = {
+      ...input.qualification,
+      id: newId(),
+      workspaceId: input.workspaceId,
+      accountId: account.id,
+      createdBy: input.createdBy,
+      version: next.value,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    this.mutate("qualifications", (rows) => rows.push(qualification));
+    return { ok: true, value: qualification };
+  }
+
+  getQualification(id: EntityId, userId: EntityId): Result<Qualification, StorageError> {
+    const qualification = this.findById("qualifications", id);
+    if (!qualification)
+      return { ok: false, error: toError("NOT_FOUND", "qualification not found") };
+    const auth = this.requireWorkspace(qualification.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: qualification };
+  }
+
+  /**
+   * A workspace's qualifications, newest first, optionally narrowed.
+   *
+   * Nothing is filtered out by default: every past version of every account
+   * stays listable, because a record that can be superseded into invisibility
+   * is not an audit trail.
+   */
+  listQualifications(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: {
+      accountId?: EntityId;
+      state?: QualificationState;
+      ruleVersion?: string;
+    },
+  ): Result<Qualification[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("qualifications").filter((q) => q.workspaceId === workspaceId);
+    const filtered = scoped.filter((q) => {
+      if (filter?.accountId && q.accountId !== filter.accountId) return false;
+      if (filter?.state && q.state !== filter.state) return false;
+      if (filter?.ruleVersion && q.ruleVersion !== filter.ruleVersion) return false;
+      return true;
+    });
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) =>
+        a.evaluatedAt < b.evaluatedAt
+          ? 1
+          : a.evaluatedAt > b.evaluatedAt
+            ? -1
+            : b.version - a.version,
+      ),
+    };
+  }
+
   /** Cleanup helper so tests and local runs do not leave files behind. */
   destroy(): void {
     try {
@@ -2191,6 +2349,10 @@ export const db = {
   getEvidence: store.getEvidence.bind(store),
   listEvidence: store.listEvidence.bind(store),
   updateEvidence: store.updateEvidence.bind(store),
+  nextQualificationVersion: store.nextQualificationVersion.bind(store),
+  createQualification: store.createQualification.bind(store),
+  getQualification: store.getQualification.bind(store),
+  listQualifications: store.listQualifications.bind(store),
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),
   workspaceOwner: store.workspaceOwner.bind(store),

@@ -28,6 +28,14 @@
  *   Account 1 -- * ResearchRequest
  *   ResearchRequest 1 -- * ResearchFinding
  *
+ * Relations (Phase 8 — Qualification Engine, ROADMAP.md §15):
+ *   Account 1 -- * Qualification
+ *
+ * A qualification row references the plan, goal and ICP it was measured
+ * against with `ON DELETE SET NULL`: a deleted plan or goal must not delete a
+ * decision a user already made, and a qualification whose goal row is gone
+ * still carries the digest and criterion results that explain it.
+ *
  * No other tables exist yet: ROADMAP.md §8 explicitly says "Not every entity
  * needs full functionality in Phase 1", and §9 lists further Business Brain
  * concepts (case studies, FAQs, competitors, playbooks) that the phases that
@@ -159,6 +167,17 @@ export const COLUMNS = {
   accountClaimId: "account_claim_id",
   researchFindingId: "research_finding_id",
   provenance: "provenance",
+  version: "version",
+  ruleVersion: "rule_version",
+  contextDigest: "context_digest",
+  state: "state",
+  score: "score",
+  reason: "reason",
+  evidenceIds: "evidence_ids",
+  claimIds: "claim_ids",
+  conflictedClaimIds: "conflicted_claim_ids",
+  dimensions: "dimensions",
+  evaluatedAt: "evaluated_at",
 } as const;
 
 export type ColumnName = (typeof COLUMNS)[keyof typeof COLUMNS];
@@ -248,6 +267,24 @@ export const accountClaimTable = "account_claims" as const;
  */
 export const evidenceTable = "evidence" as const;
 
+/**
+ * Table: qualification evaluations (Phase 8).
+ *
+ * One row per evaluation of one account. Re-evaluating inserts a new
+ * `version` instead of overwriting, so the score a user acted on stays
+ * explainable after the rule set moves on.
+ *
+ * `dimensions` holds the per-criterion results as one document column, exactly
+ * as `revenue_plans.strategies` does: the criteria are only ever read as part
+ * of the evaluation that produced them, and splitting them into a child table
+ * would invite a criterion row to outlive the decision that explains it.
+ *
+ * There is no `status` column. A qualification is not a workflow object: it has
+ * no draft state to approve and nothing to action, so a lifecycle here would
+ * only import Phase 10's semantics.
+ */
+export const qualificationTable = "qualifications" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -269,6 +306,7 @@ export const tables = [
   researchFindingTable,
   accountClaimTable,
   evidenceTable,
+  qualificationTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -367,6 +405,13 @@ export const indexes = {
     `${COLUMN(evidenceTable, COLUMNS.accountId)} NOT NULL`,
     `${COLUMN(evidenceTable, COLUMNS.accountClaimId)} NOT NULL`,
     `${COLUMN(evidenceTable, COLUMNS.status)} NOT NULL`,
+  ],
+  qualifications: [
+    `${COLUMN(qualificationTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(qualificationTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(qualificationTable, COLUMNS.accountId)} NOT NULL`,
+    `${COLUMN(qualificationTable, COLUMNS.version)} NOT NULL`,
+    `${COLUMN(qualificationTable, COLUMNS.state)} NOT NULL`,
   ],
 };
 
@@ -761,6 +806,40 @@ ${COLUMN(evidenceTable, COLUMNS.researchFindingId)} REFERENCES "${researchFindin
 ${COLUMN(evidenceTable, COLUMNS.provenance)} CHECK (${COLUMN(evidenceTable, COLUMNS.provenance)} IN ('research_finding','user_supplied')),
 ${COLUMN(evidenceTable, COLUMNS.source)} CHECK (${COLUMN(evidenceTable, COLUMNS.source)} IN ('account_record','approved_api','public_web')),
 ${COLUMN(evidenceTable, COLUMNS.status)} CHECK (${COLUMN(evidenceTable, COLUMNS.status)} IN ('recorded','superseded','contradicted','rejected'))`,
+  ),
+  createTableSql(
+    qualificationTable,
+    [
+      COLUMN(qualificationTable, COLUMNS.id),
+      COLUMN(qualificationTable, COLUMNS.workspaceId),
+      COLUMN(qualificationTable, COLUMNS.accountId),
+      COLUMN(qualificationTable, COLUMNS.ownerId),
+      COLUMN(qualificationTable, COLUMNS.version),
+      COLUMN(qualificationTable, COLUMNS.ruleVersion),
+      COLUMN(qualificationTable, COLUMNS.revenuePlanId),
+      COLUMN(qualificationTable, COLUMNS.revenueGoalId),
+      COLUMN(qualificationTable, COLUMNS.icpId),
+      COLUMN(qualificationTable, COLUMNS.contextDigest),
+      COLUMN(qualificationTable, COLUMNS.state),
+      COLUMN(qualificationTable, COLUMNS.score),
+      COLUMN(qualificationTable, COLUMNS.confidence),
+      COLUMN(qualificationTable, COLUMNS.reason),
+      COLUMN(qualificationTable, COLUMNS.evidenceIds),
+      COLUMN(qualificationTable, COLUMNS.claimIds),
+      COLUMN(qualificationTable, COLUMNS.conflictedClaimIds),
+      COLUMN(qualificationTable, COLUMNS.dimensions),
+      COLUMN(qualificationTable, COLUMNS.evaluatedAt),
+    ],
+    `${COLUMN(qualificationTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(qualificationTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(qualificationTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(qualificationTable, COLUMNS.ownerId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(qualificationTable, COLUMNS.revenuePlanId)} REFERENCES "${revenuePlanTable}"("${COLUMNS.id}") ON DELETE SET NULL,
+${COLUMN(qualificationTable, COLUMNS.revenueGoalId)} REFERENCES "${revenueGoalTable}"("${COLUMNS.id}") ON DELETE SET NULL,
+${COLUMN(qualificationTable, COLUMNS.icpId)} REFERENCES "${icpTable}"("${COLUMNS.id}") ON DELETE SET NULL,
+${COLUMN(qualificationTable, COLUMNS.version)} CHECK (${COLUMN(qualificationTable, COLUMNS.version)} > 0),
+${COLUMN(qualificationTable, COLUMNS.score)} CHECK (${COLUMN(qualificationTable, COLUMNS.score)} IS NULL OR (${COLUMN(qualificationTable, COLUMNS.score)} >= 0 AND ${COLUMN(qualificationTable, COLUMNS.score)} <= 100)),
+${COLUMN(qualificationTable, COLUMNS.state)} CHECK (${COLUMN(qualificationTable, COLUMNS.state)} IN ('qualified','unqualified','insufficient_data','contested'))`,
   ),
 ].join("\n\n");
 

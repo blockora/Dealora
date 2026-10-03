@@ -12,7 +12,15 @@ import {
 } from "./repository.js";
 import type { DbState } from "./repository.js";
 import { toDateTime } from "./types.js";
-import type { Claim, Evidence, ResearchFinding, RevenueGoal, RevenuePlan, User } from "./types.js";
+import type {
+  Claim,
+  Evidence,
+  Qualification,
+  ResearchFinding,
+  RevenueGoal,
+  RevenuePlan,
+  User,
+} from "./types.js";
 
 function seed(): Store {
   return new Store(emptyState());
@@ -1819,5 +1827,390 @@ describe("account claims and evidence", () => {
     expect(migrated.evidence[0]?.provenance).toBe("research_finding");
     expect(migrated.evidence[0]?.accountClaimId).toBe(claim.value.id);
     expect(migrated.evidence[0]?.accountId).toBe(account.id);
+  });
+});
+
+describe("qualification evaluations", () => {
+  const qualificationAccount = (
+    store: Store,
+    workspaceId: string,
+    userId: string,
+    name: string,
+  ) => {
+    const created = store.createAccount({
+      workspaceId,
+      createdBy: userId,
+      account: {
+        name,
+        website: null,
+        domain: null,
+        industry: null,
+        companySize: null,
+        geography: null,
+        description: null,
+        source: "manual",
+        sourceReference: null,
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(created)) throw new Error("seed account creation failed");
+    return created.value;
+  };
+
+  const criterionResult = (
+    overrides: Partial<{
+      result: "pass" | "fail" | "unknown";
+      criterion: string;
+      confidence: "low" | "medium" | "high" | null;
+    }> = {},
+  ) => ({
+    dimension: "icp_fit" as const,
+    criterion: overrides.criterion ?? "industry_match",
+    expectation: "ICP industries: saas",
+    observed: overrides.result === "unknown" ? null : "B2B SaaS",
+    result: overrides.result ?? ("pass" as const),
+    reason: 'the account\'s industry evidence states "B2B SaaS"',
+    confidence: overrides.confidence === undefined ? ("high" as const) : overrides.confidence,
+    evidenceIds: ["evidence-industry"],
+    claimIds: ["claim-industry"],
+  });
+
+  const qualificationInput = (
+    overrides: Partial<{
+      score: number | null;
+      state: Qualification["state"];
+      confidence: "low" | "medium" | "high" | null;
+      revenuePlanId: string | null;
+      revenueGoalId: string | null;
+      icpId: string | null;
+    }> = {},
+  ) => ({
+    ruleVersion: "deterministic-1.0.0",
+    revenuePlanId: overrides.revenuePlanId ?? null,
+    revenueGoalId: overrides.revenueGoalId ?? null,
+    icpId: overrides.icpId ?? null,
+    contextDigest: "fnv1a-0a1b2c3d",
+    state: overrides.state ?? ("qualified" as const),
+    score: overrides.score === undefined ? 100 : overrides.score,
+    confidence: overrides.confidence === undefined ? ("high" as const) : overrides.confidence,
+    reason: "every criterion resolved and passed against the workspace icp",
+    evidenceIds: ["evidence-industry"],
+    claimIds: ["claim-industry"],
+    conflictedClaimIds: [],
+    dimensions: [
+      {
+        dimension: "icp_fit" as const,
+        score: 100,
+        result: "pass" as const,
+        reason: "every icp_fit criterion resolved and passed",
+        confidence: "high" as const,
+        resolvedCriteria: 1,
+        criteria: [criterionResult()],
+      },
+    ],
+    evaluatedAt: "2026-10-03T12:00:00.000Z",
+  });
+
+  it("stores an evaluation with its criterion results and survives a reload", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Qualification Co");
+    const account = qualificationAccount(store, workspaceId, owner.id, "Northwind Trading");
+
+    const created = store.createQualification({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.id,
+      qualification: qualificationInput(),
+    });
+    if (!isOk(created)) throw new Error("qualification creation failed");
+    // The tenant boundary and the lineage version come from storage, not the caller.
+    expect(created.value.workspaceId).toBe(workspaceId);
+    expect(created.value.accountId).toBe(account.id);
+    expect(created.value.createdBy).toBe(owner.id);
+    expect(created.value.version).toBe(1);
+    expect(created.value.state).toBe("qualified");
+    expect(created.value.score).toBe(100);
+    expect(created.value.ruleVersion).toBe("deterministic-1.0.0");
+
+    const reloaded = new Store(JSON.parse(JSON.stringify(store.db)) as never);
+    const found = reloaded.getQualification(created.value.id, owner.id);
+    if (!isOk(found)) throw new Error("qualification read after reload failed");
+    // The per-criterion detail survives intact: that is the "why".
+    expect(found.value.dimensions).toHaveLength(1);
+    expect(found.value.dimensions[0]?.criteria[0]?.criterion).toBe("industry_match");
+    expect(found.value.dimensions[0]?.criteria[0]?.expectation).toBe("ICP industries: saas");
+    expect(found.value.dimensions[0]?.criteria[0]?.evidenceIds).toEqual(["evidence-industry"]);
+    expect(found.value.evaluatedAt).toBe("2026-10-03T12:00:00.000Z");
+    expect(found.value.contextDigest).toBe("fnv1a-0a1b2c3d");
+  });
+
+  it("versions each account's lineage instead of overwriting it", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Qualification Lineage Co");
+    const account = qualificationAccount(store, workspaceId, owner.id, "Lineage Trading");
+    const other = qualificationAccount(store, workspaceId, owner.id, "Other Trading");
+
+    const first = store.createQualification({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.id,
+      qualification: qualificationInput({ state: "insufficient_data", score: null }),
+    });
+    const second = store.createQualification({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.id,
+      qualification: qualificationInput(),
+    });
+    const otherAccount = store.createQualification({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: other.id,
+      qualification: qualificationInput(),
+    });
+    if (!isOk(first) || !isOk(second) || !isOk(otherAccount)) {
+      throw new Error("qualification creation failed");
+    }
+    expect(first.value.version).toBe(1);
+    expect(second.value.version).toBe(2);
+    // A different account has its own lineage.
+    expect(otherAccount.value.version).toBe(1);
+
+    const listed = store.listQualifications(workspaceId, owner.id, { accountId: account.id });
+    if (!isOk(listed)) throw new Error("qualification listing failed");
+    expect(listed.value).toHaveLength(2);
+    // Newest first, so the current judgement is what a user sees.
+    expect(listed.value[0]?.version).toBe(2);
+    expect(listed.value[1]?.version).toBe(1);
+    // And the earlier version is still readable, including its unresolved state.
+    expect(listed.value[1]?.state).toBe("insufficient_data");
+    expect(listed.value[1]?.score).toBeNull();
+
+    const next = store.nextQualificationVersion(account.id);
+    if (!isOk(next)) throw new Error("version read failed");
+    expect(next.value).toBe(3);
+  });
+
+  it("filters by state and rule version without hiding history", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Qualification Filter Co");
+    const account = qualificationAccount(store, workspaceId, owner.id, "Filter Trading");
+
+    store.createQualification({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.id,
+      qualification: qualificationInput(),
+    });
+    store.createQualification({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.id,
+      qualification: qualificationInput({
+        state: "contested",
+        score: null,
+        confidence: null,
+      }),
+    });
+
+    const contested = store.listQualifications(workspaceId, owner.id, { state: "contested" });
+    if (!isOk(contested)) throw new Error("qualification listing failed");
+    expect(contested.value).toHaveLength(1);
+    expect(contested.value[0]?.state).toBe("contested");
+    expect(contested.value[0]?.score).toBeNull();
+
+    const unknownRules = store.listQualifications(workspaceId, owner.id, {
+      ruleVersion: "deterministic-0.0.0",
+    });
+    if (!isOk(unknownRules)) throw new Error("qualification listing failed");
+    expect(unknownRules.value).toEqual([]);
+
+    const all = store.listQualifications(workspaceId, owner.id);
+    if (!isOk(all)) throw new Error("qualification listing failed");
+    expect(all.value).toHaveLength(2);
+  });
+
+  it("keeps tenants apart and refuses another workspace's context", () => {
+    const store = seed();
+    const ownerA = makeOwner(store, "qual-a@example.com");
+    const ownerB = makeOwner(store, "qual-b@example.com");
+    const wsA = makeWorkspace(store, ownerA.id, "Qualification Globex");
+    const wsB = makeWorkspace(store, ownerB.id, "Qualification Initech");
+    const accountA = qualificationAccount(store, wsA, ownerA.id, "Confidential Trading");
+
+    const created = store.createQualification({
+      workspaceId: wsA,
+      createdBy: ownerA.id,
+      accountId: accountA.id,
+      qualification: qualificationInput(),
+    });
+    if (!isOk(created)) throw new Error("qualification creation failed");
+
+    // A foreign caller cannot read it, and cannot even learn that it exists.
+    const denied = store.getQualification(created.value.id, ownerB.id);
+    expect(isErr(denied)).toBe(true);
+    if (isErr(denied)) expect(denied.error.code).toBe("UNAUTHORIZED");
+    const foreignList = store.listQualifications(wsA, ownerB.id);
+    expect(isErr(foreignList)).toBe(true);
+    const emptyList = store.listQualifications(wsB, ownerB.id);
+    if (!isOk(emptyList)) throw new Error("qualification listing failed");
+    expect(emptyList.value).toEqual([]);
+
+    // An evaluation cannot be written for another workspace's account...
+    const foreignAccount = store.createQualification({
+      workspaceId: wsB,
+      createdBy: ownerB.id,
+      accountId: accountA.id,
+      qualification: qualificationInput(),
+    });
+    expect(isErr(foreignAccount)).toBe(true);
+    if (isErr(foreignAccount)) expect(foreignAccount.error.code).toBe("INVALID");
+
+    // ...and the workspace context it points at must be its own too.
+    const goalA = store.createRevenueGoal({
+      workspaceId: wsA,
+      createdBy: ownerA.id,
+      goal: {
+        objective: "Grow pipeline",
+        targetMetric: "pipeline",
+        targetValue: 10000,
+        currency: "USD",
+        timeWindow: { start: "2026-01-01", end: "2026-06-01" },
+        market: null,
+        icpId: null,
+        buyerPersonaIds: [],
+        offerId: null,
+        economics: {
+          averageDealValue: null,
+          minimumContractValue: null,
+          targetCustomers: null,
+          currency: null,
+        },
+        constraints: {
+          geographies: [],
+          industries: [],
+          companySizes: [],
+          channels: [],
+          budget: null,
+          maxOutreachPerDay: null,
+          notes: null,
+        },
+        approvalPolicy: {
+          maxRiskLevel: "level_2_external_action",
+          externalActionsRequireApproval: true,
+          approverUserId: null,
+        },
+        successMetrics: [],
+        status: "active",
+        completeness: "incomplete",
+        unknowns: [],
+        assumptions: [],
+      },
+    });
+    if (!isOk(goalA)) throw new Error("seed goal creation failed");
+
+    const foreignGoal = store.createQualification({
+      workspaceId: wsB,
+      createdBy: ownerB.id,
+      accountId: qualificationAccount(store, wsB, ownerB.id, "Initech Trading").id,
+      qualification: qualificationInput({ revenueGoalId: goalA.value.id }),
+    });
+    expect(isErr(foreignGoal)).toBe(true);
+    if (isErr(foreignGoal)) expect(foreignGoal.error.code).toBe("INVALID");
+  });
+
+  it("preserves Phase 7 data when migrating a v7 document to v8", () => {
+    const v7 = emptyState();
+    v7.schemaVersion = 7;
+    const store = new Store(v7);
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "V7 Qualification Co");
+    const account = qualificationAccount(store, workspaceId, owner.id, "V7 Qualification Trading");
+    const claim = store.createAccountClaim({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.id,
+      category: "company_overview",
+      field: "website",
+      value: "https://northwind.example",
+      claimKind: "fact",
+    });
+    if (!isOk(claim)) throw new Error("seed claim creation failed");
+    store.createEvidence({
+      workspaceId,
+      accountClaimId: claim.value.id,
+      evidence: {
+        researchFindingId: null,
+        provenance: "research_finding",
+        source: "public_web",
+        sourceName: "company_registry",
+        sourceUrl: "https://northwind.example",
+        sourceTitle: "Company registry entry",
+        observedAt: "2026-09-01T00:00:00.000Z",
+        retrievedAt: "2026-10-02T00:00:00.000Z",
+        confidence: "medium",
+        freshness: "fresh",
+        relevance: "high",
+        note: null,
+        status: "recorded",
+      },
+    });
+
+    const migrated = migrateState(JSON.parse(JSON.stringify(store.db)) as never);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    // Phase 7 rows survive untouched, so the account can still be qualified.
+    expect(migrated.accountClaims).toHaveLength(1);
+    expect(migrated.evidence).toHaveLength(1);
+    expect(migrated.evidence[0]?.sourceName).toBe("company_registry");
+    // The Phase 8 table is additive: an older document gains it empty.
+    expect(migrated.qualifications).toEqual([]);
+
+    // And the upgraded document still holds an untouched Phase 7 chain.
+    const upgraded = new Store(migrated);
+    const reread = upgraded.listEvidence(workspaceId, owner.id, { accountId: account.id });
+    if (!isOk(reread)) throw new Error("evidence read after migration failed");
+    expect(reread.value).toHaveLength(1);
+    const evaluations = upgraded.listQualifications(workspaceId, owner.id);
+    if (!isOk(evaluations)) throw new Error("qualification listing failed");
+    expect(evaluations.value).toEqual([]);
+  });
+
+  it("keeps Phase 8 rows across a repeat migration", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Repeat Qualification Co");
+    const account = qualificationAccount(
+      store,
+      workspaceId,
+      owner.id,
+      "Repeat Qualification Trading",
+    );
+    const created = store.createQualification({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.id,
+      qualification: qualificationInput(),
+    });
+    if (!isOk(created)) throw new Error("qualification creation failed");
+
+    const migrated = migrateState(JSON.parse(JSON.stringify(store.db)) as never);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    expect(migrated.qualifications).toHaveLength(1);
+    expect(migrated.qualifications[0]?.id).toBe(created.value.id);
+    expect(migrated.qualifications[0]?.version).toBe(1);
+    // Migrating again is idempotent, so the lineage does not shift underneath.
+    expect(migrateState(migrated).qualifications).toHaveLength(1);
+  });
+
+  it("reports a missing evaluation rather than an empty one", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const absent = store.getQualification(newId(), owner.id);
+    expect(isErr(absent)).toBe(true);
+    if (isErr(absent)) expect(absent.error.code).toBe("NOT_FOUND");
   });
 });

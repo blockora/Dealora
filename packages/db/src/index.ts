@@ -74,6 +74,12 @@ export type {
   Evidence,
   EvidenceStatus,
   EvidenceProvenance,
+  Qualification,
+  QualificationDimension,
+  QualificationDimensionResult,
+  QualificationCriterionResult,
+  QualificationCriterionOutcome,
+  QualificationState,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -101,6 +107,7 @@ export {
   researchFindingTable,
   accountClaimTable,
   evidenceTable,
+  qualificationTable,
   createTableSql,
   slugify,
   capString,
