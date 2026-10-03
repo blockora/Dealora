@@ -1181,19 +1181,28 @@ describe("qualification authorization and refusals", () => {
     seedCompleteEvidence(store, workspaceId, owner.id, account.id);
     const engine = service(store, icp, goal, planFor(planId ?? "", workspaceId, goal?.id ?? null));
 
-    // Everything a caller might try to assert is simply not an input.
-    const result = engine.evaluateAccount(workspaceId, owner.id, account.id, {
+    // Everything a caller might try to assert is simply not an input. Typed as a
+    // loose record so the call compiles the way a real request body would
+    // arrive — the service accepts an untrusted shape, not a typed one.
+    const asserted: Record<string, unknown> = {
       score: 100,
       state: "qualified",
       confidence: "high",
       priority: 1,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any);
+      dimensions: [{ dimension: "icp_fit", score: 100, result: "pass" }],
+    };
+    const result = engine.evaluateAccount(workspaceId, owner.id, account.id, asserted);
     if (!isOk(result)) throw new Error("expected success");
-    // The score came from the evidence, so removing the asserted one changes
-    // nothing at all.
+    // The score came from the evidence, so the asserted values changed nothing.
     expect(result.value.score).toBe(100);
+    expect(result.value.state).toBe("qualified");
+    expect(result.value.confidence).toBe("high");
     expect(result.value.ruleVersion).toBe(QUALIFICATION_RULE_VERSION);
+    // And the criteria were computed, not copied from the request.
+    expect(result.value.dimensions[0]?.criteria).toHaveLength(3);
+    expect(
+      result.value.dimensions[0]?.criteria.every((criterion) => criterion.result === "pass"),
+    ).toBe(true);
   });
 });
 
