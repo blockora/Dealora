@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 
 import { AuthError } from "./types.js";
-import type { Session, EntityId } from "./types.js";
+import type { AuthContext, EntityId, Session, User } from "./types.js";
 
 /** In-memory session index keyed by token. Tests can seed an index. */
 export interface SessionIndex {
@@ -14,14 +14,27 @@ export function createIndex(): SessionIndex {
   return { map: new Map(), userIndex: new Map() };
 }
 
-/** Create a session for a user in the given workspace. The workspace is
- *  validated server-side against the requesting user. */
+/** Session lifetime. */
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Authorizer callback supplied by the persistence layer.
+ *
+ * Returning `true` means the user may act in the workspace. The callback is
+ * always the server-side store, never a client-supplied decision.
+ */
+export type AuthorizeFn = (workspaceId: EntityId, userId: EntityId) => boolean;
+
+/**
+ * Create a session for a user in the given workspace. The workspace is
+ * validated server-side against the requesting user.
+ */
 export function createSession(
   userId: EntityId,
   workspaceId: EntityId,
   assignee: User,
   sessions: SessionIndex,
-  authorize: (id: EntityId, userId: EntityId) => boolean,
+  authorize: AuthorizeFn,
 ): { token: string; session: Session } {
   if (!assignee || assignee.id !== userId) {
     throw new AuthError("UNAUTHENTICATED", "invalid session");
@@ -35,11 +48,11 @@ export function createSession(
     userId,
     workspaceId,
     token,
-    expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days
+    expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString(),
     createdAt: new Date().toISOString(),
   };
   sessions.map.set(token, session);
-  const byUser = sessions.userIndex.get(userId) ?? new Set();
+  const byUser = sessions.userIndex.get(userId) ?? new Set<string>();
   byUser.add(token);
   sessions.userIndex.set(userId, byUser);
   return { token, session };
@@ -48,9 +61,7 @@ export function createSession(
 /** Return the session for a token, or null when the token is unknown. */
 export function getSession(token: string, sessions: SessionIndex): Session | null {
   if (!token) return null;
-  const found = sessions.map.get(token);
-  if (!found) return null;
-  return found;
+  return sessions.map.get(token) ?? null;
 }
 
 /** Verify the token and return the session, or throw a typed auth error. */
@@ -60,6 +71,10 @@ export function verifySession(
 ): { ok: true; session: Session; userId: EntityId } {
   const session = getSession(token, sessions);
   if (!session) {
+    throw new AuthError("UNAUTHENTICATED", "session expired or missing");
+  }
+  if (new Date(session.expiresAt).getTime() <= Date.now()) {
+    sessions.map.delete(token);
     throw new AuthError("UNAUTHENTICATED", "session expired or missing");
   }
   return { ok: true, session, userId: session.userId };
@@ -107,19 +122,19 @@ export function assertSignedIn(ctx: AuthContext | null): AuthContext {
 }
 
 /**
- * Enforce that the signed-in user owns a workspace. Used by handlers for
- * write operations and by the business profile services.
+ * Enforce that the signed-in user may act in a workspace. Membership is
+ * resolved through the injected server-side authorizer, so a caller cannot
+ * assert its own access.
  */
 export function requireOwnership(
   ctx: AuthContext,
   workspaceId: EntityId,
-  allowMemberRead: boolean,
-  authorize: (workspaceId: EntityId, userId: EntityId) => boolean,
+  authorize: AuthorizeFn,
 ): void {
   if (!ctx.userId) {
-    throw new AuthError({ code: "UNAUTHENTICATED", message: "authentication required" });
+    throw new AuthError("UNAUTHENTICATED", "authentication required");
   }
   if (!authorize(workspaceId, ctx.userId)) {
-    throw new AuthError({ code: "UNAUTHORIZED", message: "workspace access denied" });
+    throw new AuthError("UNAUTHORIZED", "workspace access denied");
   }
 }

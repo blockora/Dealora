@@ -1,23 +1,34 @@
 /**
- * Phase 1 schema.
+ * Phase 1 + Phase 2 schema.
  *
  * The goal is a schema that can evolve without destructive redesign: every
  * table uses an `id` primary key, UTC `created_at`/`updated_at` instants, and
- * a `deleted_at` tombstone. Deleted rows stay isolated by `tenant_id` and are
- * never returned by default queries.
+ * a `deleted_at` tombstone. Deleted rows stay isolated by `workspace_id` and
+ * are never returned by default queries.
  *
- * Relations:
+ * Relations (Phase 1):
  *   User 1 -- * Workspace
  *   User 1 -- * WorkspaceMember (membership)
- *   Workspace 1 -- 1 BusinessProfile
+ *   Workspace 1 -- 1 BusinessProfile  (the company section of the Brain)
+ *
+ * Relations (Phase 2 — Business Brain, DEALORA_BLUEPRINT.md §9):
+ *   Workspace 1 -- * Offer
+ *   Workspace 1 -- 1 Icp
+ *   Workspace 1 -- * Persona
+ *   Workspace 1 -- 1 Positioning
+ *   Workspace 1 -- 1 BrandVoice
+ *   Workspace 1 -- * Claim
+ *
+ * Sections that hold a single record per workspace (Icp, Positioning,
+ * BrandVoice, BusinessProfile) are keyed by a UNIQUE `workspace_id` so the
+ * Business Brain stays a single canonical source of truth rather than a
+ * competing set of records.
  *
  * No other tables exist yet: ROADMAP.md §8 explicitly says "Not every entity
- * needs full functionality in Phase 1".
+ * needs full functionality in Phase 1", and §9 lists further Business Brain
+ * concepts (case studies, FAQs, competitors, playbooks) that the phases that
+ * consume them introduce.
  */
-
-export function toDateTime(now: Date): string {
-  return now.toISOString();
-}
 
 export const COLUMNS = {
   id: "id",
@@ -40,12 +51,46 @@ export const COLUMNS = {
   offer: "offer",
   industry: "industry",
   size: "size",
+  market: "market",
   createdAt: "created_at",
   updatedAt: "updated_at",
   deletedAt: "deleted_at",
   invitedAt: "invited_at",
   acceptedAt: "accepted_at",
-} as const satisfies { [K in keyof typeof COLUMNS]: string };
+  targetCustomer: "target_customer",
+  problemSolved: "problem_solved",
+  outcome: "outcome",
+  pricing: "pricing",
+  deliveryModel: "delivery_model",
+  status: "status",
+  title: "title",
+  responsibilities: "responsibilities",
+  painPoints: "pain_points",
+  goals: "goals",
+  buyingContext: "buying_context",
+  industries: "industries",
+  companySizes: "company_sizes",
+  geographies: "geographies",
+  businessModels: "business_models",
+  characteristics: "characteristics",
+  disqualifiers: "disqualifiers",
+  notes: "notes",
+  statement: "statement",
+  differentiators: "differentiators",
+  approvedValuePropositions: "approved_value_propositions",
+  competitorContext: "competitor_context",
+  tone: "tone",
+  style: "style",
+  terminology: "terminology",
+  constraints: "constraints",
+  text: "text",
+  category: "category",
+  sourceNote: "source_note",
+  approvedBy: "approved_by",
+  approvedAt: "approved_at",
+} as const;
+
+export type ColumnName = (typeof COLUMNS)[keyof typeof COLUMNS];
 
 /** Table: users. */
 export const userTable = "users" as const;
@@ -56,8 +101,44 @@ export const workspaceTable = "workspaces" as const;
 /** Table: workspace members (membership + ownership). */
 export const workspaceMembersTable = "workspace_members" as const;
 
-/** Table: business profiles, one per workspace. */
+/** Table: business profiles — the company section of the Business Brain. */
 export const businessProfilesTable = "business_profiles" as const;
+
+/** Table: commercial offers (Phase 2). */
+export const offerTable = "offers" as const;
+
+/** Table: ideal customer profile, one per workspace (Phase 2). */
+export const icpTable = "icps" as const;
+
+/** Table: buyer personas (Phase 2). */
+export const personaTable = "personas" as const;
+
+/** Table: positioning, one per workspace (Phase 2). */
+export const positioningTable = "positioning" as const;
+
+/** Table: brand voice, one per workspace (Phase 2). */
+export const brandVoiceTable = "brand_voice" as const;
+
+/** Table: business claims with explicit approval status (Phase 2). */
+export const claimTable = "claims" as const;
+
+/** All tables, in creation order — the canonical table list. */
+export const tables = [
+  userTable,
+  workspaceTable,
+  workspaceMembersTable,
+  businessProfilesTable,
+  offerTable,
+  icpTable,
+  personaTable,
+  positioningTable,
+  brandVoiceTable,
+  claimTable,
+] as const;
+
+function COLUMN(table: string, column: string): string {
+  return `"${table}"."${column}"`;
+}
 
 /** Uniqueness keys: email must be unique, workspace slug unique. */
 export const indexes = {
@@ -72,11 +153,34 @@ export const indexes = {
     `${COLUMN(businessProfilesTable, COLUMNS.id)} PRIMARY KEY`,
     `${COLUMN(businessProfilesTable, COLUMNS.workspaceId)} UNIQUE NOT NULL`,
   ],
+  offers: [
+    `${COLUMN(offerTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(offerTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(offerTable, COLUMNS.name)} NOT NULL`,
+  ],
+  icps: [
+    `${COLUMN(icpTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(icpTable, COLUMNS.workspaceId)} UNIQUE NOT NULL`,
+  ],
+  personas: [
+    `${COLUMN(personaTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(personaTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(personaTable, COLUMNS.title)} NOT NULL`,
+  ],
+  positioning: [
+    `${COLUMN(positioningTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(positioningTable, COLUMNS.workspaceId)} UNIQUE NOT NULL`,
+  ],
+  brandVoice: [
+    `${COLUMN(brandVoiceTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(brandVoiceTable, COLUMNS.workspaceId)} UNIQUE NOT NULL`,
+  ],
+  claims: [
+    `${COLUMN(claimTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(claimTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(claimTable, COLUMNS.status)} NOT NULL`,
+  ],
 };
-
-function COLUMN(table: string, column: string): string {
-  return `"${table}"."${column}"`;
-}
 
 /** SQL DDL for a single table (PostgreSQL-compatible dialect). */
 export function createTableSql(
@@ -87,11 +191,11 @@ export function createTableSql(
   return [
     `CREATE TABLE IF NOT EXISTS "${table}" (${primaryKey},`,
     ...columns.map((c) => `  ${c}`),
-    `  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-     deleted_at TIMESTAMPTZ`,
-    `);`,
-    `CREATE INDEX IF NOT EXISTS idx_${table}_deleted ON "${table}"(${COLUMN(table, "deleted_at")}) WHERE "deleted_at" IS NULL;`,
+    `  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),`,
+    `     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),`,
+    `     deleted_at TIMESTAMPTZ)`,
+    `;`,
+    `CREATE INDEX IF NOT EXISTS idx_${table}_deleted ON "${table}"("deleted_at") WHERE "deleted_at" IS NULL;`,
   ].join("\n");
 }
 
@@ -129,9 +233,9 @@ export const SCHEMA = [
       COLUMN(workspaceMembersTable, COLUMNS.invitedAt),
       COLUMN(workspaceMembersTable, COLUMNS.acceptedAt),
     ],
-    `${COLUMN(workspaceMembersTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMN(workspaceTable, COLUMNS.id)}") ON DELETE CASCADE,
-${COLUMN(workspaceMembersTable, COLUMNS.userId)} REFERENCES "${userTable}"("${COLUMN(userTable, COLUMNS.id)}") ON DELETE CASCADE,
-PRIMARY KEY ("${COLUMN(workspaceMembersTable, COLUMNS.workspaceId)}", "${COLUMN(workspaceMembersTable, COLUMNS.userId)}")`,
+    `${COLUMN(workspaceMembersTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(workspaceMembersTable, COLUMNS.userId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+PRIMARY KEY ("${COLUMNS.workspaceId}", "${COLUMNS.userId}")`,
   ),
   createTableSql(
     businessProfilesTable,
@@ -146,11 +250,104 @@ PRIMARY KEY ("${COLUMN(workspaceMembersTable, COLUMNS.workspaceId)}", "${COLUMN(
       COLUMN(businessProfilesTable, COLUMNS.offer),
       COLUMN(businessProfilesTable, COLUMNS.industry),
       COLUMN(businessProfilesTable, COLUMNS.size),
+      COLUMN(businessProfilesTable, COLUMNS.market),
     ],
     `${COLUMN(businessProfilesTable, COLUMNS.id)} PRIMARY KEY,
-${COLUMN(businessProfilesTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMN(workspaceTable, COLUMNS.id)}") ON DELETE CASCADE,
-${COLUMN(businessProfilesTable, COLUMNS.ownerId)} REFERENCES "${userTable}"("${COLUMN(userTable, COLUMNS.id)}") ON DELETE CASCADE,
-UNIQUE("${COLUMN(businessProfilesTable, COLUMNS.workspaceId)}")`,
+${COLUMN(businessProfilesTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(businessProfilesTable, COLUMNS.ownerId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+UNIQUE("${COLUMNS.workspaceId}")`,
+  ),
+  createTableSql(
+    offerTable,
+    [
+      COLUMN(offerTable, COLUMNS.id),
+      COLUMN(offerTable, COLUMNS.workspaceId),
+      COLUMN(offerTable, COLUMNS.name),
+      COLUMN(offerTable, COLUMNS.description),
+      COLUMN(offerTable, COLUMNS.targetCustomer),
+      COLUMN(offerTable, COLUMNS.problemSolved),
+      COLUMN(offerTable, COLUMNS.outcome),
+      COLUMN(offerTable, COLUMNS.pricing),
+      COLUMN(offerTable, COLUMNS.deliveryModel),
+      COLUMN(offerTable, COLUMNS.status),
+    ],
+    `${COLUMN(offerTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(offerTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE`,
+  ),
+  createTableSql(
+    icpTable,
+    [
+      COLUMN(icpTable, COLUMNS.id),
+      COLUMN(icpTable, COLUMNS.workspaceId),
+      COLUMN(icpTable, COLUMNS.industries),
+      COLUMN(icpTable, COLUMNS.companySizes),
+      COLUMN(icpTable, COLUMNS.geographies),
+      COLUMN(icpTable, COLUMNS.businessModels),
+      COLUMN(icpTable, COLUMNS.characteristics),
+      COLUMN(icpTable, COLUMNS.disqualifiers),
+      COLUMN(icpTable, COLUMNS.notes),
+    ],
+    `${COLUMN(icpTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(icpTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+UNIQUE("${COLUMNS.workspaceId}")`,
+  ),
+  createTableSql(
+    personaTable,
+    [
+      COLUMN(personaTable, COLUMNS.id),
+      COLUMN(personaTable, COLUMNS.workspaceId),
+      COLUMN(personaTable, COLUMNS.title),
+      COLUMN(personaTable, COLUMNS.responsibilities),
+      COLUMN(personaTable, COLUMNS.painPoints),
+      COLUMN(personaTable, COLUMNS.goals),
+      COLUMN(personaTable, COLUMNS.buyingContext),
+    ],
+    `${COLUMN(personaTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(personaTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE`,
+  ),
+  createTableSql(
+    positioningTable,
+    [
+      COLUMN(positioningTable, COLUMNS.id),
+      COLUMN(positioningTable, COLUMNS.workspaceId),
+      COLUMN(positioningTable, COLUMNS.statement),
+      COLUMN(positioningTable, COLUMNS.differentiators),
+      COLUMN(positioningTable, COLUMNS.approvedValuePropositions),
+      COLUMN(positioningTable, COLUMNS.competitorContext),
+    ],
+    `${COLUMN(positioningTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(positioningTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+UNIQUE("${COLUMNS.workspaceId}")`,
+  ),
+  createTableSql(
+    brandVoiceTable,
+    [
+      COLUMN(brandVoiceTable, COLUMNS.id),
+      COLUMN(brandVoiceTable, COLUMNS.workspaceId),
+      COLUMN(brandVoiceTable, COLUMNS.tone),
+      COLUMN(brandVoiceTable, COLUMNS.style),
+      COLUMN(brandVoiceTable, COLUMNS.terminology),
+      COLUMN(brandVoiceTable, COLUMNS.constraints),
+    ],
+    `${COLUMN(brandVoiceTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(brandVoiceTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+UNIQUE("${COLUMNS.workspaceId}")`,
+  ),
+  createTableSql(
+    claimTable,
+    [
+      COLUMN(claimTable, COLUMNS.id),
+      COLUMN(claimTable, COLUMNS.workspaceId),
+      COLUMN(claimTable, COLUMNS.text),
+      COLUMN(claimTable, COLUMNS.category),
+      COLUMN(claimTable, COLUMNS.status),
+      COLUMN(claimTable, COLUMNS.sourceNote),
+      COLUMN(claimTable, COLUMNS.approvedBy),
+      COLUMN(claimTable, COLUMNS.approvedAt),
+    ],
+    `${COLUMN(claimTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(claimTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(claimTable, COLUMNS.status)} CHECK (${COLUMN(claimTable, COLUMNS.status)} IN ('approved','unverified','restricted'))`,
   ),
 ].join("\n\n");
 

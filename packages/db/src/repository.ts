@@ -2,21 +2,25 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node
 import { join } from "node:path";
 import { randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 
-import {
+import type {
+  BrandVoice,
   BusinessProfile,
+  Claim,
+  EntityId,
+  Icp,
+  Offer,
+  Persona,
+  Positioning,
+  User,
   Workspace,
   WorkspaceMember,
-  User,
-  EntityId,
-  toDateTime,
-  slugify,
-  capString,
-} from "./schema.js";
-import { Result } from "@dealora/core";
+} from "./types.js";
+import { toDateTime } from "./types.js";
+import { slugify, capString, businessProfilesTable } from "./schema.js";
+import type { Result } from "@dealora/core";
 
-export type { User, Workspace, WorkspaceMember, BusinessProfile, EntityId } from "./schema.js";
+export type { User, Workspace, WorkspaceMember, BusinessProfile, EntityId } from "./types.js";
 export {
-  toDateTime,
   slugify,
   capString,
   userTable,
@@ -28,15 +32,19 @@ export {
 
 export const DB_DIR = process.env.DB_DIR ?? join(import.meta.dirname ?? process.cwd(), "data");
 
+/** Storage-level failure codes surfaced to the application layer. */
+export type StorageErrorCode =
+  "NOT_FOUND" | "CONFLICT" | "UNAVAILABLE" | "INVALID" | "UNAUTHORIZED";
+
 export interface StorageError extends Error {
-  code: "NOT_FOUND" | "CONFLICT" | "UNAVAILABLE" | "INVALID";
+  code: StorageErrorCode;
 }
 
 export function toResult<T>(value: T): Result<T, StorageError> {
   return { ok: true, value };
 }
 
-export function toError<E extends StorageError>(code: E["code"], message: string): E {
+export function toError(code: StorageErrorCode, message: string): StorageError {
   const err = new Error(message) as StorageError;
   err.code = code;
   return err;
@@ -57,6 +65,7 @@ export function hashPassword(password: string): string {
   const derived = scryptSync(password, salt, 64);
   return `${salt}:${derived.toString("hex")}`;
 }
+
 export function verifyPassword(password: string, stored: string): boolean {
   const [salt, expected] = stored.split(":");
   if (!salt || !expected) return false;
@@ -70,18 +79,98 @@ function ensureDir(): void {
   }
 }
 
-function loadDb(): unknown {
+/**
+ * Phase 2 migration.
+ *
+ * A store written by Phase 1 has no Business Brain tables and no `market`
+ * column on `business_profiles`. `migrateState` upgrades such a document in
+ * place without discarding any existing row, so Phase 1 data survives.
+ *
+ * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
+ * schema change appends a new step rather than rewriting this one.
+ */
+export const LATEST_SCHEMA_VERSION = 2;
+
+export interface DbState {
+  schemaVersion?: number;
+  users: User[];
+  workspaces: Workspace[];
+  members: WorkspaceMember[];
+  profiles: BusinessProfile[];
+  offers?: Offer[];
+  icps?: Icp[];
+  personas?: Persona[];
+  positioning?: Positioning[];
+  brandVoices?: BrandVoice[];
+  claims?: Claim[];
+}
+
+/** A fully-populated store state: every table present, no optional tables. */
+export type CompleteDbState = Required<DbState>;
+
+export function emptyState(): CompleteDbState {
+  return {
+    schemaVersion: LATEST_SCHEMA_VERSION,
+    users: [],
+    workspaces: [],
+    members: [],
+    profiles: [],
+    offers: [],
+    icps: [],
+    personas: [],
+    positioning: [],
+    brandVoices: [],
+    claims: [],
+  };
+}
+
+/**
+ * Bring a persisted document up to the current schema version.
+ *
+ * Step 2 (Phase 2 — Business Brain): add the Brain tables and the
+ * `business_profiles.market` column, defaulting existing rows to `null`.
+ */
+export function migrateState(input: DbState): CompleteDbState {
+  const base = emptyState();
+  const version = input.schemaVersion ?? 1;
+
+  const state: CompleteDbState = {
+    ...base,
+    schemaVersion: LATEST_SCHEMA_VERSION,
+    users: Array.isArray(input.users) ? input.users : base.users,
+    workspaces: Array.isArray(input.workspaces) ? input.workspaces : base.workspaces,
+    members: Array.isArray(input.members) ? input.members : base.members,
+    profiles: (Array.isArray(input.profiles) ? input.profiles : base.profiles).map((profile) => ({
+      ...profile,
+      // Phase 1 rows have no `market`; existing data is preserved as-is.
+      market: profile.market ?? null,
+    })),
+  };
+
+  if (version >= 2) {
+    state.offers = Array.isArray(input.offers) ? input.offers : base.offers;
+    state.icps = Array.isArray(input.icps) ? input.icps : base.icps;
+    state.personas = Array.isArray(input.personas) ? input.personas : base.personas;
+    state.positioning = Array.isArray(input.positioning) ? input.positioning : base.positioning;
+    state.brandVoices = Array.isArray(input.brandVoices) ? input.brandVoices : base.brandVoices;
+    state.claims = Array.isArray(input.claims) ? input.claims : base.claims;
+  }
+
+  return state;
+}
+
+function loadDb(): CompleteDbState {
   ensureDir();
   const file = join(DB_DIR, "dealora.json");
-  if (!existsSync(file)) return { users: [], workspaces: [], members: [], profiles: [] };
+  if (!existsSync(file)) return emptyState();
   try {
-    return JSON.parse(readFileSync(file, "utf8"));
+    return migrateState(JSON.parse(readFileSync(file, "utf8")) as DbState);
   } catch {
-    return { users: [], workspaces: [], members: [], profiles: [] };
+    return emptyState();
   }
 }
 
-function persistDb(db: unknown): void {
+function persistDb(db: CompleteDbState): void {
   ensureDir();
   const file = join(DB_DIR, "dealora.json");
   const tmp = `${file}.tmp`;
@@ -90,41 +179,63 @@ function persistDb(db: unknown): void {
   writeFileSync(file, readFileSync(tmp), "utf8");
 }
 
-interface DbState {
-  users: User[];
-  workspaces: Workspace[];
-  members: WorkspaceMember[];
-  profiles: BusinessProfile[];
+/** Table names that hold array rows. */
+type RowTable = "users" | "workspaces" | "members" | "profiles" | keyof BrainTables;
+
+interface BrainTables {
+  offers: Offer[];
+  icps: Icp[];
+  personas: Persona[];
+  positioning: Positioning[];
+  brandVoices: BrandVoice[];
+  claims: Claim[];
 }
 
 /** Unique in-memory store per process, seedable for tests. */
 export class Store {
-  private readonly db: DbState;
+  /**
+   * Row storage. Public so tests can seed fixtures directly; application code
+   * must go through the methods below so tenant checks are never bypassed.
+   */
+  readonly db: CompleteDbState;
 
-  constructor(seed?: DbState) {
-    if (seed) {
-      this.db = seed;
-    } else {
-      this.db = loadDb() as DbState;
-    }
+  constructor(seed?: Partial<DbState>) {
+    this.db = seed ? migrateState(seed as DbState) : loadDb();
   }
 
-  private mutate<T extends keyof DbState>(table: T, mutate: (rows: DbState[T]) => void): void {
-    mutate(this.db[table]);
+  private save(): void {
     persistDb(this.db);
   }
 
-  private find<T extends keyof DbState>(table: T, id: EntityId): DbState[T] {
-    const rows = this.db[table] as unknown[];
-    if (!Array.isArray(rows)) throw toError("UNAVAILABLE", "store corrupted");
-    return rows.find((r) => (r as { id: EntityId }).id === id) as DbState[T] | undefined;
+  /**
+   * Run a mutation against a table's rows and persist.
+   *
+   * The callback receives and returns the row array; callers that push to the
+   * array in place are still persisted because the same reference is saved.
+   */
+  private mutate(table: RowTable, mutate: (rows: unknown[]) => void): void {
+    mutate(this.db[table] as unknown as unknown[]);
+    this.save();
   }
 
-  private remove<T extends keyof DbState>(table: T, id: EntityId): void {
-    const rows = this.db[table] as unknown[];
+  private rows<T extends RowTable>(table: T): CompleteDbState[T] {
+    const rows: unknown = this.db[table];
     if (!Array.isArray(rows)) throw toError("UNAVAILABLE", "store corrupted");
-    this.db[table] = rows.filter((r) => (r as { id: EntityId }).id !== id);
-    persistDb(this.db);
+    return rows as CompleteDbState[T];
+  }
+
+  /** Rows carry `id` except workspace members, which use a composite key. */
+  private findById<T extends RowTable>(table: T, id: EntityId): CompleteDbState[T][number] | null {
+    const rows = this.rows(table) as unknown as { id?: EntityId }[];
+    const found = rows.find((r) => r.id === id);
+    return (found as CompleteDbState[T][number] | undefined) ?? null;
+  }
+
+  private removeById(table: RowTable, id: EntityId): void {
+    const rows = this.rows(table) as unknown as { id?: EntityId }[];
+    const kept = rows.filter((r) => r.id !== id);
+    (this.db as unknown as Record<RowTable, unknown[]>)[table] = kept;
+    this.save();
   }
 
   // --- Users ---
@@ -141,7 +252,7 @@ export class Store {
       };
     }
     if (!input.email.includes("@")) {
-      return { ok: false, error: toError("INVALID", "email must contain @" + input.email) };
+      return { ok: false, error: toError("INVALID", `email must contain @: ${input.email}`) };
     }
     const email = capString(input.email.trim().toLowerCase(), 320);
     const displayName = capString(input.displayName.trim(), 128);
@@ -165,17 +276,33 @@ export class Store {
   }
 
   getUser(id: EntityId): Result<User, StorageError> {
-    const user = this.find("users", id);
+    const user = this.findById("users", id);
     if (!user) return { ok: false, error: toError("NOT_FOUND", "user not found") };
     return { ok: true, value: user };
   }
 
   getUserByEmail(email: string): Result<User | null, StorageError> {
-    const rows = this.db.users as unknown[];
-    if (!Array.isArray(rows))
-      return { ok: false, error: toError("UNAVAILABLE", "store corrupted") };
-    const found = (rows as User[]).find((u) => u.email === email);
+    const found = this.rows("users").find((u) => u.email === email);
     return { ok: true, value: found ?? null };
+  }
+
+  /**
+   * Replace a user's password hash.
+   *
+   * Only the derived hash is accepted from the auth layer — plaintext never
+   * reaches storage — and the row is re-read from the store rather than
+   * written through a client-held reference.
+   */
+  updatePasswordHash(userId: EntityId, passwordHash: string): Result<User, StorageError> {
+    if (!passwordHash.includes(":")) {
+      return { ok: false, error: toError("INVALID", "password hash format is invalid") };
+    }
+    const user = this.findById("users", userId);
+    if (!user) return { ok: false, error: toError("NOT_FOUND", "user not found") };
+    user.passwordHash = passwordHash;
+    user.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: { ...user } };
   }
 
   listUsers(): Result<User[], StorageError> {
@@ -185,19 +312,16 @@ export class Store {
   // --- Workspaces ---
 
   getWorkspaces(userId: EntityId): Result<Workspace[], StorageError> {
-    const rows = this.db.workspaces as unknown[];
-    if (!Array.isArray(rows))
-      return { ok: false, error: toError("UNAVAILABLE", "store corrupted") };
-    const owned = (rows as Workspace[]).filter((w) => w.ownerId === userId);
+    const workspaces = this.rows("workspaces");
     const memberIds = new Set(
-      (this.db.members as unknown[])
-        .filter(
-          (m) => (m as WorkspaceMember).userId === userId && (m as WorkspaceMember).acceptedAt,
-        )
-        .map((m) => (m as WorkspaceMember).workspaceId),
+      this.rows("members")
+        .filter((m) => m.userId === userId && m.acceptedAt)
+        .map((m) => m.workspaceId),
     );
-    const joined = (rows as Workspace[]).filter((w) => memberIds.has(w.id)).map((w) => w);
-    return { ok: true, value: owned.length ? owned : joined.length ? joined : [] };
+    return {
+      ok: true,
+      value: workspaces.filter((w) => w.ownerId === userId || memberIds.has(w.id)),
+    };
   }
 
   createWorkspace(input: {
@@ -212,8 +336,8 @@ export class Store {
     if (!input.ownerId) {
       return { ok: false, error: toError("UNAUTHORIZED", "owner must exist") };
     }
-    const workspace = this.find("users", input.ownerId) as User | undefined;
-    if (!workspace) {
+    const owner = this.findById("users", input.ownerId);
+    if (!owner) {
       return { ok: false, error: toError("NOT_FOUND", "owner user not found") };
     }
 
@@ -250,7 +374,7 @@ export class Store {
   }
 
   getWorkspace(id: EntityId): Result<Workspace, StorageError> {
-    const workspace = this.find("workspaces", id);
+    const workspace = this.findById("workspaces", id);
     if (!workspace) return { ok: false, error: toError("NOT_FOUND", "workspace not found") };
     return { ok: true, value: workspace };
   }
@@ -259,7 +383,7 @@ export class Store {
     id: EntityId,
     input: { name?: string; timezone?: string },
   ): Result<Workspace, StorageError> {
-    const workspace = this.find("workspaces", id);
+    const workspace = this.findById("workspaces", id);
     if (!workspace) return { ok: false, error: toError("NOT_FOUND", "workspace not found") };
     if (input.name !== undefined) {
       workspace.name = capString(input.name.trim(), 128);
@@ -268,7 +392,7 @@ export class Store {
       workspace.timezone = input.timezone;
     }
     workspace.updatedAt = toDateTime(now());
-    persistDb(this.db);
+    this.save();
     return { ok: true, value: workspace };
   }
 
@@ -280,21 +404,13 @@ export class Store {
    * ownership assertions.
    */
   authorize(workspaceId: EntityId, userId: EntityId): Result<Workspace, StorageError> {
-    const workspace = this.find("workspaces", workspaceId);
+    const workspace = this.findById("workspaces", workspaceId);
     if (!workspace) return { ok: false, error: toError("NOT_FOUND", "workspace not found") };
-    if (workspace.ownerId !== userId) {
-      const member = this.db.members.find(
-        (m) =>
-          (m as WorkspaceMember).workspaceId === workspaceId &&
-          (m as WorkspaceMember).userId === userId &&
-          (m as WorkspaceMember).acceptedAt,
-      );
-      if (!member) {
-        return {
-          ok: false,
-          error: toError("UNAUTHORIZED", "user is not a member of this workspace"),
-        };
-      }
+    if (workspace.ownerId !== userId && !this.workspaceIsMember(workspaceId, userId)) {
+      return {
+        ok: false,
+        error: toError("UNAUTHORIZED", "user is not a member of this workspace"),
+      };
     }
     return { ok: true, value: workspace };
   }
@@ -305,36 +421,55 @@ export class Store {
   }
 
   workspaceOwner(workspaceId: EntityId): Result<User, StorageError> {
-    const workspace = this.find("workspaces", workspaceId);
+    const workspace = this.findById("workspaces", workspaceId);
     if (!workspace) return { ok: false, error: toError("NOT_FOUND", "workspace not found") };
-    const user = this.find("users", workspace.ownerId);
+    const user = this.findById("users", workspace.ownerId);
     if (!user) return { ok: false, error: toError("NOT_FOUND", "owner not found") };
     return { ok: true, value: user };
   }
 
   isWorkspaceOwner(workspaceId: EntityId, userId: EntityId): boolean {
-    const workspace = this.find("workspaces", workspaceId);
+    const workspace = this.findById("workspaces", workspaceId);
     return workspace?.ownerId === userId;
   }
 
   workspaceIsMember(workspaceId: EntityId, userId: EntityId): boolean {
-    const member = this.db.members.find(
-      (m) =>
-        (m as WorkspaceMember).workspaceId === workspaceId &&
-        (m as WorkspaceMember).userId === userId &&
-        (m as WorkspaceMember).acceptedAt,
+    return this.rows("members").some(
+      (m) => m.workspaceId === workspaceId && m.userId === userId && Boolean(m.acceptedAt),
     );
-    return Boolean(member);
   }
 
-  // --- Business profiles ---
+  /**
+   * Tenant guard for workspace-scoped collections.
+   *
+   * Every Brain read and write funnels through here, so a caller can never
+   * reach another workspace's rows by passing a foreign `workspaceId`.
+   */
+  private requireWorkspace(
+    workspaceId: EntityId,
+    userId: EntityId,
+  ): Result<Workspace, StorageError> {
+    if (!workspaceId || typeof workspaceId !== "string") {
+      return { ok: false, error: toError("INVALID", "workspace id is required") };
+    }
+    return this.authorize(workspaceId, userId);
+  }
+
+  // --- Business profile (company section of the Business Brain) ---
 
   getBusinessProfile(workspaceId: EntityId): Result<BusinessProfile | null, StorageError> {
-    const rows = this.db.profiles as unknown[];
-    if (!Array.isArray(rows))
-      return { ok: false, error: toError("UNAVAILABLE", "store corrupted") };
-    const profile = (rows as BusinessProfile[]).find((p) => p.workspaceId === workspaceId) ?? null;
+    const profile = this.rows("profiles").find((p) => p.workspaceId === workspaceId) ?? null;
     return { ok: true, value: profile };
+  }
+
+  /** Authorized read of the company section. */
+  getBusinessProfileFor(
+    workspaceId: EntityId,
+    userId: EntityId,
+  ): Result<BusinessProfile | null, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    return this.getBusinessProfile(workspaceId);
   }
 
   createBusinessProfile(input: {
@@ -347,11 +482,18 @@ export class Store {
     offer?: string | null;
     industry?: string | null;
     size?: string | null;
+    market?: string | null;
   }): Result<BusinessProfile, StorageError> {
-    const workspace = this.find("workspaces", input.workspaceId);
+    const workspace = this.findById("workspaces", input.workspaceId);
     if (!workspace) return { ok: false, error: toError("NOT_FOUND", "workspace not found") };
     if (workspace.ownerId !== input.ownerId) {
       return { ok: false, error: toError("UNAUTHORIZED", "owner must own the workspace") };
+    }
+    if (this.rows("profiles").some((p) => p.workspaceId === input.workspaceId)) {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `business profile already exists for ${businessProfilesTable}`),
+      };
     }
 
     const profile: BusinessProfile = {
@@ -365,6 +507,7 @@ export class Store {
       offer: input.offer ?? null,
       industry: input.industry ?? null,
       size: input.size ?? null,
+      market: input.market ?? null,
       createdAt: toDateTime(now()),
       updatedAt: toDateTime(now()),
     };
@@ -384,9 +527,10 @@ export class Store {
       offer?: string | null;
       industry?: string | null;
       size?: string | null;
+      market?: string | null;
     },
   ): Result<BusinessProfile, StorageError> {
-    const profile = this.find("profiles", id);
+    const profile = this.findById("profiles", id);
     if (!profile) return { ok: false, error: toError("NOT_FOUND", "business profile not found") };
     if (profile.workspaceId !== input.workspaceId) {
       return {
@@ -402,20 +546,451 @@ export class Store {
     if (input.offer !== undefined) profile.offer = input.offer ?? null;
     if (input.industry !== undefined) profile.industry = input.industry ?? null;
     if (input.size !== undefined) profile.size = input.size ?? null;
+    if (input.market !== undefined) profile.market = input.market ?? null;
     profile.updatedAt = toDateTime(now());
-    persistDb(this.db);
+    this.save();
     return { ok: true, value: profile };
   }
 
   deleteBusinessProfile(id: EntityId): Result<void, StorageError> {
-    const profile = this.find("profiles", id);
-    if (!profile) return { ok: false, error: toError("NOT_FOUND", "business profile not found") };
-    this.remove("profiles", id);
+    if (!this.findById("profiles", id)) {
+      return { ok: false, error: toError("NOT_FOUND", "business profile not found") };
+    }
+    this.removeById("profiles", id);
     return { ok: true, value: undefined };
   }
 
-  // --- Cleanup at process exit (so tests don't leave files behind) ---
+  // --- Offers ---
 
+  createOffer(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    name: string;
+    description: string;
+    targetCustomer?: string | null;
+    problemSolved?: string | null;
+    outcome?: string | null;
+    pricing?: Offer["pricing"];
+    deliveryModel?: string | null;
+    status?: Offer["status"];
+  }): Result<Offer, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+
+    const offer: Offer = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      name: capString(input.name.trim(), 200),
+      description: capString(input.description.trim(), 2000),
+      targetCustomer: input.targetCustomer ?? null,
+      problemSolved: input.problemSolved ?? null,
+      outcome: input.outcome ?? null,
+      pricing: input.pricing ?? null,
+      deliveryModel: input.deliveryModel ?? null,
+      status: input.status ?? "draft",
+      createdAt: toDateTime(now()),
+      updatedAt: toDateTime(now()),
+    };
+
+    this.mutate("offers", (rows) => rows.push(offer));
+    return { ok: true, value: offer };
+  }
+
+  listOffers(workspaceId: EntityId, userId: EntityId): Result<Offer[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: this.rows("offers").filter((o) => o.workspaceId === workspaceId) };
+  }
+
+  getOffer(id: EntityId, userId: EntityId): Result<Offer, StorageError> {
+    const offer = this.findById("offers", id);
+    if (!offer) return { ok: false, error: toError("NOT_FOUND", "offer not found") };
+    const auth = this.requireWorkspace(offer.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: offer };
+  }
+
+  updateOffer(
+    id: EntityId,
+    input: { userId: EntityId } & Partial<Omit<Offer, "id" | "workspaceId" | "createdAt">>,
+  ): Result<Offer, StorageError> {
+    const offer = this.findById("offers", id);
+    if (!offer) return { ok: false, error: toError("NOT_FOUND", "offer not found") };
+    const auth = this.requireWorkspace(offer.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+
+    if (input.name !== undefined) offer.name = capString(input.name.trim(), 200);
+    if (input.description !== undefined)
+      offer.description = capString(input.description.trim(), 2000);
+    if (input.targetCustomer !== undefined) offer.targetCustomer = input.targetCustomer ?? null;
+    if (input.problemSolved !== undefined) offer.problemSolved = input.problemSolved ?? null;
+    if (input.outcome !== undefined) offer.outcome = input.outcome ?? null;
+    if (input.pricing !== undefined) offer.pricing = input.pricing ?? null;
+    if (input.deliveryModel !== undefined) offer.deliveryModel = input.deliveryModel ?? null;
+    if (input.status !== undefined) offer.status = input.status;
+    offer.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: offer };
+  }
+
+  deleteOffer(id: EntityId, userId: EntityId): Result<void, StorageError> {
+    const offer = this.findById("offers", id);
+    if (!offer) return { ok: false, error: toError("NOT_FOUND", "offer not found") };
+    const auth = this.requireWorkspace(offer.workspaceId, userId);
+    if (!auth.ok) return auth;
+    this.removeById("offers", id);
+    return { ok: true, value: undefined };
+  }
+
+  // --- ICP (single record per workspace) ---
+
+  upsertIcp(
+    workspaceId: EntityId,
+    userId: EntityId,
+    input: {
+      industries?: string[];
+      companySizes?: string[];
+      geographies?: string[];
+      businessModels?: string[];
+      characteristics?: string[];
+      disqualifiers?: string[];
+      notes?: string | null;
+    },
+  ): Result<Icp, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+
+    const existing = this.rows("icps").find((i) => i.workspaceId === workspaceId);
+    if (existing) {
+      if (input.industries !== undefined) existing.industries = input.industries;
+      if (input.companySizes !== undefined) existing.companySizes = input.companySizes;
+      if (input.geographies !== undefined) existing.geographies = input.geographies;
+      if (input.businessModels !== undefined) existing.businessModels = input.businessModels;
+      if (input.characteristics !== undefined) existing.characteristics = input.characteristics;
+      if (input.disqualifiers !== undefined) existing.disqualifiers = input.disqualifiers;
+      if (input.notes !== undefined) existing.notes = input.notes ?? null;
+      existing.updatedAt = toDateTime(now());
+      this.save();
+      return { ok: true, value: existing };
+    }
+
+    const icp: Icp = {
+      id: newId(),
+      workspaceId,
+      industries: input.industries ?? [],
+      companySizes: input.companySizes ?? [],
+      geographies: input.geographies ?? [],
+      businessModels: input.businessModels ?? [],
+      characteristics: input.characteristics ?? [],
+      disqualifiers: input.disqualifiers ?? [],
+      notes: input.notes ?? null,
+      createdAt: toDateTime(now()),
+      updatedAt: toDateTime(now()),
+    };
+    this.mutate("icps", (rows) => rows.push(icp));
+    return { ok: true, value: icp };
+  }
+
+  getIcp(workspaceId: EntityId, userId: EntityId): Result<Icp | null, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const icp = this.rows("icps").find((i) => i.workspaceId === workspaceId) ?? null;
+    return { ok: true, value: icp };
+  }
+
+  // --- Personas ---
+
+  createPersona(
+    workspaceId: EntityId,
+    userId: EntityId,
+    input: {
+      title: string;
+      responsibilities?: string[];
+      painPoints?: string[];
+      goals?: string[];
+      buyingContext?: string | null;
+    },
+  ): Result<Persona, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+
+    const persona: Persona = {
+      id: newId(),
+      workspaceId,
+      title: capString(input.title.trim(), 200),
+      responsibilities: input.responsibilities ?? [],
+      painPoints: input.painPoints ?? [],
+      goals: input.goals ?? [],
+      buyingContext: input.buyingContext ?? null,
+      createdAt: toDateTime(now()),
+      updatedAt: toDateTime(now()),
+    };
+    this.mutate("personas", (rows) => rows.push(persona));
+    return { ok: true, value: persona };
+  }
+
+  listPersonas(workspaceId: EntityId, userId: EntityId): Result<Persona[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    return {
+      ok: true,
+      value: this.rows("personas").filter((p) => p.workspaceId === workspaceId),
+    };
+  }
+
+  getPersona(id: EntityId, userId: EntityId): Result<Persona, StorageError> {
+    const persona = this.findById("personas", id);
+    if (!persona) return { ok: false, error: toError("NOT_FOUND", "persona not found") };
+    const auth = this.requireWorkspace(persona.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: persona };
+  }
+
+  updatePersona(
+    id: EntityId,
+    input: { userId: EntityId } & Partial<Omit<Persona, "id" | "workspaceId" | "createdAt">>,
+  ): Result<Persona, StorageError> {
+    const persona = this.findById("personas", id);
+    if (!persona) return { ok: false, error: toError("NOT_FOUND", "persona not found") };
+    const auth = this.requireWorkspace(persona.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+
+    if (input.title !== undefined) persona.title = capString(input.title.trim(), 200);
+    if (input.responsibilities !== undefined) persona.responsibilities = input.responsibilities;
+    if (input.painPoints !== undefined) persona.painPoints = input.painPoints;
+    if (input.goals !== undefined) persona.goals = input.goals;
+    if (input.buyingContext !== undefined) persona.buyingContext = input.buyingContext ?? null;
+    persona.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: persona };
+  }
+
+  deletePersona(id: EntityId, userId: EntityId): Result<void, StorageError> {
+    const persona = this.findById("personas", id);
+    if (!persona) return { ok: false, error: toError("NOT_FOUND", "persona not found") };
+    const auth = this.requireWorkspace(persona.workspaceId, userId);
+    if (!auth.ok) return auth;
+    this.removeById("personas", id);
+    return { ok: true, value: undefined };
+  }
+
+  // --- Positioning (single record per workspace) ---
+
+  upsertPositioning(
+    workspaceId: EntityId,
+    userId: EntityId,
+    input: {
+      statement: string;
+      differentiators?: string[];
+      approvedValuePropositions?: string[];
+      competitorContext?: string[];
+    },
+  ): Result<Positioning, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+
+    const existing = this.rows("positioning").find((p) => p.workspaceId === workspaceId);
+    if (existing) {
+      existing.statement = capString(input.statement.trim(), 2000);
+      if (input.differentiators !== undefined) existing.differentiators = input.differentiators;
+      if (input.approvedValuePropositions !== undefined)
+        existing.approvedValuePropositions = input.approvedValuePropositions;
+      if (input.competitorContext !== undefined)
+        existing.competitorContext = input.competitorContext;
+      existing.updatedAt = toDateTime(now());
+      this.save();
+      return { ok: true, value: existing };
+    }
+
+    const positioning: Positioning = {
+      id: newId(),
+      workspaceId,
+      statement: capString(input.statement.trim(), 2000),
+      differentiators: input.differentiators ?? [],
+      approvedValuePropositions: input.approvedValuePropositions ?? [],
+      competitorContext: input.competitorContext ?? [],
+      createdAt: toDateTime(now()),
+      updatedAt: toDateTime(now()),
+    };
+    this.mutate("positioning", (rows) => rows.push(positioning));
+    return { ok: true, value: positioning };
+  }
+
+  getPositioning(
+    workspaceId: EntityId,
+    userId: EntityId,
+  ): Result<Positioning | null, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("positioning").find((p) => p.workspaceId === workspaceId) ?? null;
+    return { ok: true, value: found };
+  }
+
+  // --- Brand voice (single record per workspace) ---
+
+  upsertBrandVoice(
+    workspaceId: EntityId,
+    userId: EntityId,
+    input: {
+      tone: string[];
+      style?: string | null;
+      terminology?: string[];
+      constraints?: string[];
+    },
+  ): Result<BrandVoice, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+
+    const existing = this.rows("brandVoices").find((b) => b.workspaceId === workspaceId);
+    if (existing) {
+      existing.tone = input.tone;
+      if (input.style !== undefined) existing.style = input.style ?? null;
+      if (input.terminology !== undefined) existing.terminology = input.terminology;
+      if (input.constraints !== undefined) existing.constraints = input.constraints;
+      existing.updatedAt = toDateTime(now());
+      this.save();
+      return { ok: true, value: existing };
+    }
+
+    const brandVoice: BrandVoice = {
+      id: newId(),
+      workspaceId,
+      tone: input.tone,
+      style: input.style ?? null,
+      terminology: input.terminology ?? [],
+      constraints: input.constraints ?? [],
+      createdAt: toDateTime(now()),
+      updatedAt: toDateTime(now()),
+    };
+    this.mutate("brandVoices", (rows) => rows.push(brandVoice));
+    return { ok: true, value: brandVoice };
+  }
+
+  getBrandVoice(workspaceId: EntityId, userId: EntityId): Result<BrandVoice | null, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("brandVoices").find((b) => b.workspaceId === workspaceId) ?? null;
+    return { ok: true, value: found };
+  }
+
+  // --- Claims ---
+
+  /**
+   * Create a claim. A claim can never be created as `approved`: approval is a
+   * separate, attributed action (`approveClaim`), so user-entered text is
+   * never treated as verified evidence.
+   */
+  createClaim(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    text: string;
+    category: Claim["category"];
+    status?: Claim["status"];
+    sourceNote?: string | null;
+  }): Result<Claim, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+
+    const status = input.status ?? "unverified";
+    const claim: Claim = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      text: capString(input.text.trim(), 1000),
+      category: input.category,
+      status: status === "approved" ? "unverified" : status,
+      sourceNote: input.sourceNote ?? null,
+      approvedBy: null,
+      approvedAt: null,
+      createdAt: toDateTime(now()),
+      updatedAt: toDateTime(now()),
+    };
+    this.mutate("claims", (rows) => rows.push(claim));
+    return { ok: true, value: claim };
+  }
+
+  listClaims(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: { status?: Claim["status"] },
+  ): Result<Claim[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("claims").filter((c) => c.workspaceId === workspaceId);
+    return {
+      ok: true,
+      value: filter?.status ? scoped.filter((c) => c.status === filter.status) : scoped,
+    };
+  }
+
+  getClaim(id: EntityId, userId: EntityId): Result<Claim, StorageError> {
+    const claim = this.findById("claims", id);
+    if (!claim) return { ok: false, error: toError("NOT_FOUND", "claim not found") };
+    const auth = this.requireWorkspace(claim.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: claim };
+  }
+
+  updateClaim(
+    id: EntityId,
+    input: { userId: EntityId } & Partial<Omit<Claim, "id" | "workspaceId" | "createdAt">>,
+  ): Result<Claim, StorageError> {
+    const claim = this.findById("claims", id);
+    if (!claim) return { ok: false, error: toError("NOT_FOUND", "claim not found") };
+    const auth = this.requireWorkspace(claim.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+
+    if (input.text !== undefined) {
+      const nextText = capString(input.text.trim(), 1000);
+      if (nextText !== claim.text) {
+        // Changing the wording of an approved claim invalidates the
+        // approval: the new text has not been reviewed.
+        claim.status = "unverified";
+        claim.approvedBy = null;
+        claim.approvedAt = null;
+      }
+      claim.text = nextText;
+    }
+    if (input.category !== undefined) claim.category = input.category;
+    if (input.sourceNote !== undefined) claim.sourceNote = input.sourceNote ?? null;
+    // Approval is deliberately not settable through a generic update: it must
+    // go through `approveClaim`, which attributes the decision to a user.
+    if (input.status !== undefined && input.status !== "approved") {
+      claim.status = input.status;
+      claim.approvedBy = null;
+      claim.approvedAt = null;
+    }
+    claim.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: claim };
+  }
+
+  /**
+   * Record an explicit approval. This is the only path to `approved`, and it
+   * attributes the decision to a real user id resolved server-side.
+   */
+  approveClaim(id: EntityId, userId: EntityId): Result<Claim, StorageError> {
+    const claim = this.findById("claims", id);
+    if (!claim) return { ok: false, error: toError("NOT_FOUND", "claim not found") };
+    const auth = this.requireWorkspace(claim.workspaceId, userId);
+    if (!auth.ok) return auth;
+    claim.status = "approved";
+    claim.approvedBy = userId;
+    claim.approvedAt = toDateTime(now());
+    claim.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: claim };
+  }
+
+  deleteClaim(id: EntityId, userId: EntityId): Result<void, StorageError> {
+    const claim = this.findById("claims", id);
+    if (!claim) return { ok: false, error: toError("NOT_FOUND", "claim not found") };
+    const auth = this.requireWorkspace(claim.workspaceId, userId);
+    if (!auth.ok) return auth;
+    this.removeById("claims", id);
+    return { ok: true, value: undefined };
+  }
+
+  /** Cleanup helper so tests and local runs do not leave files behind. */
   destroy(): void {
     try {
       rmSync(DB_DIR, { recursive: true, force: true });
@@ -432,14 +1007,38 @@ export const db = {
   getUser: store.getUser.bind(store),
   getUserByEmail: store.getUserByEmail.bind(store),
   listUsers: store.listUsers.bind(store),
+  updatePasswordHash: store.updatePasswordHash.bind(store),
   getWorkspaces: store.getWorkspaces.bind(store),
   createWorkspace: store.createWorkspace.bind(store),
   getWorkspace: store.getWorkspace.bind(store),
   updateWorkspace: store.updateWorkspace.bind(store),
   getBusinessProfile: store.getBusinessProfile.bind(store),
+  getBusinessProfileFor: store.getBusinessProfileFor.bind(store),
   createBusinessProfile: store.createBusinessProfile.bind(store),
   updateBusinessProfile: store.updateBusinessProfile.bind(store),
   deleteBusinessProfile: store.deleteBusinessProfile.bind(store),
+  createOffer: store.createOffer.bind(store),
+  listOffers: store.listOffers.bind(store),
+  getOffer: store.getOffer.bind(store),
+  updateOffer: store.updateOffer.bind(store),
+  deleteOffer: store.deleteOffer.bind(store),
+  upsertIcp: store.upsertIcp.bind(store),
+  getIcp: store.getIcp.bind(store),
+  createPersona: store.createPersona.bind(store),
+  listPersonas: store.listPersonas.bind(store),
+  getPersona: store.getPersona.bind(store),
+  updatePersona: store.updatePersona.bind(store),
+  deletePersona: store.deletePersona.bind(store),
+  upsertPositioning: store.upsertPositioning.bind(store),
+  getPositioning: store.getPositioning.bind(store),
+  upsertBrandVoice: store.upsertBrandVoice.bind(store),
+  getBrandVoice: store.getBrandVoice.bind(store),
+  createClaim: store.createClaim.bind(store),
+  listClaims: store.listClaims.bind(store),
+  getClaim: store.getClaim.bind(store),
+  updateClaim: store.updateClaim.bind(store),
+  approveClaim: store.approveClaim.bind(store),
+  deleteClaim: store.deleteClaim.bind(store),
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),
   workspaceOwner: store.workspaceOwner.bind(store),

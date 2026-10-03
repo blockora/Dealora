@@ -1,8 +1,13 @@
+import type { EntityId, User, UserRole } from "@dealora/db";
+
 /** Secure session value returned to the client. */
 export interface SessionToken {
   token: string;
-  expiresAt: string;
+  expiresAt: DateTimeString;
 }
+
+/** RFC 3339 timestamp. */
+export type DateTimeString = string;
 
 /** Server-side session record. */
 export interface Session {
@@ -14,6 +19,16 @@ export interface Session {
   createdAt: string;
 }
 
+/** Structured authentication failure codes. */
+export type AuthErrorCode =
+  | "UNAUTHORIZED"
+  | "UNAUTHENTICATED"
+  | "NOT_FOUND"
+  | "INVALID"
+  | "CONFLICT"
+  | "RATE_LIMITED"
+  | "UNAVAILABLE";
+
 /**
  * Structured error returned to callers. Discriminated by `code` so handlers
  * can render user-safe messages without exposing internals. Exported as a
@@ -21,9 +36,8 @@ export interface Session {
  */
 export class AuthError extends Error {
   constructor(
-    public readonly code:
-      "UNAUTHORIZED" | "UNAUTHENTICATED" | "NOT_FOUND" | "INVALID" | "CONFLICT" | "RATE_LIMITED",
-    public readonly message: string,
+    public readonly code: AuthErrorCode,
+    message: string,
   ) {
     super(message);
     this.name = "AuthError";
@@ -38,10 +52,4 @@ export interface AuthContext {
   currentWorkspaceId: EntityId | null;
 }
 
-/**
- * Build a typed AuthError from a discriminated union so handlers remain
- * strict and avoid accidental `any`/stringly-typed errors.
- */
-export function authError(error: AuthError): AuthError {
-  return new AuthError(error.code, error.message);
-}
+export type { EntityId, User, UserRole };

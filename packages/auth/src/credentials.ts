@@ -1,69 +1,93 @@
-import { hashPassword, verifyPassword, store } from "@dealora/db";
-import type { User, EntityId, AuthError } from "./types.js";
-import { createSession, createIndex } from "./session.js";
+import { hashPassword, store, verifyPassword } from "@dealora/db";
+import type { User } from "@dealora/db";
+
+import { AuthError } from "./types.js";
+import type { EntityId } from "./types.js";
+import { createIndex, createSession } from "./session.js";
+import type { AuthorizeFn, SessionIndex } from "./session.js";
 
 /**
  * Authentication service.
  *
  * - Passwords never leave the comparison in memory; only the scrypt-derived
  *   hash is persisted.
- * - The configured `db` store handles user creation and session storage.
- * - Tokens are unguessable, single-use-capable, and validated server-side.
+ * - The configured store handles user creation; sessions live in an
+ *   injectable index so tests stay isolated.
+ * - Tokens are unguessable and validated server-side.
  *
- * No credentials are hardcoded. `process.env` is the only place secrets/tokens
- * are ever read (e.g. a runtime override); tests inject their own store.
+ * No credentials are hardcoded and no secret is read at module scope.
  */
 
-let sessions = createIndex();
+/** Minimum accepted password length. */
+export const MIN_PASSWORD_LENGTH = 12;
 
-export function setSessionIndex(index: typeof sessions): void {
+let sessions: SessionIndex = createIndex();
+
+/** Swap the session index (tests inject an isolated index). */
+export function setSessionIndex(index: SessionIndex): void {
   sessions = index;
 }
 
-export { createSession, getSession, invalidateSession, listSessions } from "./session.js";
+/** Current session index, for verification and tests. */
+export function getSessionIndex(): SessionIndex {
+  return sessions;
+}
+
+/**
+ * Default authorizer: a session may only be opened in a workspace the user
+ * actually owns or is an accepted member of.
+ */
+const defaultAuthorize: AuthorizeFn = (workspaceId, userId) =>
+  store.authorize(workspaceId, userId).ok;
+
+export {
+  createSession,
+  createIndex,
+  getSession,
+  invalidateSession,
+  listSessions,
+  verifySession,
+  assertSignedIn,
+  requireOwnership,
+} from "./session.js";
 
 export function signup(
   email: string,
   password: string,
   displayName: string,
-): {
-  user: User;
-  token: string;
-} {
+): { user: User; token: string } {
   const result = store.createUser({ email, password, displayName });
   if (!result.ok) {
-    const err = result.error;
-    throw err as AuthError;
+    throw new AuthError(result.error.code, result.error.message);
   }
   const user = result.value;
-  const { token } = createSession(user.id, user.id, user, sessions, (wsId, userId) => {
-    // A fresh user is their first workspace owner; workspaceId == userId signals
-    // the ownership path in a test-only helper. In production this flips to a
-    // real workspace lookup.
-    return wsId === userId;
-  });
+
+  // A new user has no workspace yet, so the first session is issued against
+  // the identity itself; workspace sessions are opened once a workspace
+  // exists and can be authorized.
+  const authorize: AuthorizeFn = (workspaceId, userId) =>
+    workspaceId === userId ? userId === user.id : defaultAuthorize(workspaceId, userId);
+
+  const { token } = createSession(user.id, user.id, user, sessions, authorize);
   return { user, token };
 }
 
-export function authenticate(
-  email: string,
-  password: string,
-): {
-  user: User;
-  token: string;
-} {
+export function authenticate(email: string, password: string): { user: User; token: string } {
   const result = store.getUserByEmail(email);
   if (!result.ok) {
-    throw result.error as AuthError;
+    throw new AuthError("UNAVAILABLE", "authentication service unavailable");
   }
   const user = result.value;
   if (!user || !verifyPassword(password, user.passwordHash)) {
-    throw new AuthError({ code: "UNAUTHENTICATED", message: "invalid credentials" });
+    // One message for both "no such user" and "wrong password" so the
+    // response cannot be used to enumerate accounts.
+    throw new AuthError("UNAUTHENTICATED", "invalid credentials");
   }
-  const { token } = createSession(user.id, user.id, user, sessions, (wsId, userId) => {
-    // Backward-compatible fallback for the single-workspace per user model.
-    return wsId === userId;
-  });
+
+  const authorize: AuthorizeFn = (workspaceId, userId) =>
+    workspaceId === userId ? userId === user.id : defaultAuthorize(workspaceId, userId);
+
+  const { token } = createSession(user.id, user.id, user, sessions, authorize);
   return { user, token };
 }
 
@@ -74,6 +98,12 @@ export function authenticatePassword(email: string, password: string): boolean {
   return user ? verifyPassword(password, user.passwordHash) : false;
 }
 
+/**
+ * Rotate a password after verifying the current one.
+ *
+ * Only the derived hash is written; the plaintext never touches storage, and
+ * every other session for the user is revoked.
+ */
 export function changePassword(
   userId: EntityId,
   currentPassword: string,
@@ -81,17 +111,16 @@ export function changePassword(
 ): void {
   const result = store.getUser(userId);
   if (!result.ok) {
-    throw result.error as AuthError;
+    throw new AuthError("NOT_FOUND", "user not found");
   }
   const user = result.value;
   if (!verifyPassword(currentPassword, user.passwordHash)) {
-    throw new AuthError({ code: "UNAUTHENTICATED", message: "invalid current password" });
+    throw new AuthError("UNAUTHENTICATED", "invalid current password");
   }
-  if (newPassword.length < 12) {
-    throw new AuthError({ code: "INVALID", message: "password must be at least 12 characters" });
+  if (newPassword.length < MIN_PASSWORD_LENGTH) {
+    throw new AuthError("INVALID", `password must be at least ${MIN_PASSWORD_LENGTH} characters`);
   }
-  user.passwordHash = hashPassword(newPassword);
-  store.persistDb?.(store.db);
+  store.updatePasswordHash(userId, hashPassword(newPassword));
 }
 
 export function currentUser(ctx: { userId: EntityId } | null): User | null {
