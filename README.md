@@ -20,8 +20,8 @@ intelligence and execution layer around the revenue stack.
 The repository has completed **Phase 0 — Repository & Engineering Foundation**,
 **Phase 1 — Application Foundation**, **Phase 2 — Business Brain**,
 **Phase 3 — Revenue Goal Engine**, **Phase 4 — Revenue Plan Compiler**,
-**Phase 5 — Account & Prospect Input**, and **Phase 6 — Research Engine** (see
-[`ROADMAP.md`](./ROADMAP.md)).
+**Phase 5 — Account & Prospect Input**, **Phase 6 — Research Engine**, and
+**Phase 7 — Evidence System** (see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
 with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
@@ -88,7 +88,30 @@ the workspace's own account record is researchable. Its gate — research an
 account, persist attributed findings, reload and keep the provenance — is
 covered by `tests/phase6-gate.test.ts`.
 
-Next is **Phase 7 — Evidence System**.
+Phase 7 adds the Evidence System: a research finding becomes **evidence** only
+through one controlled conversion, and evidence supports a structured **account
+claim** whose source, reference, observation time, retrieval time, confidence,
+freshness and relevance are all preserved verbatim from the source. Research
+finding, evidence and claim stay three distinct things, and `AccountClaim`
+stays distinct from the Business Brain's own marketing `Claim` — one is
+externally sourced and unverified, the other internally authored and
+approval-gated. Evidence is attributed, never invented: a source kind outside
+`DEALORA_BLUEPRINT.md` §43 cannot be represented, a citation that was not
+supplied stays absent, and a record the workspace supplied itself is always
+attributed to the workspace's own account record rather than to an external
+source. Conflicting evidence is **represented, never resolved** — two sources
+that disagree about the same field both survive, both are marked
+`contradicted`, and no timestamp is consulted, so a newer source never wins
+automatically. Supersession is always caller-directed and names both sides;
+nothing is ever deleted, so superseded, contradicted and rejected records stay
+auditable. Nothing here scores, qualifies, ranks, personalizes or contacts
+anyone: confidence and relevance describe a record's support and its directness
+and are never summed, and a claim can never be marked verified — that status
+does not exist. Its gate — an account's claims traced back through evidence to
+the finding, request and account behind them — is covered by
+`tests/phase7-gate.test.ts`.
+
+Next is **Phase 8 — Qualification Engine**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -102,20 +125,21 @@ Next is **Phase 7 — Evidence System**.
 apps/           Web / API applications (Phase 2+)
 packages/       Shared TypeScript packages (built with project references)
   core/         Result types and cross-cutting helpers
-  db/           Schema, repository, tenant-isolated persistence (Phases 1-6)
+  db/           Schema, repository, tenant-isolated persistence (Phases 1-7)
   auth/         Identity, sessions, server-side authentication (Phase 1)
   brain/        Business Brain domain, claim safety, agent context (Phase 2)
   goal/         Revenue Goal domain, validation, lifecycle, goal parsing (Phase 3)
   plan/         Revenue Plan compiler, provenance, validation, lifecycle (Phase 4)
   account/      Account & contact input, validation, dedup, CSV import (Phase 5)
   research/     Research requests, permitted-source providers, attributed findings (Phase 6)
+  evidence/     Evidence, account claims, provenance, contradiction, supersession (Phase 7)
   api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 11+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests (Phase 1-6 gates)
+tests/          Cross-package integration tests (Phase 1-7 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
@@ -128,8 +152,9 @@ Business Brain ([0003](./docs/adr/0003-business-brain.md)), the Revenue Goal
 Engine ([0004](./docs/adr/0004-revenue-goal-engine.md)), and the Revenue Plan
 Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)), the Account
 & Prospect Input layer
-([0006](./docs/adr/0006-account-prospect-input.md)), and the Research Engine
-([0007](./docs/adr/0007-research-engine.md)).
+([0006](./docs/adr/0006-account-prospect-input.md)), the Research Engine
+([0007](./docs/adr/0007-research-engine.md)), and the Evidence System
+([0008](./docs/adr/0008-evidence-system.md)).
 
 ## Getting started
 
@@ -169,10 +194,10 @@ convention and the currently supported keys are documented in
 
 The only key is `DB_DIR` — the directory the local store writes
 `dealora.json` into (defaults to `packages/db/src/data`, which is
-git-ignored). Phases 1-6 need no credential: passwords are hashed with
-scrypt, goal parsing, plan compilation, account deduplication and research
-normalization are deterministic and take no model provider, and no secret is
-ever hardcoded or read at module scope.
+git-ignored). Phases 1-7 need no credential: passwords are hashed with
+scrypt, goal parsing, plan compilation, account deduplication, research
+normalization and evidence conversion are deterministic and take no model
+provider, and no secret is ever hardcoded or read at module scope.
 
 ## License
 
