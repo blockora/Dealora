@@ -65,8 +65,8 @@ Phase 1 needs no credential: passwords are hashed with scrypt and a per-user
 salt, sessions are opaque random tokens, and the test suite runs without any
 secret. Add new keys to this table in the same commit that introduces them.
 
-Phases 1 and 2 add no further keys and require no LLM provider key: the
-Business Brain is a deterministic data layer.
+Phases 1-3 add no further keys and require no LLM provider key: the Business
+Brain and the Revenue Goal Engine are deterministic data layers.
 
 ## Quality gates
 
