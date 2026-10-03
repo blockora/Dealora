@@ -630,3 +630,85 @@ export interface RevenuePlan {
   createdAt: DateTime;
   updatedAt: DateTime;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Account & Prospect Input (DEALORA_BLUEPRINT.md §9, ROADMAP.md §12)
+// ---------------------------------------------------------------------------
+
+/**
+ * Target account lifecycle.
+ *
+ * Minimal by design (ROADMAP.md §12): an account is either usable input or
+ * archived. Opportunity stages belong to a later phase.
+ */
+export type AccountStatus = "active" | "archived";
+
+/** Contact lifecycle, mirroring {@link AccountStatus}. */
+export type ContactStatus = "active" | "archived";
+
+/**
+ * Where a record came from.
+ *
+ * An account or contact entering DEALORA is **user-provided input**, not
+ * verified business evidence. Phase 5 stores what the user supplied and makes
+ * no claim that it is true; the Research and Evidence phases are what verify
+ * external facts.
+ */
+export type RecordSource =
+  /** Typed in by a user through the application. */
+  | "manual"
+  /** Arrived through a CSV import. */
+  | "csv"
+  /** Supplied by an approved, user-authorized integration. */
+  | "approved_integration";
+
+/**
+ * A target account: a company the workspace is considering.
+ *
+ * Every field is exactly what the user supplied. Nothing here is inferred,
+ * enriched, scored or verified.
+ */
+export interface Account {
+  id: EntityId;
+  workspaceId: EntityId;
+  createdBy: EntityId;
+  name: string;
+  website: string | null;
+  /** Lower-cased registrable host, used for deterministic deduplication. */
+  domain: string | null;
+  industry: string | null;
+  companySize: string | null;
+  geography: string | null;
+  description: string | null;
+  source: RecordSource;
+  /** Where this record came from in the user's terms: a filename, a list name. */
+  sourceReference: string | null;
+  /** Optional association with the plan that targeted this account. */
+  revenuePlanId: EntityId | null;
+  status: AccountStatus;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}
+
+/** A person at an account, as supplied by the user. Never enriched. */
+export interface Contact {
+  id: EntityId;
+  workspaceId: EntityId;
+  accountId: EntityId;
+  createdBy: EntityId;
+  firstName: string | null;
+  lastName: string | null;
+  /** Denormalized for display; derived from the parts, never invented. */
+  fullName: string;
+  jobTitle: string | null;
+  /** Lower-cased, used for deterministic deduplication within an account. */
+  email: string | null;
+  phone: string | null;
+  /** A profile URL the user supplied. Never crawled or resolved. */
+  profileUrl: string | null;
+  source: RecordSource;
+  sourceReference: string | null;
+  status: ContactStatus;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}

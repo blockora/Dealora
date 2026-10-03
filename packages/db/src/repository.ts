@@ -15,6 +15,10 @@ import type {
   RevenueGoalEvent,
   RevenuePlan,
   RevenuePlanStatus,
+  Account,
+  AccountStatus,
+  Contact,
+  ContactStatus,
   User,
   Workspace,
   WorkspaceMember,
@@ -93,7 +97,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 4;
+export const LATEST_SCHEMA_VERSION = 5;
 
 export interface DbState {
   schemaVersion?: number;
@@ -110,6 +114,8 @@ export interface DbState {
   revenueGoals?: RevenueGoal[];
   revenueGoalEvents?: RevenueGoalEvent[];
   revenuePlans?: RevenuePlan[];
+  accounts?: Account[];
+  contacts?: Contact[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -131,6 +137,8 @@ export function emptyState(): CompleteDbState {
     revenueGoals: [],
     revenueGoalEvents: [],
     revenuePlans: [],
+    accounts: [],
+    contacts: [],
   };
 }
 
@@ -182,6 +190,12 @@ export function migrateState(input: DbState): CompleteDbState {
     state.revenuePlans = Array.isArray(input.revenuePlans) ? input.revenuePlans : base.revenuePlans;
   }
 
+  // Phase 5 adds user-supplied accounts and contacts. Additive.
+  if (version >= 5) {
+    state.accounts = Array.isArray(input.accounts) ? input.accounts : base.accounts;
+    state.contacts = Array.isArray(input.contacts) ? input.contacts : base.contacts;
+  }
+
   return state;
 }
 
@@ -214,6 +228,8 @@ type RowTable =
   | "revenueGoals"
   | "revenueGoalEvents"
   | "revenuePlans"
+  | "accounts"
+  | "contacts"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -1309,6 +1325,245 @@ export class Store {
     return { ok: true, value: plan };
   }
 
+  // --- Accounts and contacts (Phase 5) ---
+
+  /**
+   * Create a target account.
+   *
+   * Storage performs no business deduplication: the domain decides what counts
+   * as a duplicate and owns the conflict policy. This method only enforces the
+   * tenant boundary.
+   */
+  createAccount(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    account: Omit<Account, "id" | "workspaceId" | "createdBy" | "createdAt" | "updatedAt">;
+  }): Result<Account, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+    const account: Account = {
+      ...input.account,
+      id: newId(),
+      workspaceId: input.workspaceId,
+      createdBy: input.createdBy,
+      createdAt: toDateTime(now()),
+      updatedAt: toDateTime(now()),
+    };
+    this.mutate("accounts", (rows) => rows.push(account));
+    return { ok: true, value: account };
+  }
+
+  /** Authorized list of a workspace's accounts, newest first. */
+  listAccounts(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: { status?: AccountStatus; revenuePlanId?: EntityId },
+  ): Result<Account[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("accounts").filter((a) => a.workspaceId === workspaceId);
+    const filtered = scoped.filter((a) => {
+      if (filter?.status && a.status !== filter.status) return false;
+      if (filter?.revenuePlanId && a.revenuePlanId !== filter.revenuePlanId) return false;
+      return true;
+    });
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) =>
+        a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : a.id.localeCompare(b.id),
+      ),
+    };
+  }
+
+  getAccount(id: EntityId, userId: EntityId): Result<Account, StorageError> {
+    const account = this.findById("accounts", id);
+    if (!account) return { ok: false, error: toError("NOT_FOUND", "account not found") };
+    const auth = this.requireWorkspace(account.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: account };
+  }
+
+  /**
+   * Accounts a plan targeted.
+   *
+   * Filtering by plan happens through {@link listAccounts}, which authorizes
+   * the workspace first; the plan itself is resolved and authorized by the
+   * Account domain, so there is a single authorization path for plan-linked
+   * accounts.
+   */
+
+  updateAccount(
+    id: EntityId,
+    input: {
+      userId: EntityId;
+      patch: Partial<Omit<Account, "id" | "workspaceId" | "createdBy" | "createdAt">>;
+    },
+  ): Result<Account, StorageError> {
+    const account = this.findById("accounts", id);
+    if (!account) return { ok: false, error: toError("NOT_FOUND", "account not found") };
+    const auth = this.requireWorkspace(account.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    Object.assign(account, input.patch);
+    account.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: account };
+  }
+
+  /**
+   * Archive an account and, with it, its contacts.
+   *
+   * The cascade is explicit rather than accidental: an archived account must
+   * not keep active contacts attached, and nothing is ever hard-deleted here —
+   * both rows stay for audit and can be inspected in archived state.
+   */
+  archiveAccount(id: EntityId, userId: EntityId): Result<Account, StorageError> {
+    const account = this.findById("accounts", id);
+    if (!account) return { ok: false, error: toError("NOT_FOUND", "account not found") };
+    const auth = this.requireWorkspace(account.workspaceId, userId);
+    if (!auth.ok) return auth;
+    const stamp = toDateTime(now());
+    account.status = "archived";
+    account.updatedAt = stamp;
+    for (const contact of this.rows("contacts")) {
+      if (contact.accountId === account.id && contact.status === "active") {
+        contact.status = "archived";
+        contact.updatedAt = stamp;
+      }
+    }
+    this.save();
+    return { ok: true, value: account };
+  }
+
+  /** Deterministic duplicate lookup: same workspace, same normalized domain. */
+  findAccountByDomain(
+    workspaceId: EntityId,
+    userId: EntityId,
+    domain: string,
+  ): Result<Account | null, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("accounts").find(
+      (a) => a.workspaceId === workspaceId && a.domain === domain,
+    );
+    return { ok: true, value: found ?? null };
+  }
+
+  /**
+   * Name-only lookup, used to report an ambiguous match.
+   *
+   * A shared name is never treated as proof that two records are the same
+   * company; the domain surfaces it as ambiguity rather than merging.
+   */
+  findAccountByName(
+    workspaceId: EntityId,
+    userId: EntityId,
+    name: string,
+  ): Result<Account[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("accounts").filter(
+      (a) => a.workspaceId === workspaceId && a.name.toLowerCase() === name.toLowerCase(),
+    );
+    return { ok: true, value: found };
+  }
+
+  createContact(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    contact: Omit<Contact, "id" | "workspaceId" | "createdBy" | "createdAt" | "updatedAt">;
+  }): Result<Contact, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+    // A contact may only attach to an account in the same workspace.
+    const account = this.findById("accounts", input.contact.accountId);
+    if (!account || account.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("INVALID", "account does not exist in this workspace") };
+    }
+    const contact: Contact = {
+      ...input.contact,
+      id: newId(),
+      workspaceId: input.workspaceId,
+      createdBy: input.createdBy,
+      createdAt: toDateTime(now()),
+      updatedAt: toDateTime(now()),
+    };
+    this.mutate("contacts", (rows) => rows.push(contact));
+    return { ok: true, value: contact };
+  }
+
+  /** Contacts at an account, or the whole workspace when no account is given. */
+  listContacts(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: { accountId?: EntityId; status?: ContactStatus },
+  ): Result<Contact[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("contacts").filter((c) => c.workspaceId === workspaceId);
+    const filtered = scoped.filter((c) => {
+      if (filter?.accountId && c.accountId !== filter.accountId) return false;
+      if (filter?.status && c.status !== filter.status) return false;
+      return true;
+    });
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) =>
+        a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : a.id.localeCompare(b.id),
+      ),
+    };
+  }
+
+  getContact(id: EntityId, userId: EntityId): Result<Contact, StorageError> {
+    const contact = this.findById("contacts", id);
+    if (!contact) return { ok: false, error: toError("NOT_FOUND", "contact not found") };
+    const auth = this.requireWorkspace(contact.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: contact };
+  }
+
+  updateContact(
+    id: EntityId,
+    input: {
+      userId: EntityId;
+      patch: Partial<Omit<Contact, "id" | "workspaceId" | "createdBy" | "createdAt">>;
+    },
+  ): Result<Contact, StorageError> {
+    const contact = this.findById("contacts", id);
+    if (!contact) return { ok: false, error: toError("NOT_FOUND", "contact not found") };
+    const auth = this.requireWorkspace(contact.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    Object.assign(contact, input.patch);
+    contact.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: contact };
+  }
+
+  archiveContact(id: EntityId, userId: EntityId): Result<Contact, StorageError> {
+    const contact = this.findById("contacts", id);
+    if (!contact) return { ok: false, error: toError("NOT_FOUND", "contact not found") };
+    const auth = this.requireWorkspace(contact.workspaceId, userId);
+    if (!auth.ok) return auth;
+    contact.status = "archived";
+    contact.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: contact };
+  }
+
+  /** Deterministic duplicate lookup: same account, same normalized email. */
+  findContactByEmail(
+    workspaceId: EntityId,
+    userId: EntityId,
+    accountId: EntityId,
+    email: string,
+  ): Result<Contact | null, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("contacts").find(
+      (c) => c.workspaceId === workspaceId && c.accountId === accountId && c.email === email,
+    );
+    return { ok: true, value: found ?? null };
+  }
+
   /** Cleanup helper so tests and local runs do not leave files behind. */
   destroy(): void {
     try {
@@ -1372,6 +1627,21 @@ export const db = {
   listRevenuePlansForGoal: store.listRevenuePlansForGoal.bind(store),
   updateRevenuePlan: store.updateRevenuePlan.bind(store),
   setRevenuePlanStatus: store.setRevenuePlanStatus.bind(store),
+
+  createAccount: store.createAccount.bind(store),
+  listAccounts: store.listAccounts.bind(store),
+  getAccount: store.getAccount.bind(store),
+  updateAccount: store.updateAccount.bind(store),
+  archiveAccount: store.archiveAccount.bind(store),
+  findAccountByDomain: store.findAccountByDomain.bind(store),
+  findAccountByName: store.findAccountByName.bind(store),
+
+  createContact: store.createContact.bind(store),
+  listContacts: store.listContacts.bind(store),
+  getContact: store.getContact.bind(store),
+  updateContact: store.updateContact.bind(store),
+  archiveContact: store.archiveContact.bind(store),
+  findContactByEmail: store.findContactByEmail.bind(store),
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),
   workspaceOwner: store.workspaceOwner.bind(store),

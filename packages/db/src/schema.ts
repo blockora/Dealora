@@ -103,12 +103,25 @@ export const COLUMNS = {
   unknowns: "unknowns",
   assumptions: "assumptions",
   recommendations: "recommendations",
+  accountId: "account_id",
+  domain: "domain",
+  geography: "geography",
+  companySize: "company_size",
+  source: "source",
+  sourceReference: "source_reference",
+  firstName: "first_name",
+  lastName: "last_name",
+  fullName: "full_name",
+  jobTitle: "job_title",
+  phone: "phone",
+  profileUrl: "profile_url",
   goalId: "goal_id",
   actorUserId: "actor_user_id",
   kind: "kind",
   fromStatus: "from_status",
   toStatus: "to_status",
   revenueGoalId: "revenue_goal_id",
+  revenuePlanId: "revenue_plan_id",
   planVersion: "plan_version",
   compilerVersion: "compiler_version",
   brainSnapshotDigest: "brain_snapshot_digest",
@@ -166,6 +179,12 @@ export const revenueGoalEventTable = "revenue_goal_events" as const;
  */
 export const revenuePlanTable = "revenue_plans" as const;
 
+/** Table: target accounts supplied by the user (Phase 5). */
+export const accountTable = "accounts" as const;
+
+/** Table: contacts at a target account, supplied by the user (Phase 5). */
+export const contactTable = "contacts" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -181,6 +200,8 @@ export const tables = [
   revenueGoalTable,
   revenueGoalEventTable,
   revenuePlanTable,
+  accountTable,
+  contactTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -237,6 +258,19 @@ export const indexes = {
     `${COLUMN(revenuePlanTable, COLUMNS.workspaceId)} NOT NULL`,
     `${COLUMN(revenuePlanTable, COLUMNS.status)} NOT NULL`,
     `${COLUMN(revenuePlanTable, COLUMNS.planVersion)} NOT NULL`,
+  ],
+  accounts: [
+    `${COLUMN(accountTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(accountTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(accountTable, COLUMNS.name)} NOT NULL`,
+    `${COLUMN(accountTable, COLUMNS.status)} NOT NULL`,
+  ],
+  contacts: [
+    `${COLUMN(contactTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(contactTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(contactTable, COLUMNS.accountId)} NOT NULL`,
+    `${COLUMN(contactTable, COLUMNS.fullName)} NOT NULL`,
+    `${COLUMN(contactTable, COLUMNS.status)} NOT NULL`,
   ],
   revenueGoalEvents: [
     `${COLUMN(revenueGoalEventTable, COLUMNS.id)} PRIMARY KEY`,
@@ -483,6 +517,56 @@ ${COLUMN(revenuePlanTable, COLUMNS.ownerId)} REFERENCES "${userTable}"("${COLUMN
 ${COLUMN(revenuePlanTable, COLUMNS.revenueGoalId)} REFERENCES "${revenueGoalTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(revenuePlanTable, COLUMNS.planVersion)} CHECK (${COLUMN(revenuePlanTable, COLUMNS.planVersion)} > 0),
 ${COLUMN(revenuePlanTable, COLUMNS.status)} CHECK (${COLUMN(revenuePlanTable, COLUMNS.status)} IN ('draft','proposed','approved','archived'))`,
+  ),
+  createTableSql(
+    accountTable,
+    [
+      COLUMN(accountTable, COLUMNS.id),
+      COLUMN(accountTable, COLUMNS.workspaceId),
+      COLUMN(accountTable, COLUMNS.ownerId),
+      COLUMN(accountTable, COLUMNS.name),
+      COLUMN(accountTable, COLUMNS.website),
+      COLUMN(accountTable, COLUMNS.domain),
+      COLUMN(accountTable, COLUMNS.industry),
+      COLUMN(accountTable, COLUMNS.companySize),
+      COLUMN(accountTable, COLUMNS.geography),
+      COLUMN(accountTable, COLUMNS.description),
+      COLUMN(accountTable, COLUMNS.source),
+      COLUMN(accountTable, COLUMNS.sourceReference),
+      COLUMN(accountTable, COLUMNS.revenuePlanId),
+      COLUMN(accountTable, COLUMNS.status),
+    ],
+    `${COLUMN(accountTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(accountTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(accountTable, COLUMNS.ownerId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(accountTable, COLUMNS.name)} NOT NULL,
+${COLUMN(accountTable, COLUMNS.source)} CHECK (${COLUMN(accountTable, COLUMNS.source)} IN ('manual','csv','approved_integration')),
+${COLUMN(accountTable, COLUMNS.status)} CHECK (${COLUMN(accountTable, COLUMNS.status)} IN ('active','archived'))`,
+  ),
+  createTableSql(
+    contactTable,
+    [
+      COLUMN(contactTable, COLUMNS.id),
+      COLUMN(contactTable, COLUMNS.workspaceId),
+      COLUMN(contactTable, COLUMNS.accountId),
+      COLUMN(contactTable, COLUMNS.ownerId),
+      COLUMN(contactTable, COLUMNS.firstName),
+      COLUMN(contactTable, COLUMNS.lastName),
+      COLUMN(contactTable, COLUMNS.fullName),
+      COLUMN(contactTable, COLUMNS.jobTitle),
+      COLUMN(contactTable, COLUMNS.email),
+      COLUMN(contactTable, COLUMNS.phone),
+      COLUMN(contactTable, COLUMNS.profileUrl),
+      COLUMN(contactTable, COLUMNS.source),
+      COLUMN(contactTable, COLUMNS.sourceReference),
+      COLUMN(contactTable, COLUMNS.status),
+    ],
+    `${COLUMN(contactTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(contactTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(contactTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(contactTable, COLUMNS.ownerId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(contactTable, COLUMNS.source)} CHECK (${COLUMN(contactTable, COLUMNS.source)} IN ('manual','csv','approved_integration')),
+${COLUMN(contactTable, COLUMNS.status)} CHECK (${COLUMN(contactTable, COLUMNS.status)} IN ('active','archived'))`,
   ),
 ].join("\n\n");
 

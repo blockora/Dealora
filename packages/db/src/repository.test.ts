@@ -891,6 +891,199 @@ describe("Phase 1 -> Phase 2 migration", () => {
   });
 });
 
+describe("accounts and contacts", () => {
+  const accountSeed = (
+    store: Store,
+    workspaceId: string,
+    userId: string,
+    overrides: Partial<{
+      name: string;
+      domain: string | null;
+      revenuePlanId: string | null;
+      source: "manual" | "csv" | "approved_integration";
+      sourceReference: string | null;
+    }> = {},
+  ) => {
+    const created = store.createAccount({
+      workspaceId,
+      createdBy: userId,
+      account: {
+        name: overrides.name ?? "Northwind Trading",
+        website: null,
+        domain: overrides.domain === undefined ? "northwind.example" : overrides.domain,
+        industry: null,
+        companySize: null,
+        geography: null,
+        description: null,
+        source: overrides.source ?? "manual",
+        sourceReference: overrides.sourceReference ?? null,
+        revenuePlanId: overrides.revenuePlanId ?? null,
+        status: "active",
+      },
+    });
+    if (!isOk(created)) throw new Error("seed account creation failed");
+    return created.value;
+  };
+
+  it("stores an account and a contact with their provenance", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Accounts Co");
+
+    const account = accountSeed(store, workspaceId, owner.id, {
+      source: "csv",
+      sourceReference: "q1-target-list.csv",
+    });
+    expect(account.workspaceId).toBe(workspaceId);
+    expect(account.createdBy).toBe(owner.id);
+    expect(account.source).toBe("csv");
+    expect(account.status).toBe("active");
+
+    const contact = store.createContact({
+      workspaceId,
+      createdBy: owner.id,
+      contact: {
+        accountId: account.id,
+        firstName: "Ada",
+        lastName: "Wong",
+        fullName: "Ada Wong",
+        jobTitle: "VP Revenue",
+        email: "ada@northwind.example",
+        phone: null,
+        profileUrl: null,
+        source: "csv",
+        sourceReference: "people.csv",
+        status: "active",
+      },
+    });
+    if (!isOk(contact)) throw new Error("contact creation failed");
+    expect(contact.value.accountId).toBe(account.id);
+
+    const listed = store.listContacts(workspaceId, owner.id, { accountId: account.id });
+    if (!isOk(listed)) throw new Error("contact listing failed");
+    expect(listed.value.map((c) => c.fullName)).toEqual(["Ada Wong"]);
+  });
+
+  it("archives an account together with its contacts, without deleting rows", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Archive Co");
+    const account = accountSeed(store, workspaceId, owner.id);
+
+    for (const email of ["a@archive.example", "b@archive.example"]) {
+      const contact = store.createContact({
+        workspaceId,
+        createdBy: owner.id,
+        contact: {
+          accountId: account.id,
+          firstName: null,
+          lastName: null,
+          fullName: "",
+          jobTitle: null,
+          email,
+          phone: null,
+          profileUrl: null,
+          source: "manual",
+          sourceReference: null,
+          status: "active",
+        },
+      });
+      if (!isOk(contact)) throw new Error("contact creation failed");
+    }
+
+    const archived = store.archiveAccount(account.id, owner.id);
+    if (!isOk(archived)) throw new Error("archive failed");
+    expect(archived.value.status).toBe("archived");
+
+    // Nothing is hard-deleted: both rows survive in archived state.
+    expect(store.db.contacts).toHaveLength(2);
+    expect(store.db.contacts?.every((c) => c.status === "archived")).toBe(true);
+
+    const active = store.listAccounts(workspaceId, owner.id, { status: "active" });
+    if (!isOk(active)) throw new Error("listing failed");
+    expect(active.value).toEqual([]);
+    const all = store.listAccounts(workspaceId, owner.id);
+    if (!isOk(all)) throw new Error("listing failed");
+    expect(all.value).toHaveLength(1);
+  });
+
+  it("keeps tenants apart and refuses a contact on another workspace's account", () => {
+    const store = seed();
+    const ownerA = makeOwner(store, "tenant-a@example.com");
+    const ownerB = makeOwner(store, "tenant-b@example.com");
+    const workspaceA = makeWorkspace(store, ownerA.id, "Tenant A");
+    const workspaceB = makeWorkspace(store, ownerB.id, "Tenant B");
+
+    const account = accountSeed(store, workspaceA, ownerA.id);
+
+    const foreignRead = store.getAccount(account.id, ownerB.id);
+    expect(isErr(foreignRead)).toBe(true);
+    if (isErr(foreignRead)) expect(foreignRead.error.code).toBe("UNAUTHORIZED");
+
+    const crossWorkspace = store.createContact({
+      workspaceId: workspaceB,
+      createdBy: ownerB.id,
+      contact: {
+        accountId: account.id,
+        firstName: "Mallory",
+        lastName: "Malice",
+        fullName: "Mallory Malice",
+        jobTitle: null,
+        email: "mallory@evil.example",
+        phone: null,
+        profileUrl: null,
+        source: "manual",
+        sourceReference: null,
+        status: "active",
+      },
+    });
+    expect(isErr(crossWorkspace)).toBe(true);
+    if (isErr(crossWorkspace)) expect(crossWorkspace.error.code).toBe("INVALID");
+    expect(store.db.contacts).toHaveLength(0);
+
+    // Domain lookup never crosses the tenant boundary: B's own lookup finds
+    // nothing, and A's lookup still sees only A's row.
+    const fromB = store.findAccountByDomain(workspaceB, ownerB.id, "northwind.example");
+    if (!isOk(fromB)) throw new Error("domain lookup failed");
+    expect(fromB.value).toBeNull();
+    const fromA = store.findAccountByDomain(workspaceA, ownerA.id, "northwind.example");
+    if (!isOk(fromA)) throw new Error("domain lookup failed");
+    expect(fromA.value?.id).toBe(account.id);
+  });
+
+  it("preserves Phase 4 data when migrating a v4 document to v5", () => {
+    const v4 = emptyState();
+    v4.schemaVersion = 4;
+    v4.revenueGoals = [seedGoal(v4, "goal-keep", "w1", "u1")];
+    v4.revenuePlans = [seedPlan(v4, "plan-keep", "goal-keep", "w1", "u1", 1)];
+
+    const migrated = migrateState(v4);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    expect(migrated.revenueGoals).toHaveLength(1);
+    expect(migrated.revenuePlans).toHaveLength(1);
+    expect(migrated.revenuePlans[0]?.id).toBe("plan-keep");
+    // The Phase 5 tables are additive: an older document gains them empty.
+    expect(migrated.accounts).toEqual([]);
+    expect(migrated.contacts).toEqual([]);
+  });
+
+  it("keeps Phase 5 rows across a repeat migration", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Migration Co");
+    accountSeed(store, workspaceId, owner.id, { source: "csv", sourceReference: "list.csv" });
+
+    const migrated = migrateState(store.db);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    expect(migrated.accounts).toHaveLength(1);
+    expect(migrated.accounts[0]?.source).toBe("csv");
+    expect(migrated.accounts[0]?.sourceReference).toBe("list.csv");
+    expect(migrated.accounts[0]?.domain).toBe("northwind.example");
+    expect(migrated.accounts[0]?.status).toBe("active");
+    expect(migrated.contacts).toEqual([]);
+  });
+});
+
 describe("revenue goal history", () => {
   /**
    * Events written in the same millisecond share a `createdAt`. An audit log

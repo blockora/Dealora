@@ -54,6 +54,11 @@ export type {
   RevenuePlanOptimizationPlan,
   RevenuePlanKpi,
   RevenuePlanOptimizationLever,
+  Account,
+  AccountStatus,
+  Contact,
+  ContactStatus,
+  RecordSource,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -75,6 +80,8 @@ export {
   revenueGoalTable,
   revenueGoalEventTable,
   revenuePlanTable,
+  accountTable,
+  contactTable,
   createTableSql,
   slugify,
   capString,
