@@ -111,7 +111,26 @@ does not exist. Its gate — an account's claims traced back through evidence to
 the finding, request and account behind them — is covered by
 `tests/phase7-gate.test.ts`.
 
-Next is **Phase 8 — Qualification Engine**.
+Phase 8 adds the Qualification Engine: it answers whether an account satisfies
+the criteria **the workspace itself defined**, by comparing Phase 7 evidence
+against the canonical Business Brain ICP and the Revenue Goal's time window. The
+five dimensions are exactly the roadmap's — ICP Fit, Need Fit, Buying Signal,
+Timing, Company Fit — and the ten criteria are data you can read through the API
+*before* an account is scored. Every score carries a reason, its evidence and a
+confidence, which is the weakest band among the sources that produced it. The
+result is a decision aid, never certainty, and it is deterministic: no model, no
+randomness, no clock inside evaluation, and a rule version stored with every
+record. Missing data is `insufficient_data` with **no score at all** — an
+un-researched account is neither a pass nor a failure — and sources that disagree
+produce a `contested` result with no score and a named list of the claims in
+dispute, because qualification never resolves a conflict Phase 7 preserved.
+Evaluations are immutable and versioned, so a score stays explainable after the
+ICP or the rules change. Nothing here personalizes, contacts, approves,
+prioritizes or books anything: a qualification is an input to those later phases,
+never their output. Its gate — inspect why an account received a score, end to
+end — is covered by `tests/phase8-gate.test.ts`.
+
+Next is **Phase 9 — Personalization Engine**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -125,7 +144,7 @@ Next is **Phase 8 — Qualification Engine**.
 apps/           Web / API applications (Phase 2+)
 packages/       Shared TypeScript packages (built with project references)
   core/         Result types and cross-cutting helpers
-  db/           Schema, repository, tenant-isolated persistence (Phases 1-7)
+  db/           Schema, repository, tenant-isolated persistence (Phases 1-8)
   auth/         Identity, sessions, server-side authentication (Phase 1)
   brain/        Business Brain domain, claim safety, agent context (Phase 2)
   goal/         Revenue Goal domain, validation, lifecycle, goal parsing (Phase 3)
@@ -133,13 +152,14 @@ packages/       Shared TypeScript packages (built with project references)
   account/      Account & contact input, validation, dedup, CSV import (Phase 5)
   research/     Research requests, permitted-source providers, attributed findings (Phase 6)
   evidence/     Evidence, account claims, provenance, contradiction, supersession (Phase 7)
+  qualification/ Qualification criteria, deterministic scoring, explainable results (Phase 8)
   api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 11+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests (Phase 1-7 gates)
+tests/          Cross-package integration tests (Phase 1-8 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
@@ -153,8 +173,9 @@ Engine ([0004](./docs/adr/0004-revenue-goal-engine.md)), and the Revenue Plan
 Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)), the Account
 & Prospect Input layer
 ([0006](./docs/adr/0006-account-prospect-input.md)), the Research Engine
-([0007](./docs/adr/0007-research-engine.md)), and the Evidence System
-([0008](./docs/adr/0008-evidence-system.md)).
+([0007](./docs/adr/0007-research-engine.md)), the Evidence System
+([0008](./docs/adr/0008-evidence-system.md)), and the Qualification Engine
+([0009](./docs/adr/0009-qualification-engine.md)).
 
 ## Getting started
 
@@ -194,10 +215,11 @@ convention and the currently supported keys are documented in
 
 The only key is `DB_DIR` — the directory the local store writes
 `dealora.json` into (defaults to `packages/db/src/data`, which is
-git-ignored). Phases 1-7 need no credential: passwords are hashed with
+git-ignored). Phases 1-8 need no credential: passwords are hashed with
 scrypt, goal parsing, plan compilation, account deduplication, research
-normalization and evidence conversion are deterministic and take no model
-provider, and no secret is ever hardcoded or read at module scope.
+normalization, evidence conversion and qualification scoring are deterministic
+and take no model provider, and no secret is ever hardcoded or read at module
+scope.
 
 ## License
 

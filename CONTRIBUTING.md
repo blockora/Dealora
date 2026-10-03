@@ -65,15 +65,18 @@ Phase 1 needs no credential: passwords are hashed with scrypt and a per-user
 salt, sessions are opaque random tokens, and the test suite runs without any
 secret. Add new keys to this table in the same commit that introduces them.
 
-Phases 1-7 add no further keys and require no LLM provider key: the Business
+Phases 1-8 add no further keys and require no LLM provider key: the Business
 Brain, the Revenue Goal Engine, the Revenue Plan Compiler, the Account &
-Prospect Input layer, the Research Engine and the Evidence System are
-deterministic data layers. The Research Engine ships with one permitted provider
-— the workspace's own account record — so no external source credential is
-configured or read; registering an authorized API or a permitted public source
-is an explicit deployment decision and its key must be documented here in the
-same commit that introduces it. The Evidence System adds no key of its own: it
-only cites sources the Research Engine already holds.
+Prospect Input layer, the Research Engine, the Evidence System and the
+Qualification Engine are deterministic data layers. The Research Engine ships
+with one permitted provider — the workspace's own account record — so no
+external source credential is configured or read; registering an authorized API
+or a permitted public source is an explicit deployment decision and its key must
+be documented here in the same commit that introduces it. The Evidence System
+adds no key of its own: it only cites sources the Research Engine already holds.
+The Qualification Engine adds no key either: it scores from the Business Brain
+ICP, a Revenue Goal window and the evidence already stored, and calls no model
+provider.
 
 ## Quality gates
 
