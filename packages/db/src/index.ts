@@ -20,6 +20,17 @@ export type {
   Claim,
   ClaimStatus,
   ClaimCategory,
+  RevenueGoal,
+  RevenueGoalEvent,
+  RevenueGoalMetric,
+  RevenueGoalEconomics,
+  RevenueGoalConstraints,
+  RevenueGoalApprovalPolicy,
+  RevenueGoalUnknown,
+  RevenueGoalStatus,
+  GoalCompleteness,
+  GoalMetricKind,
+  IsoDate,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -38,6 +49,8 @@ export {
   positioningTable,
   brandVoiceTable,
   claimTable,
+  revenueGoalTable,
+  revenueGoalEventTable,
   createTableSql,
   slugify,
   capString,

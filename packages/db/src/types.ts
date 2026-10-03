@@ -235,3 +235,138 @@ export interface ValidationError {
   message: string;
   severity: ValidationSeverity;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3 — Revenue Goal Engine
+// ---------------------------------------------------------------------------
+
+/**
+ * Goal lifecycle.
+ *
+ * `draft` is the entry state. `archived` is terminal. Transitions are
+ * validated by the domain layer, never by the client.
+ */
+export type RevenueGoalStatus = "draft" | "active" | "paused" | "completed" | "archived";
+
+/**
+ * Whether a goal carries everything needed to be measured.
+ *
+ * A goal may legitimately be `incomplete` — the missing fields are recorded
+ * explicitly rather than invented — but it is never `invalid`.
+ */
+export type GoalCompleteness = "complete" | "incomplete";
+
+/** The outcome a goal targets. */
+export type GoalMetricKind =
+  | "revenue"
+  | "pipeline"
+  | "qualified_opportunity"
+  | "meeting"
+  | "customer"
+  | "conversion_rate"
+  | "time_to_target";
+
+/** ISO-8601 calendar date, `YYYY-MM-DD`. */
+export type IsoDate = string;
+
+/** An explicit success criterion recorded against the goal. */
+export interface RevenueGoalMetric {
+  kind: GoalMetricKind;
+  /** Target value in `unit`. */
+  target: number;
+  unit: string;
+}
+
+/**
+ * Commercial assumptions. Deliberately minimal: no forecasting, no
+ * optimization (ROADMAP.md §10/§23 are later phases).
+ */
+export interface RevenueGoalEconomics {
+  averageDealValue: number | null;
+  minimumContractValue: number | null;
+  targetCustomers: number | null;
+  currency: string | null;
+}
+
+/**
+ * Explicit limits on how the goal may be pursued.
+ *
+ * Constraints are never silently reinterpreted as part of the objective.
+ */
+export interface RevenueGoalConstraints {
+  geographies: string[];
+  industries: string[];
+  companySizes: string[];
+  channels: string[];
+  budget: string | null;
+  maxOutreachPerDay: number | null;
+  notes: string | null;
+}
+
+/**
+ * Approval context carried by the goal.
+ *
+ * Mirrors the Blueprint §17 risk levels. Phase 3 records the policy only —
+ * it never performs an external action.
+ */
+export interface RevenueGoalApprovalPolicy {
+  /**
+   * Highest risk level the downstream workflow may reach under this goal.
+   * Level 2 and 3 require approval before execution (Phase 10).
+   */
+  maxRiskLevel:
+    "level_0_read" | "level_1_draft" | "level_2_external_action" | "level_3_high_impact";
+  externalActionsRequireApproval: boolean;
+  approverUserId: string | null;
+}
+
+/** A field the goal still needs before it can be measured. */
+export interface RevenueGoalUnknown {
+  field: string;
+  reason: string;
+}
+
+/** The structured revenue outcome a workspace is working toward. */
+export interface RevenueGoal {
+  id: EntityId;
+  workspaceId: EntityId;
+  createdBy: EntityId;
+  /** Natural-language objective as stated by the user. */
+  objective: string;
+  targetMetric: GoalMetricKind;
+  targetValue: number;
+  currency: string | null;
+  timeWindow: { start: IsoDate; end: IsoDate };
+  market: string | null;
+  /** References to canonical Business Brain records — never copies. */
+  icpId: EntityId | null;
+  buyerPersonaIds: EntityId[];
+  offerId: EntityId | null;
+  economics: RevenueGoalEconomics;
+  constraints: RevenueGoalConstraints;
+  approvalPolicy: RevenueGoalApprovalPolicy;
+  successMetrics: RevenueGoalMetric[];
+  status: RevenueGoalStatus;
+  completeness: GoalCompleteness;
+  /** Missing information, recorded rather than invented. */
+  unknowns: RevenueGoalUnknown[];
+  /** Assumptions the system made while structuring the input. */
+  assumptions: string[];
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}
+
+/**
+ * An auditable status transition. Satisfies the roadmap's "goal history"
+ * requirement and SECURITY.md's auditability rule.
+ */
+export interface RevenueGoalEvent {
+  id: EntityId;
+  goalId: EntityId;
+  workspaceId: EntityId;
+  actorUserId: EntityId;
+  kind: "created" | "updated" | "status_changed";
+  fromStatus: RevenueGoalStatus | null;
+  toStatus: RevenueGoalStatus;
+  createdAt: DateTime;
+}

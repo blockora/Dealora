@@ -22,6 +22,10 @@ export default defineConfig({
         replacement: new URL("./packages/brain/src/index.ts", import.meta.url).pathname,
       },
       {
+        find: "@dealora/goal",
+        replacement: new URL("./packages/goal/src/index.ts", import.meta.url).pathname,
+      },
+      {
         find: "@dealora/api",
         replacement: new URL("./packages/api/src/index.ts", import.meta.url).pathname,
       },

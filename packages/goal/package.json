@@ -1,8 +1,8 @@
 {
-  "name": "@dealora/api",
+  "name": "@dealora/goal",
   "version": "0.1.0",
   "private": true,
-  "description": "DEALORA transport handlers and application-service wiring.",
+  "description": "DEALORA Revenue Goal Engine: structured, validated, workspace-scoped revenue goals and deterministic natural-language structuring.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -12,11 +12,8 @@
     "./types": "./dist/types.js"
   },
   "dependencies": {
-    "@dealora/auth": "workspace:*",
-    "@dealora/brain": "workspace:*",
     "@dealora/core": "workspace:*",
-    "@dealora/db": "workspace:*",
-    "@dealora/goal": "workspace:*"
+    "@dealora/db": "workspace:*"
   },
   "devDependencies": {}
 }

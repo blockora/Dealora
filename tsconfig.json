@@ -1,11 +1,12 @@
 {
-  "//": "Solution-style root config. `tsc -b` builds every referenced package; `tsc -b --noEmit` type-checks the whole repository.",
+  "//": "Solution-style root config. `tsc -b tsconfig.json` type-checks and builds every referenced package.",
   "files": [],
   "references": [
     { "path": "packages/core" },
     { "path": "packages/db" },
     { "path": "packages/auth" },
     { "path": "packages/brain" },
+    { "path": "packages/goal" },
     { "path": "packages/api" }
   ]
 }

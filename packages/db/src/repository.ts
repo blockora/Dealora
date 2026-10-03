@@ -11,6 +11,8 @@ import type {
   Offer,
   Persona,
   Positioning,
+  RevenueGoal,
+  RevenueGoalEvent,
   User,
   Workspace,
   WorkspaceMember,
@@ -89,7 +91,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 2;
+export const LATEST_SCHEMA_VERSION = 3;
 
 export interface DbState {
   schemaVersion?: number;
@@ -103,6 +105,8 @@ export interface DbState {
   positioning?: Positioning[];
   brandVoices?: BrandVoice[];
   claims?: Claim[];
+  revenueGoals?: RevenueGoal[];
+  revenueGoalEvents?: RevenueGoalEvent[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -121,6 +125,8 @@ export function emptyState(): CompleteDbState {
     positioning: [],
     brandVoices: [],
     claims: [],
+    revenueGoals: [],
+    revenueGoalEvents: [],
   };
 }
 
@@ -129,6 +135,10 @@ export function emptyState(): CompleteDbState {
  *
  * Step 2 (Phase 2 — Business Brain): add the Brain tables and the
  * `business_profiles.market` column, defaulting existing rows to `null`.
+ *
+ * Step 3 (Phase 3 — Revenue Goal Engine): add `revenue_goals` and the
+ * `revenue_goal_events` audit trail. Purely additive: no Phase 1 or Phase 2
+ * row is rewritten or dropped.
  */
 export function migrateState(input: DbState): CompleteDbState {
   const base = emptyState();
@@ -156,6 +166,13 @@ export function migrateState(input: DbState): CompleteDbState {
     state.claims = Array.isArray(input.claims) ? input.claims : base.claims;
   }
 
+  if (version >= 3) {
+    state.revenueGoals = Array.isArray(input.revenueGoals) ? input.revenueGoals : base.revenueGoals;
+    state.revenueGoalEvents = Array.isArray(input.revenueGoalEvents)
+      ? input.revenueGoalEvents
+      : base.revenueGoalEvents;
+  }
+
   return state;
 }
 
@@ -180,7 +197,14 @@ function persistDb(db: CompleteDbState): void {
 }
 
 /** Table names that hold array rows. */
-type RowTable = "users" | "workspaces" | "members" | "profiles" | keyof BrainTables;
+type RowTable =
+  | "users"
+  | "workspaces"
+  | "members"
+  | "profiles"
+  | "revenueGoals"
+  | "revenueGoalEvents"
+  | keyof BrainTables;
 
 interface BrainTables {
   offers: Offer[];
@@ -990,6 +1014,147 @@ export class Store {
     return { ok: true, value: undefined };
   }
 
+  // --- Revenue goals (Phase 3) ---
+
+  createRevenueGoal(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    goal: Omit<RevenueGoal, "id" | "workspaceId" | "createdBy" | "createdAt" | "updatedAt">;
+  }): Result<RevenueGoal, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+
+    const goal: RevenueGoal = {
+      ...input.goal,
+      id: newId(),
+      workspaceId: input.workspaceId,
+      createdBy: input.createdBy,
+      createdAt: toDateTime(now()),
+      updatedAt: toDateTime(now()),
+    };
+    this.mutate("revenueGoals", (rows) => rows.push(goal));
+    this.recordGoalEvent(input.workspaceId, goal.id, input.createdBy, "created", null, goal.status);
+    return { ok: true, value: goal };
+  }
+
+  /** Authorized list of a workspace's goals, newest first. */
+  listRevenueGoals(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: { status?: RevenueGoal["status"] },
+  ): Result<RevenueGoal[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("revenueGoals").filter((g) => g.workspaceId === workspaceId);
+    const filtered = filter?.status ? scoped.filter((g) => g.status === filter.status) : scoped;
+    // Deterministic ordering: newest first, id as a stable tiebreaker.
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) =>
+        a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : a.id.localeCompare(b.id),
+      ),
+    };
+  }
+
+  getRevenueGoal(id: EntityId, userId: EntityId): Result<RevenueGoal, StorageError> {
+    const goal = this.findById("revenueGoals", id);
+    if (!goal) return { ok: false, error: toError("NOT_FOUND", "revenue goal not found") };
+    const auth = this.requireWorkspace(goal.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: goal };
+  }
+
+  updateRevenueGoal(
+    id: EntityId,
+    input: {
+      userId: EntityId;
+      patch: Partial<Omit<RevenueGoal, "id" | "workspaceId" | "createdBy" | "createdAt">>;
+    },
+  ): Result<RevenueGoal, StorageError> {
+    const goal = this.findById("revenueGoals", id);
+    if (!goal) return { ok: false, error: toError("NOT_FOUND", "revenue goal not found") };
+    const auth = this.requireWorkspace(goal.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const before = goal.status;
+    Object.assign(goal, input.patch);
+    goal.updatedAt = toDateTime(now());
+    this.save();
+    if (goal.status !== before) {
+      this.recordGoalEvent(
+        goal.workspaceId,
+        goal.id,
+        input.userId,
+        "status_changed",
+        before,
+        goal.status,
+      );
+    } else {
+      this.recordGoalEvent(goal.workspaceId, goal.id, input.userId, "updated", before, goal.status);
+    }
+    return { ok: true, value: goal };
+  }
+
+  /**
+   * Apply a status transition and append an audit event.
+   *
+   * The domain layer validates the transition; the store only persists it.
+   */
+  setRevenueGoalStatus(
+    id: EntityId,
+    userId: EntityId,
+    status: RevenueGoal["status"],
+  ): Result<RevenueGoal, StorageError> {
+    const goal = this.findById("revenueGoals", id);
+    if (!goal) return { ok: false, error: toError("NOT_FOUND", "revenue goal not found") };
+    const auth = this.requireWorkspace(goal.workspaceId, userId);
+    if (!auth.ok) return auth;
+    const before = goal.status;
+    goal.status = status;
+    goal.updatedAt = toDateTime(now());
+    this.save();
+    this.recordGoalEvent(goal.workspaceId, goal.id, userId, "status_changed", before, status);
+    return { ok: true, value: goal };
+  }
+
+  /** Auditable history for one goal. */
+  listRevenueGoalEvents(
+    goalId: EntityId,
+    userId: EntityId,
+  ): Result<RevenueGoalEvent[], StorageError> {
+    const goal = this.findById("revenueGoals", goalId);
+    if (!goal) return { ok: false, error: toError("NOT_FOUND", "revenue goal not found") };
+    const auth = this.requireWorkspace(goal.workspaceId, userId);
+    if (!auth.ok) return auth;
+    const events = this.rows("revenueGoalEvents")
+      .filter((e) => e.goalId === goalId)
+      .sort((a, b) =>
+        a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id.localeCompare(b.id),
+      );
+    return { ok: true, value: events };
+  }
+
+  private recordGoalEvent(
+    workspaceId: EntityId,
+    goalId: EntityId,
+    actorUserId: EntityId,
+    kind: RevenueGoalEvent["kind"],
+    fromStatus: RevenueGoal["status"] | null,
+    toStatus: RevenueGoal["status"],
+  ): void {
+    const event: RevenueGoalEvent = {
+      id: newId(),
+      goalId,
+      workspaceId,
+      actorUserId,
+      kind,
+      fromStatus,
+      toStatus,
+      createdAt: toDateTime(now()),
+    };
+    (this.db.revenueGoalEvents as unknown[]).push(event);
+    this.save();
+  }
+
   /** Cleanup helper so tests and local runs do not leave files behind. */
   destroy(): void {
     try {
@@ -1039,6 +1204,12 @@ export const db = {
   updateClaim: store.updateClaim.bind(store),
   approveClaim: store.approveClaim.bind(store),
   deleteClaim: store.deleteClaim.bind(store),
+  createRevenueGoal: store.createRevenueGoal.bind(store),
+  listRevenueGoals: store.listRevenueGoals.bind(store),
+  getRevenueGoal: store.getRevenueGoal.bind(store),
+  updateRevenueGoal: store.updateRevenueGoal.bind(store),
+  setRevenueGoalStatus: store.setRevenueGoalStatus.bind(store),
+  listRevenueGoalEvents: store.listRevenueGoalEvents.bind(store),
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),
   workspaceOwner: store.workspaceOwner.bind(store),

@@ -88,6 +88,25 @@ export const COLUMNS = {
   sourceNote: "source_note",
   approvedBy: "approved_by",
   approvedAt: "approved_at",
+  objective: "objective",
+  targetMetric: "target_metric",
+  targetValue: "target_value",
+  currency: "currency",
+  timeWindow: "time_window",
+  icpId: "icp_id",
+  buyerPersonaIds: "buyer_persona_ids",
+  offerId: "offer_id",
+  economics: "economics",
+  approvalPolicy: "approval_policy",
+  successMetrics: "success_metrics",
+  completeness: "completeness",
+  unknowns: "unknowns",
+  assumptions: "assumptions",
+  goalId: "goal_id",
+  actorUserId: "actor_user_id",
+  kind: "kind",
+  fromStatus: "from_status",
+  toStatus: "to_status",
 } as const;
 
 export type ColumnName = (typeof COLUMNS)[keyof typeof COLUMNS];
@@ -122,6 +141,12 @@ export const brandVoiceTable = "brand_voice" as const;
 /** Table: business claims with explicit approval status (Phase 2). */
 export const claimTable = "claims" as const;
 
+/** Table: structured revenue goals (Phase 3). */
+export const revenueGoalTable = "revenue_goals" as const;
+
+/** Table: auditable revenue-goal status transitions (Phase 3). */
+export const revenueGoalEventTable = "revenue_goal_events" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -134,6 +159,8 @@ export const tables = [
   positioningTable,
   brandVoiceTable,
   claimTable,
+  revenueGoalTable,
+  revenueGoalEventTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -179,6 +206,15 @@ export const indexes = {
     `${COLUMN(claimTable, COLUMNS.id)} PRIMARY KEY`,
     `${COLUMN(claimTable, COLUMNS.workspaceId)} NOT NULL`,
     `${COLUMN(claimTable, COLUMNS.status)} NOT NULL`,
+  ],
+  revenueGoals: [
+    `${COLUMN(revenueGoalTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(revenueGoalTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(revenueGoalTable, COLUMNS.status)} NOT NULL`,
+  ],
+  revenueGoalEvents: [
+    `${COLUMN(revenueGoalEventTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(revenueGoalEventTable, COLUMNS.goalId)} NOT NULL`,
   ],
 };
 
@@ -348,6 +384,51 @@ UNIQUE("${COLUMNS.workspaceId}")`,
     `${COLUMN(claimTable, COLUMNS.id)} PRIMARY KEY,
 ${COLUMN(claimTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(claimTable, COLUMNS.status)} CHECK (${COLUMN(claimTable, COLUMNS.status)} IN ('approved','unverified','restricted'))`,
+  ),
+  createTableSql(
+    revenueGoalTable,
+    [
+      COLUMN(revenueGoalTable, COLUMNS.id),
+      COLUMN(revenueGoalTable, COLUMNS.workspaceId),
+      COLUMN(revenueGoalTable, COLUMNS.ownerId),
+      COLUMN(revenueGoalTable, COLUMNS.objective),
+      COLUMN(revenueGoalTable, COLUMNS.targetMetric),
+      COLUMN(revenueGoalTable, COLUMNS.targetValue),
+      COLUMN(revenueGoalTable, COLUMNS.currency),
+      COLUMN(revenueGoalTable, COLUMNS.timeWindow),
+      COLUMN(revenueGoalTable, COLUMNS.market),
+      COLUMN(revenueGoalTable, COLUMNS.icpId),
+      COLUMN(revenueGoalTable, COLUMNS.buyerPersonaIds),
+      COLUMN(revenueGoalTable, COLUMNS.offerId),
+      COLUMN(revenueGoalTable, COLUMNS.economics),
+      COLUMN(revenueGoalTable, COLUMNS.constraints),
+      COLUMN(revenueGoalTable, COLUMNS.approvalPolicy),
+      COLUMN(revenueGoalTable, COLUMNS.successMetrics),
+      COLUMN(revenueGoalTable, COLUMNS.status),
+      COLUMN(revenueGoalTable, COLUMNS.completeness),
+      COLUMN(revenueGoalTable, COLUMNS.unknowns),
+      COLUMN(revenueGoalTable, COLUMNS.assumptions),
+    ],
+    `${COLUMN(revenueGoalTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(revenueGoalTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(revenueGoalTable, COLUMNS.ownerId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(revenueGoalTable, COLUMNS.targetValue)} CHECK (${COLUMN(revenueGoalTable, COLUMNS.targetValue)} > 0),
+${COLUMN(revenueGoalTable, COLUMNS.status)} CHECK (${COLUMN(revenueGoalTable, COLUMNS.status)} IN ('draft','active','paused','completed','archived'))`,
+  ),
+  createTableSql(
+    revenueGoalEventTable,
+    [
+      COLUMN(revenueGoalEventTable, COLUMNS.id),
+      COLUMN(revenueGoalEventTable, COLUMNS.goalId),
+      COLUMN(revenueGoalEventTable, COLUMNS.workspaceId),
+      COLUMN(revenueGoalEventTable, COLUMNS.actorUserId),
+      COLUMN(revenueGoalEventTable, COLUMNS.kind),
+      COLUMN(revenueGoalEventTable, COLUMNS.fromStatus),
+      COLUMN(revenueGoalEventTable, COLUMNS.toStatus),
+    ],
+    `${COLUMN(revenueGoalEventTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(revenueGoalEventTable, COLUMNS.goalId)} REFERENCES "${revenueGoalTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(revenueGoalEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE`,
   ),
 ].join("\n\n");
 

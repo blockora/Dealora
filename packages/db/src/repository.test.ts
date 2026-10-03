@@ -8,6 +8,7 @@ import {
   newId,
   emptyState,
   migrateState,
+  LATEST_SCHEMA_VERSION,
 } from "./repository.js";
 import type { DbState } from "./repository.js";
 import { toDateTime } from "./types.js";
@@ -616,7 +617,7 @@ describe("Phase 1 -> Phase 2 migration", () => {
     };
 
     const migrated = migrateState(legacy);
-    expect(migrated.schemaVersion).toBe(2);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
     // Existing Phase 1 data survives untouched.
     expect(migrated.users).toHaveLength(1);
     expect(migrated.workspaces).toHaveLength(1);
@@ -631,6 +632,87 @@ describe("Phase 1 -> Phase 2 migration", () => {
     expect(migrated.positioning).toEqual([]);
     expect(migrated.brandVoices).toEqual([]);
     expect(migrated.claims).toEqual([]);
+    // Phase 3 tables are added by the same additive migration.
+    expect(migrated.revenueGoals).toEqual([]);
+    expect(migrated.revenueGoalEvents).toEqual([]);
+  });
+
+  it("preserves Phase 2 data when migrating a v2 document to v3", () => {
+    const v2 = emptyState();
+    v2.schemaVersion = 2;
+    v2.claims = [
+      {
+        id: "c-keep",
+        workspaceId: "w1",
+        text: "Preserved across the Phase 3 migration",
+        category: "other",
+        status: "approved",
+        sourceNote: null,
+        approvedBy: "u1",
+        approvedAt: toDateTime(new Date("2026-01-01T00:00:00.000Z")),
+        createdAt: toDateTime(new Date("2026-01-01T00:00:00.000Z")),
+        updatedAt: toDateTime(new Date("2026-01-01T00:00:00.000Z")),
+      },
+    ];
+
+    const migrated = migrateState(v2);
+    expect(migrated.schemaVersion).toBe(3);
+    expect(migrated.claims).toHaveLength(1);
+    expect(migrated.claims[0]?.text).toBe("Preserved across the Phase 3 migration");
+    expect(migrated.claims[0]?.approvedBy).toBe("u1");
+    expect(migrated.revenueGoals).toEqual([]);
+  });
+
+  it("keeps Phase 3 goal rows across a repeat migration", () => {
+    const state = emptyState();
+    state.revenueGoals = [
+      {
+        id: "g1",
+        workspaceId: "w1",
+        createdBy: "u1",
+        objective: "Generate pipeline",
+        targetMetric: "pipeline",
+        targetValue: 100000,
+        currency: "USD",
+        timeWindow: { start: "2026-01-01", end: "2026-04-01" },
+        market: "B2B SaaS",
+        icpId: null,
+        buyerPersonaIds: [],
+        offerId: null,
+        economics: {
+          averageDealValue: null,
+          minimumContractValue: null,
+          targetCustomers: null,
+          currency: null,
+        },
+        constraints: {
+          geographies: [],
+          industries: [],
+          companySizes: [],
+          channels: [],
+          budget: null,
+          maxOutreachPerDay: null,
+          notes: null,
+        },
+        approvalPolicy: {
+          maxRiskLevel: "level_2_external_action",
+          externalActionsRequireApproval: true,
+          approverUserId: null,
+        },
+        successMetrics: [{ kind: "pipeline", target: 100000, unit: "USD" }],
+        status: "draft",
+        completeness: "complete",
+        unknowns: [],
+        assumptions: [],
+        createdAt: toDateTime(new Date()),
+        updatedAt: toDateTime(new Date()),
+      },
+    ];
+
+    const migrated = migrateState(state);
+    expect(migrated.revenueGoals).toHaveLength(1);
+    expect(migrated.revenueGoals[0]?.objective).toBe("Generate pipeline");
+    expect(migrated.revenueGoals[0]?.targetValue).toBe(100000);
   });
 
   it("keeps Phase 2 rows when re-migrating an upgraded document", () => {
