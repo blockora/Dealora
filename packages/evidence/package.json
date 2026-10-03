@@ -1,0 +1,21 @@
+{
+  "name": "@dealora/evidence",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DEALORA Evidence System: first-class, source-backed evidence and structured account claims, with provenance, contradiction and supersession preserved.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./types": "./dist/types.js"
+  },
+  "dependencies": {
+    "@dealora/account": "workspace:*",
+    "@dealora/core": "workspace:*",
+    "@dealora/db": "workspace:*",
+    "@dealora/research": "workspace:*"
+  },
+  "devDependencies": {}
+}

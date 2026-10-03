@@ -10,6 +10,7 @@
     { "path": "packages/plan" },
     { "path": "packages/account" },
     { "path": "packages/research" },
+    { "path": "packages/evidence" },
     { "path": "packages/api" }
   ]
 }
