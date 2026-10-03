@@ -1,0 +1,22 @@
+{
+  "name": "@dealora/qualification",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DEALORA Qualification Engine: deterministic, evidence-backed scoring of an account against the criteria the business itself defined.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./types": "./dist/types.js"
+  },
+  "dependencies": {
+    "@dealora/account": "workspace:*",
+    "@dealora/core": "workspace:*",
+    "@dealora/db": "workspace:*",
+    "@dealora/evidence": "workspace:*",
+    "@dealora/research": "workspace:*"
+  },
+  "devDependencies": {}
+}

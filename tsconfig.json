@@ -11,6 +11,7 @@
     { "path": "packages/account" },
     { "path": "packages/research" },
     { "path": "packages/evidence" },
+    { "path": "packages/qualification" },
     { "path": "packages/api" }
   ]
 }

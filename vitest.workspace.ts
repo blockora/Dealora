@@ -42,6 +42,10 @@ export default defineConfig({
         replacement: new URL("./packages/evidence/src/index.ts", import.meta.url).pathname,
       },
       {
+        find: "@dealora/qualification",
+        replacement: new URL("./packages/qualification/src/index.ts", import.meta.url).pathname,
+      },
+      {
         find: "@dealora/api",
         replacement: new URL("./packages/api/src/index.ts", import.meta.url).pathname,
       },
