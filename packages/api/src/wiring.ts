@@ -3,6 +3,8 @@ import { authenticate, signup, verifySession } from "@dealora/auth";
 import { getSessionIndex, createIndex } from "@dealora/auth";
 import { createBusinessBrainService } from "@dealora/brain";
 import { createRevenueGoalService } from "@dealora/goal";
+import { createRevenuePlanService } from "@dealora/plan";
+import type { PlanBrainSnapshot } from "@dealora/plan";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -37,6 +39,96 @@ export function createDefaultHandlers(): ReturnType<typeof createHandlers> {
     identity,
     brain,
     goal: createRevenueGoalService(),
+
+    /**
+     * The plan compiler reads a richer, still-narrow, slice of the same
+     * canonical Business Brain: the account profile, personas, positioning and
+     * the claim counts the compiler must prove it excluded.
+     *
+     * Authorization runs first, so a plan can never be compiled against
+     * another tenant's context.
+     */
+    planContext: (workspaceId, userId): PlanBrainSnapshot => {
+      const auth = store.authorize(workspaceId, userId);
+      if (!auth.ok) {
+        throw new Error(`business brain unavailable: ${auth.error.code}`);
+      }
+      const offers = store.listOffers(workspaceId, userId);
+      const icp = store.getIcp(workspaceId, userId);
+      const personas = store.listPersonas(workspaceId, userId);
+      const positioning = store.getPositioning(workspaceId, userId);
+      const brandVoice = store.getBrandVoice(workspaceId, userId);
+      const claims = store.listClaims(workspaceId, userId);
+      const profile = store.getBusinessProfileFor(workspaceId, userId);
+      if (
+        !offers.ok ||
+        !icp.ok ||
+        !personas.ok ||
+        !positioning.ok ||
+        !brandVoice.ok ||
+        !claims.ok ||
+        !profile.ok
+      ) {
+        throw new Error("business brain unavailable");
+      }
+      const approved = claims.value.filter((c) => c.status === "approved");
+      return {
+        workspaceId,
+        company: profile.value
+          ? {
+              name: profile.value.name,
+              market: profile.value.market,
+              industry: profile.value.industry,
+              size: profile.value.size,
+            }
+          : null,
+        offers: offers.value.map((o) => ({
+          id: o.id,
+          name: o.name,
+          description: o.description,
+          outcome: o.outcome,
+        })),
+        icp: icp.value
+          ? {
+              id: icp.value.id,
+              industries: icp.value.industries,
+              companySizes: icp.value.companySizes,
+              geographies: icp.value.geographies,
+              characteristics: icp.value.characteristics,
+              disqualifiers: icp.value.disqualifiers,
+            }
+          : null,
+        personas: personas.value.map((p) => ({
+          id: p.id,
+          title: p.title,
+          painPoints: p.painPoints,
+          goals: p.goals,
+          buyingContext: p.buyingContext,
+        })),
+        positioning: positioning.value
+          ? {
+              statement: positioning.value.statement,
+              differentiators: positioning.value.differentiators,
+              approvedValuePropositions: positioning.value.approvedValuePropositions,
+            }
+          : null,
+        brandVoice: brandVoice.value
+          ? { tone: brandVoice.value.tone, constraints: brandVoice.value.constraints }
+          : null,
+        approvedClaims: approved.map((c) => ({ id: c.id, text: c.text })),
+        // Counts only: the compiler must never quote an unapproved claim.
+        withheldClaims: {
+          unverified: claims.value.filter((c) => c.status === "unverified").length,
+          restricted: claims.value.filter((c) => c.status === "restricted").length,
+        },
+      };
+    },
+    plan: createRevenuePlanService(
+      store as never,
+      undefined,
+      (goalId, userId) => store.getRevenueGoal(goalId, userId) as never,
+      (workspaceId, userId) => deps.planContext(workspaceId, userId),
+    ),
     /**
      * Goal references are validated against this canonical, workspace-scoped
      * context. Reads go through the Business Brain service, which authorizes

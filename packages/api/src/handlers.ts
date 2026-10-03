@@ -10,7 +10,10 @@ import type {
 import type { BrainError, BusinessBrainService } from "@dealora/brain";
 import { GOAL_STATUSES } from "@dealora/goal";
 import type { GoalError, RevenueGoalService } from "@dealora/goal";
+import { PLAN_STATUSES } from "@dealora/plan";
+import type { PlanBrainReader, PlanError, RevenuePlanService } from "@dealora/plan";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
+import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 
 import type {
   ApiError,
@@ -87,6 +90,23 @@ function fromGoalError(error: GoalError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `PlanError` into the safe API error envelope.
+ *
+ * Same contract as {@link fromGoalError}: an illegal transition is a CONFLICT
+ * and an internal condition is never surfaced verbatim.
+ */
+function fromPlanError(error: PlanError): ApiError {
+  if (error.code === "UNAVAILABLE") {
+    return { code: "SERVER_ERROR", message: "unexpected failure" };
+  }
+  const code: ApiErrorCode =
+    error.code === "INVALID_TRANSITION" ? "CONFLICT" : (error.code as ApiErrorCode);
+  const mapped: ApiError = { code, message: error.message };
+  if (error.details) mapped.details = error.details;
+  return mapped;
+}
+
 /** Parse a JSON body, tolerating already-parsed objects. */
 async function parseBody(req: RequestBody): Promise<Record<string, unknown> | ApiError> {
   const raw = req.body;
@@ -113,6 +133,8 @@ export interface HandlerDeps {
   brain: BusinessBrainService;
   goal: RevenueGoalService;
   brainContext: BrainContextReader;
+  plan: RevenuePlanService;
+  planContext: PlanBrainReader;
   resolveSession: SessionResolver;
 }
 
@@ -657,6 +679,104 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok({ goal: result.value }) };
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 4 — Revenue Plan Compiler
+  //
+  // Compilation produces a proposal only. No handler here performs, schedules
+  // or records an external action of any kind.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Compile a RevenueGoal into a new RevenuePlan version.
+   *
+   * The workspace is authorized here before the compiler runs, so a caller
+   * from another tenant is denied rather than being allowed to compile against
+   * a goal they cannot read.
+   */
+  const compileRevenuePlanHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const auth = deps.identity.authorize(workspaceId, actor.userId);
+      if (!auth.ok) return { ok: false, error: toApiError(auth.error.code, "workspace not found") };
+
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const revenueGoalId = body.revenueGoalId;
+
+      const result = deps.plan.compileRevenuePlan(workspaceId, actor.userId, revenueGoalId);
+      if (!result.ok) return { ok: false, error: fromPlanError(result.error) };
+      return { ok: true, value: ok({ plan: result.value }) };
+    });
+
+  const listRevenuePlansHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const rawStatus = req.query.status;
+      let status: PlanStatus | undefined;
+      if (typeof rawStatus === "string" && rawStatus !== "") {
+        if (!PLAN_STATUSES.includes(rawStatus as PlanStatus)) {
+          return Promise.resolve({
+            ok: false,
+            error: { code: "VALIDATION_ERROR", message: "invalid status filter" },
+          });
+        }
+        status = rawStatus as PlanStatus;
+      }
+      const revenueGoalId =
+        typeof req.query.revenueGoalId === "string" && req.query.revenueGoalId !== ""
+          ? req.query.revenueGoalId
+          : undefined;
+
+      const result = deps.plan.listRevenuePlans(
+        workspaceId,
+        actor.userId,
+        status ? { status } : revenueGoalId ? { revenueGoalId } : undefined,
+      );
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromPlanError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ plans: result.value }) });
+    });
+
+  const getRevenuePlanHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.plan.getRevenuePlan(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromPlanError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ plan: result.value }) });
+    });
+
+  /** Every version compiled from the same goal, oldest first. */
+  const getRevenuePlanHistoryHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.plan.planHistory(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromPlanError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ history: result.value }) });
+    });
+
+  const changeRevenuePlanStatusHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const result = deps.plan.changeRevenuePlanStatus(id, actor.userId, body.status);
+      if (!result.ok) return { ok: false, error: fromPlanError(result.error) };
+      return { ok: true, value: ok({ plan: result.value }) };
+    });
+
+  const archiveRevenuePlanHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.plan.archiveRevenuePlan(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromPlanError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ plan: result.value }) });
+    });
+
   /**
    * The agent-facing Business Brain context.
    *
@@ -706,6 +826,12 @@ export function createHandlers(deps: HandlerDeps) {
     revenueGoalHistoryHandler,
     parseRevenueGoalInputHandler,
     createRevenueGoalFromTextHandler,
+    compileRevenuePlanHandler,
+    listRevenuePlansHandler,
+    getRevenuePlanHandler,
+    getRevenuePlanHistoryHandler,
+    changeRevenuePlanStatusHandler,
+    archiveRevenuePlanHandler,
   };
 }
 

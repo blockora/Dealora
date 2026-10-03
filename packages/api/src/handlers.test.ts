@@ -6,9 +6,12 @@ import { BusinessBrainService } from "@dealora/brain";
 import type { BrainRepository } from "@dealora/brain";
 import { RevenueGoalService, deterministicGoalParser } from "@dealora/goal";
 import type { GoalRepository } from "@dealora/goal";
+import { RevenuePlanService, deterministicPlanCompiler } from "@dealora/plan";
+import type { PlanBrainSnapshot, PlanRepository } from "@dealora/plan";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
+import type { RevenueGoal } from "@dealora/db";
 import type { ApiError, ApiResponse, RequestBody } from "./types.js";
 
 /**
@@ -86,6 +89,17 @@ function fixture(): {
         personas: personas.value.map((p) => ({ id: p.id, title: p.title })),
       };
     },
+    planContext: (workspaceId, userId) => {
+      const auth = store.authorize(workspaceId, userId);
+      if (!auth.ok) throw new Error("business brain unavailable");
+      return readPlanBrain(store, workspaceId, userId);
+    },
+    plan: new RevenuePlanService(
+      store as unknown as PlanRepository,
+      deterministicPlanCompiler,
+      (goalId, userId) => store.getRevenueGoal(goalId, userId) as never,
+      (workspaceId, userId) => readPlanBrain(store, workspaceId, userId),
+    ),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -100,6 +114,86 @@ function fixture(): {
     workspaceB: wsBResult.value.id,
     userA: userAResult.value.id,
     userB: userBResult.value.id,
+  };
+}
+
+/**
+ * Read the canonical Business Brain slice the plan compiler consumes.
+ *
+ * Mirrors the production wiring so route tests exercise the same reader the
+ * real application uses.
+ */
+function readPlanBrain(store: Store, workspaceId: string, userId: string): PlanBrainSnapshot {
+  const auth = store.authorize(workspaceId, userId);
+  if (!auth.ok) throw new Error("business brain unavailable");
+  const offers = store.listOffers(workspaceId, userId);
+  const icp = store.getIcp(workspaceId, userId);
+  const personas = store.listPersonas(workspaceId, userId);
+  const positioning = store.getPositioning(workspaceId, userId);
+  const brandVoice = store.getBrandVoice(workspaceId, userId);
+  const claims = store.listClaims(workspaceId, userId);
+  const profile = store.getBusinessProfileFor(workspaceId, userId);
+  if (
+    !offers.ok ||
+    !icp.ok ||
+    !personas.ok ||
+    !positioning.ok ||
+    !brandVoice.ok ||
+    !claims.ok ||
+    !profile.ok
+  ) {
+    throw new Error("business brain unavailable");
+  }
+  return {
+    workspaceId,
+    company: profile.value
+      ? {
+          name: profile.value.name,
+          market: profile.value.market,
+          industry: profile.value.industry,
+          size: profile.value.size,
+        }
+      : null,
+    offers: offers.value.map((o) => ({
+      id: o.id,
+      name: o.name,
+      description: o.description,
+      outcome: o.outcome,
+    })),
+    icp: icp.value
+      ? {
+          id: icp.value.id,
+          industries: icp.value.industries,
+          companySizes: icp.value.companySizes,
+          geographies: icp.value.geographies,
+          characteristics: icp.value.characteristics,
+          disqualifiers: icp.value.disqualifiers,
+        }
+      : null,
+    personas: personas.value.map((p) => ({
+      id: p.id,
+      title: p.title,
+      painPoints: p.painPoints,
+      goals: p.goals,
+      buyingContext: p.buyingContext,
+    })),
+    positioning: positioning.value
+      ? {
+          statement: positioning.value.statement,
+          differentiators: positioning.value.differentiators,
+          approvedValuePropositions: positioning.value.approvedValuePropositions,
+        }
+      : null,
+    brandVoice: brandVoice.value
+      ? { tone: brandVoice.value.tone, constraints: brandVoice.value.constraints }
+      : null,
+    approvedClaims: claims.value
+      .filter((c) => c.status === "approved")
+      .map((c) => ({ id: c.id, text: c.text })),
+    withheldClaims: {
+      unverified: claims.value.filter((c) => c.status === "unverified").length,
+      restricted: claims.value.filter((c) => c.status === "restricted").length,
+    },
   };
 }
 
@@ -460,6 +554,19 @@ describe("API Revenue Goal routes", () => {
         icp: null,
         personas: [],
       }),
+      planContext: () => {
+        throw new Error("business brain unavailable");
+      },
+      plan: new RevenuePlanService(
+        {
+          authorize: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as unknown as PlanRepository,
+        deterministicPlanCompiler,
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        () => {
+          throw new Error("business brain unavailable");
+        },
+      ),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -477,6 +584,371 @@ describe("API Revenue Goal routes", () => {
     expect(JSON.stringify(error)).not.toContain("UNAVAILABLE");
   });
 });
+
+describe("API Revenue Plan routes", () => {
+  /** Seed a complete goal through the real goal service, then return its id. */
+  async function seedCompleteGoal(
+    handlers: ReturnType<typeof createHandlers>,
+    token: string,
+    workspaceId: string,
+  ): Promise<string> {
+    // A goal can only be compiled when it is complete, which includes
+    // referencing a canonical Business Brain offer.
+    const offer = (await dataOf(
+      handlers.createOfferHandler(
+        request({
+          token,
+          params: { workspaceId },
+          body: { name: "AI automation", description: "Automates the revenue motion" },
+        }),
+      ),
+    )) as { offer: { id: string } };
+
+    const goal = (await dataOf(
+      handlers.createRevenueGoalHandler(
+        request({
+          token,
+          params: { workspaceId },
+          body: {
+            objective: "Generate $100,000 of qualified pipeline from mid-market SaaS companies",
+            targetMetric: "pipeline",
+            targetValue: 100000,
+            currency: "USD",
+            timeWindow: { start: "2026-03-01", end: "2026-06-01" },
+            market: "B2B SaaS",
+            offerId: offer.offer.id,
+            successMetrics: [{ kind: "pipeline", target: 100000, unit: "USD" }],
+          },
+        }),
+      ),
+    )) as { goal: { id: string; completeness: string } };
+    expect(goal.goal.completeness).toBe("complete");
+    return goal.goal.id;
+  }
+
+  it("compiles a goal into a plan and reads it back", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const goalId = await seedCompleteGoal(handlers, tokenA, workspaceA);
+
+    const compiled = (await dataOf(
+      handlers.compileRevenuePlanHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: { revenueGoalId: goalId },
+        }),
+      ),
+    )) as { plan: { id: string; version: number; status: string } };
+
+    expect(compiled.plan.version).toBe(1);
+    expect(compiled.plan.status).toBe("proposed");
+
+    const fetched = await dataOf(
+      handlers.getRevenuePlanHandler(request({ token: tokenA, params: { id: compiled.plan.id } })),
+    );
+    const plan = fetched as { plan: Record<string, unknown> };
+    expect(JSON.stringify(plan)).toContain("deterministic-1.0.0");
+    // Every roadmap section travels with the plan, and the approval record
+    // never claims execution rights.
+    const strategies = plan.plan.strategies as Record<string, unknown>;
+    for (const section of [
+      "icp",
+      "buyer",
+      "sourcing",
+      "signal",
+      "qualification",
+      "outreach",
+      "followUp",
+      "meeting",
+      "crm",
+      "measurement",
+      "optimization",
+    ]) {
+      expect(strategies[section]).toBeTruthy();
+    }
+    expect(
+      (plan.plan.approval as { approvesExternalActions: boolean }).approvesExternalActions,
+    ).toBe(false);
+  });
+
+  it("refuses to compile an incomplete goal and reports what is missing", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const goal = (await dataOf(
+      handlers.createRevenueGoalHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: {
+            objective: "Generate pipeline",
+            targetMetric: "pipeline",
+            targetValue: 1000,
+            currency: "USD",
+          },
+        }),
+      ),
+    )) as { goal: { id: string } };
+
+    const error = await errorOf(
+      handlers.compileRevenuePlanHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: { revenueGoalId: goal.goal.id },
+        }),
+      ),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+    expect(Array.isArray(error.details)).toBe(true);
+    expect(JSON.stringify(error)).toContain("incomplete");
+  });
+
+  it("refuses to compile without a goal id", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const error = await errorOf(
+      handlers.compileRevenuePlanHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA }, body: {} }),
+      ),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("rejects a plan request with no session token", async () => {
+    const { handlers, workspaceA } = fixture();
+    const error = await errorOf(
+      handlers.compileRevenuePlanHandler(
+        request({ params: { workspaceId: workspaceA }, body: { revenueGoalId: "g1" } }),
+      ),
+    );
+    expect(error.code).toBe("UNAUTHENTICATED");
+  });
+
+  it("denies compiling another tenant's goal", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB } = fixture();
+    const goalId = await seedCompleteGoal(handlers, tokenA, workspaceA);
+
+    const error = await errorOf(
+      handlers.compileRevenuePlanHandler(
+        request({
+          token: tokenB,
+          params: { workspaceId: workspaceA },
+          body: { revenueGoalId: goalId },
+        }),
+      ),
+    );
+    expect(error.code).toBe("UNAUTHORIZED");
+    expect(JSON.stringify(error)).not.toContain("100,000");
+
+    const listError = await errorOf(
+      handlers.listRevenuePlansHandler(
+        request({ token: tokenB, params: { workspaceId: workspaceA } }),
+      ),
+    );
+    expect(listError.code).toBe("UNAUTHORIZED");
+    const own = await dataOf(
+      handlers.listRevenuePlansHandler(
+        request({ token: tokenB, params: { workspaceId: workspaceB } }),
+      ),
+    );
+    expect(JSON.stringify(own)).not.toContain("100,000");
+  });
+
+  it("versions plans and exposes the history", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const goalId = await seedCompleteGoal(handlers, tokenA, workspaceA);
+
+    const first = (await dataOf(
+      handlers.compileRevenuePlanHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: { revenueGoalId: goalId },
+        }),
+      ),
+    )) as { plan: { id: string; version: number } };
+    const second = (await dataOf(
+      handlers.compileRevenuePlanHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: { revenueGoalId: goalId },
+        }),
+      ),
+    )) as { plan: { id: string; version: number } };
+
+    expect(first.plan.version).toBe(1);
+    expect(second.plan.version).toBe(2);
+
+    const history = (await dataOf(
+      handlers.getRevenuePlanHistoryHandler(
+        request({ token: tokenA, params: { id: second.plan.id } }),
+      ),
+    )) as { history: { version: number }[] };
+    expect(history.history.map((h) => h.version)).toEqual([1, 2]);
+  });
+
+  it("validates the plan lifecycle and rejects an illegal transition", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const goalId = await seedCompleteGoal(handlers, tokenA, workspaceA);
+    const compiled = (await dataOf(
+      handlers.compileRevenuePlanHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: { revenueGoalId: goalId },
+        }),
+      ),
+    )) as { plan: { id: string } };
+
+    // proposed → draft is legal; approved → proposed is not.
+    const approved = (await dataOf(
+      handlers.changeRevenuePlanStatusHandler(
+        request({ token: tokenA, params: { id: compiled.plan.id }, body: { status: "approved" } }),
+      ),
+    )) as { plan: { status: string; approval: { approvesExternalActions: boolean } } };
+    expect(approved.plan.status).toBe("approved");
+    // Approving the plan still does not approve external actions.
+    expect(approved.plan.approval.approvesExternalActions).toBe(false);
+
+    const illegal = await errorOf(
+      handlers.changeRevenuePlanStatusHandler(
+        request({ token: tokenA, params: { id: compiled.plan.id }, body: { status: "proposed" } }),
+      ),
+    );
+    expect(illegal.code).toBe("CONFLICT");
+
+    const archived = (await dataOf(
+      handlers.archiveRevenuePlanHandler(
+        request({ token: tokenA, params: { id: compiled.plan.id } }),
+      ),
+    )) as { plan: { status: string } };
+    expect(archived.plan.status).toBe("archived");
+  });
+
+  it("rejects an invalid plan status filter", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const error = await errorOf(
+      handlers.listRevenuePlansHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          query: { status: "executing" },
+        }),
+      ),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("maps a plan storage failure to SERVER_ERROR without leaking internals", async () => {
+    const store = new Store(emptyState());
+    const handlers = createHandlers({
+      identity: {
+        signup: () => {
+          throw new Error("not used");
+        },
+        authenticate: () => {
+          throw new Error("not used");
+        },
+        listWorkspaces: () => ({ ok: true as const, value: [] }),
+        getWorkspace: () => ({ ok: true as const, value: {} as never }),
+        authorize: () => ({ ok: true as const, value: {} as never }),
+        updateWorkspace: () => ({ ok: true as const, value: {} as never }),
+        getUser: () => ({ ok: true as const, value: {} as never }),
+      },
+      brain: new BusinessBrainService(store as unknown as BrainRepository),
+      goal: new RevenueGoalService(store as unknown as GoalRepository, deterministicGoalParser),
+      brainContext: () => ({
+        workspaceId: "w1",
+        company: null,
+        offers: [],
+        icp: null,
+        personas: [],
+      }),
+      planContext: () => ({
+        workspaceId: "w1",
+        company: null,
+        offers: [],
+        icp: null,
+        personas: [],
+        positioning: null,
+        brandVoice: null,
+        approvedClaims: [],
+        withheldClaims: { unverified: 0, restricted: 0 },
+      }),
+      plan: new RevenuePlanService(
+        {
+          authorize: () => ({ ok: true as const, value: {} }),
+          createRevenuePlan: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+          listRevenuePlans: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+          getRevenuePlan: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+          listRevenuePlansForGoal: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+          updateRevenuePlan: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+          setRevenuePlanStatus: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+          nextRevenuePlanVersion: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as unknown as PlanRepository,
+        deterministicPlanCompiler,
+        () => ({ ok: true as const, value: completeGoalStub() }),
+        () => {
+          throw new Error("business brain unavailable");
+        },
+      ),
+      resolveSession: () => ({ userId: "u1" }),
+    });
+
+    const error = await errorOf(
+      handlers.compileRevenuePlanHandler(
+        request({ token: "t", params: { workspaceId: "w1" }, body: { revenueGoalId: "g1" } }),
+      ),
+    );
+    expect(error.code).toBe("SERVER_ERROR");
+    expect(error.message).toBe("unexpected failure");
+    expect(JSON.stringify(error)).not.toContain("UNAVAILABLE");
+  });
+});
+
+/** A complete goal, for tests that only need the precondition to pass. */
+function completeGoalStub(): RevenueGoal {
+  return {
+    id: "g1",
+    workspaceId: "w1",
+    createdBy: "u1",
+    objective: "Generate pipeline",
+    targetMetric: "pipeline",
+    targetValue: 1000,
+    currency: "USD",
+    timeWindow: { start: "2026-03-01", end: "2026-06-01" },
+    market: "B2B",
+    icpId: null,
+    buyerPersonaIds: [],
+    offerId: null,
+    economics: {
+      averageDealValue: null,
+      minimumContractValue: null,
+      targetCustomers: null,
+      currency: "USD",
+    },
+    constraints: {
+      geographies: [],
+      industries: [],
+      companySizes: [],
+      channels: [],
+      budget: null,
+      maxOutreachPerDay: null,
+      notes: null,
+    },
+    approvalPolicy: {
+      maxRiskLevel: "level_2_external_action",
+      externalActionsRequireApproval: true,
+      approverUserId: null,
+    },
+    successMetrics: [{ kind: "pipeline", target: 1000, unit: "USD" }],
+    status: "draft",
+    completeness: "complete",
+    unknowns: [],
+    assumptions: [],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
 
 describe("API Business Brain routes", () => {
   it("creates a company and reads it back", async () => {
@@ -601,6 +1073,19 @@ describe("API Business Brain routes", () => {
       brainContext: () => {
         throw new Error("business context unavailable");
       },
+      planContext: () => {
+        throw new Error("business brain unavailable");
+      },
+      plan: new RevenuePlanService(
+        {
+          authorize: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as unknown as PlanRepository,
+        deterministicPlanCompiler,
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        () => {
+          throw new Error("business brain unavailable");
+        },
+      ),
       resolveSession: () => ({ userId: "u1" }),
     };
 
