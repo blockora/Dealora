@@ -12,7 +12,7 @@ import {
 } from "./repository.js";
 import type { DbState } from "./repository.js";
 import { toDateTime } from "./types.js";
-import type { Claim, ResearchFinding, RevenueGoal, RevenuePlan, User } from "./types.js";
+import type { Claim, Evidence, ResearchFinding, RevenueGoal, RevenuePlan, User } from "./types.js";
 
 function seed(): Store {
   return new Store(emptyState());
@@ -1474,5 +1474,350 @@ describe("research requests and findings", () => {
     expect(migrated.researchFindings[0]?.sourceUrl).toBeNull();
     expect(migrated.researchFindings[0]?.source).toBe("account_record");
     expect(migrated.researchFindings[0]?.observedAt).toBeNull();
+  });
+});
+
+describe("account claims and evidence", () => {
+  const evidenceAccount = (store: Store, workspaceId: string, userId: string, name: string) => {
+    const created = store.createAccount({
+      workspaceId,
+      createdBy: userId,
+      account: {
+        name,
+        website: "https://northwind.example",
+        domain: "northwind.example",
+        industry: "Wholesale",
+        companySize: "120",
+        geography: "UK",
+        description: null,
+        source: "manual",
+        sourceReference: "q1-list.csv",
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(created)) throw new Error("seed account creation failed");
+    return created.value;
+  };
+
+  const seedFinding = (store: Store, workspaceId: string, userId: string, accountId: string) => {
+    const request = store.createResearchRequest({
+      workspaceId,
+      requestedBy: userId,
+      accountId,
+      provider: "account_record",
+      categories: ["company_overview"],
+    });
+    if (!isOk(request)) throw new Error("seed research request failed");
+    const finding = store.createResearchFinding({
+      researchRequestId: request.value.id,
+      createdBy: userId,
+      finding: {
+        category: "company_overview",
+        field: "website",
+        value: "https://northwind.example",
+        claimKind: "fact",
+        source: "account_record",
+        sourceName: "account_record",
+        sourceUrl: "https://northwind.example",
+        sourceTitle: "workspace account record",
+        observedAt: null,
+        retrievedAt: "2026-10-01T00:00:00.000Z",
+        confidence: "medium",
+        freshness: "unknown",
+        relevance: "high",
+        note: null,
+        status: "recorded",
+      },
+    });
+    if (!isOk(finding)) throw new Error("seed research finding failed");
+    return finding.value;
+  };
+
+  const evidenceInput = (
+    overrides: Partial<{
+      value: string;
+      confidence: Evidence["confidence"];
+      freshness: Evidence["freshness"];
+      relevance: Evidence["relevance"];
+      status: Evidence["status"];
+    }> = {},
+  ) => ({
+    researchFindingId: null,
+    provenance: "user_supplied" as const,
+    source: "account_record" as const,
+    sourceName: "account_record",
+    sourceUrl: null,
+    sourceTitle: null,
+    observedAt: null,
+    retrievedAt: "2026-10-02T00:00:00.000Z",
+    confidence: overrides.confidence ?? ("medium" as const),
+    freshness: overrides.freshness ?? ("unknown" as const),
+    relevance: overrides.relevance ?? ("high" as const),
+    note: null,
+    status: overrides.status ?? ("recorded" as const),
+  });
+
+  it("stores a claim and evidence with full provenance and survives a reload", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Evidence Co");
+    const account = evidenceAccount(store, workspaceId, owner.id, "Northwind Trading");
+
+    const claim = store.createAccountClaim({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.id,
+      category: "company_overview",
+      field: "website",
+      value: "https://northwind.example",
+      claimKind: "fact",
+    });
+    if (!isOk(claim)) throw new Error("claim creation failed");
+    expect(claim.value.status).toBe("asserted");
+    expect(claim.value.workspaceId).toBe(workspaceId);
+    expect(claim.value.accountId).toBe(account.id);
+
+    const evidence = store.createEvidence({
+      workspaceId,
+      accountClaimId: claim.value.id,
+      evidence: evidenceInput({ confidence: "high", freshness: "fresh", relevance: "high" }),
+    });
+    if (!isOk(evidence)) throw new Error("evidence creation failed");
+    // The evidence inherits its tenant boundary from the claim.
+    expect(evidence.value.workspaceId).toBe(workspaceId);
+    expect(evidence.value.accountId).toBe(account.id);
+    expect(evidence.value.accountClaimId).toBe(claim.value.id);
+    expect(evidence.value.sourceUrl).toBeNull();
+    expect(evidence.value.status).toBe("recorded");
+
+    const reloaded = new Store(JSON.parse(JSON.stringify(store.db)) as never);
+    const found = reloaded.getEvidence(evidence.value.id, owner.id);
+    if (!isOk(found)) throw new Error("evidence read after reload failed");
+    expect(found.value.confidence).toBe("high");
+    expect(found.value.freshness).toBe("fresh");
+    expect(found.value.retrievedAt).toBe("2026-10-02T00:00:00.000Z");
+    expect(found.value.provenance).toBe("user_supplied");
+  });
+
+  it("resolves the same claim for the same account field", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Evidence Lookup Co");
+    const account = evidenceAccount(store, workspaceId, owner.id, "Lookup Trading");
+    const claim = store.createAccountClaim({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.id,
+      category: "company_overview",
+      field: "website",
+      value: "https://northwind.example",
+      claimKind: "fact",
+    });
+    if (!isOk(claim)) throw new Error("claim creation failed");
+
+    const found = store.findAccountClaimByField(
+      workspaceId,
+      owner.id,
+      account.id,
+      "company_overview",
+      "website",
+    );
+    if (!isOk(found)) throw new Error("claim lookup failed");
+    expect(found.value?.id).toBe(claim.value.id);
+
+    const missing = store.findAccountClaimByField(
+      workspaceId,
+      owner.id,
+      account.id,
+      "company_overview",
+      "hiring",
+    );
+    if (!isOk(missing)) throw new Error("claim lookup failed");
+    expect(missing.value).toBeNull();
+  });
+
+  it("keeps claims and evidence inside their own tenant", () => {
+    const store = seed();
+    const ownerA = makeOwner(store, "a@example.com");
+    const ownerB = makeOwner(store, "b@example.com");
+    const workspaceA = makeWorkspace(store, ownerA.id, "Tenant Evidence A");
+    const workspaceB = makeWorkspace(store, ownerB.id, "Tenant Evidence B");
+    const accountA = evidenceAccount(store, workspaceA, ownerA.id, "Confidential Trading");
+    const claim = store.createAccountClaim({
+      workspaceId: workspaceA,
+      createdBy: ownerA.id,
+      accountId: accountA.id,
+      category: "company_overview",
+      field: "website",
+      value: "https://confidential.example",
+      claimKind: "fact",
+    });
+    if (!isOk(claim)) throw new Error("claim creation failed");
+    const evidence = store.createEvidence({
+      workspaceId: workspaceA,
+      accountClaimId: claim.value.id,
+      evidence: evidenceInput(),
+    });
+    if (!isOk(evidence)) throw new Error("evidence creation failed");
+
+    // Another tenant reads neither record, and the error never reveals why.
+    const foreignClaim = store.getAccountClaim(claim.value.id, ownerB.id);
+    if (!isErr(foreignClaim)) throw new Error("cross-tenant claim read was allowed");
+    expect(foreignClaim.error.code).toBe("UNAUTHORIZED");
+    const foreignEvidence = store.getEvidence(evidence.value.id, ownerB.id);
+    if (!isErr(foreignEvidence)) throw new Error("cross-tenant evidence read was allowed");
+    expect(foreignEvidence.error.code).toBe("UNAUTHORIZED");
+    expect(store.listEvidence(workspaceB, ownerB.id)).toEqual({ ok: true, value: [] });
+    expect(store.listAccountClaims(workspaceB, ownerB.id)).toEqual({ ok: true, value: [] });
+  });
+
+  it("refuses to write a claim against another workspace's account", () => {
+    const store = seed();
+    const ownerA = makeOwner(store, "a@example.com");
+    const ownerB = makeOwner(store, "b@example.com");
+    const workspaceA = makeWorkspace(store, ownerA.id, "Claim Tenant A");
+    const workspaceB = makeWorkspace(store, ownerB.id, "Claim Tenant B");
+    const accountA = evidenceAccount(store, workspaceA, ownerA.id, "Cross Tenant Trading");
+
+    const crossWorkspace = store.createAccountClaim({
+      workspaceId: workspaceB,
+      createdBy: ownerB.id,
+      accountId: accountA.id,
+      category: "company_overview",
+      field: "website",
+      value: "https://cross.example",
+      claimKind: "fact",
+    });
+    if (!isErr(crossWorkspace)) throw new Error("cross-workspace claim was allowed");
+    expect(crossWorkspace.error.code).toBe("INVALID");
+    expect(store.db.accountClaims).toHaveLength(0);
+  });
+
+  it("changes status only, so recorded provenance is never rewritten", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Evidence Status Co");
+    const account = evidenceAccount(store, workspaceId, owner.id, "Status Trading");
+    const claim = store.createAccountClaim({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.id,
+      category: "company_overview",
+      field: "website",
+      value: "https://northwind.example",
+      claimKind: "fact",
+    });
+    if (!isOk(claim)) throw new Error("claim creation failed");
+    const evidence = store.createEvidence({
+      workspaceId,
+      accountClaimId: claim.value.id,
+      evidence: evidenceInput(),
+    });
+    if (!isOk(evidence)) throw new Error("evidence creation failed");
+
+    const superseded = store.updateEvidence(evidence.value.id, {
+      userId: owner.id,
+      status: "superseded",
+    });
+    if (!isOk(superseded)) throw new Error("evidence status update failed");
+    expect(superseded.value.status).toBe("superseded");
+    // Only the status moved. The source, retrieval time and provenance are
+    // exactly what was recorded.
+    expect(superseded.value.retrievedAt).toBe(evidence.value.retrievedAt);
+    expect(superseded.value.sourceName).toBe(evidence.value.sourceName);
+    expect(superseded.value.confidence).toBe(evidence.value.confidence);
+    // And the record is still listable: history does not disappear.
+    const listed = store.listEvidence(workspaceId, owner.id, { status: "superseded" });
+    if (!isOk(listed)) throw new Error("evidence listing failed");
+    expect(listed.value).toHaveLength(1);
+
+    const retracted = store.updateAccountClaim(claim.value.id, {
+      userId: owner.id,
+      status: "retracted",
+    });
+    if (!isOk(retracted)) throw new Error("claim status update failed");
+    expect(retracted.value.status).toBe("retracted");
+    // Retracting a claim does not remove the evidence that supported it.
+    expect(store.db.evidence).toHaveLength(1);
+  });
+
+  it("exposes a research finding to the evidence layer without trusting the caller", () => {
+    const store = seed();
+    const ownerA = makeOwner(store, "a@example.com");
+    const ownerB = makeOwner(store, "b@example.com");
+    const workspaceA = makeWorkspace(store, ownerA.id, "Finding Tenant A");
+    const accountA = evidenceAccount(store, workspaceA, ownerA.id, "Finding Trading");
+    const finding = seedFinding(store, workspaceA, ownerA.id, accountA.id);
+
+    const owned = store.getResearchFinding(finding.id, ownerA.id);
+    if (!isOk(owned)) throw new Error("finding read failed");
+    expect(owned.value.accountId).toBe(accountA.id);
+
+    const foreign = store.getResearchFinding(finding.id, ownerB.id);
+    if (!isErr(foreign)) throw new Error("cross-tenant finding read was allowed");
+    expect(foreign.error.code).toBe("UNAUTHORIZED");
+
+    const absent = store.getResearchFinding(newId(), ownerA.id);
+    if (!isErr(absent)) throw new Error("unknown finding read was allowed");
+    expect(absent.error.code).toBe("NOT_FOUND");
+  });
+
+  it("preserves Phase 6 data when migrating a v6 document to v7", () => {
+    const v6 = emptyState();
+    v6.schemaVersion = 6;
+    const store = new Store(v6);
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "V6 Evidence Co");
+    const account = evidenceAccount(store, workspaceId, owner.id, "V6 Trading");
+    const finding = seedFinding(store, workspaceId, owner.id, account.id);
+
+    const migrated = migrateState(JSON.parse(JSON.stringify(store.db)) as never);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    // Phase 6 rows survive untouched, so evidence can still be derived later.
+    expect(migrated.researchRequests).toHaveLength(1);
+    expect(migrated.researchFindings).toHaveLength(1);
+    expect(migrated.researchFindings[0]?.id).toBe(finding.id);
+    // The Phase 7 tables are additive: an older document gains them empty.
+    expect(migrated.accountClaims).toEqual([]);
+    expect(migrated.evidence).toEqual([]);
+  });
+
+  it("keeps Phase 7 rows across a repeat migration", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Repeat Evidence Co");
+    const account = evidenceAccount(store, workspaceId, owner.id, "Repeat Trading");
+    const finding = seedFinding(store, workspaceId, owner.id, account.id);
+    const claim = store.createAccountClaim({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.id,
+      category: "company_overview",
+      field: "website",
+      value: "https://northwind.example",
+      claimKind: "fact",
+    });
+    if (!isOk(claim)) throw new Error("claim creation failed");
+    store.createEvidence({
+      workspaceId,
+      accountClaimId: claim.value.id,
+      evidence: {
+        ...evidenceInput(),
+        researchFindingId: finding.id,
+        provenance: "research_finding",
+        sourceUrl: "https://northwind.example",
+      },
+    });
+
+    const migrated = migrateState(JSON.parse(JSON.stringify(store.db)) as never);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    expect(migrated.accountClaims).toHaveLength(1);
+    expect(migrated.evidence).toHaveLength(1);
+    // The provenance chain survives the round trip intact.
+    expect(migrated.evidence[0]?.researchFindingId).toBe(finding.id);
+    expect(migrated.evidence[0]?.provenance).toBe("research_finding");
+    expect(migrated.evidence[0]?.accountClaimId).toBe(claim.value.id);
+    expect(migrated.evidence[0]?.accountId).toBe(account.id);
   });
 });

@@ -870,3 +870,152 @@ export interface ResearchRequest {
   createdAt: DateTime;
   updatedAt: DateTime;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7 — Evidence System (DEALORA_BLUEPRINT.md §10, ROADMAP.md §14)
+// ---------------------------------------------------------------------------
+
+/**
+ * The lifecycle of a claim about an external account.
+ *
+ * Three states, and the third one is the point of the phase:
+ *
+ * - `asserted`  — a claim exists and carries at least one source-backed
+ *                 evidence record. DEALORA is **not** saying the claim is true;
+ *                 it is saying a permitted source stated it.
+ * - `contested` — a source-backed contradiction was recorded against this
+ *                 claim. DEALORA never resolves it on the user's behalf.
+ * - `retracted` — the workspace withdrew the claim. Terminal, and soft: the
+ *                 claim row and every evidence record attached to it stay
+ *                 readable so the audit trail survives the withdrawal.
+ *
+ * There is deliberately no `verified` state and no score. Verification is not
+ * something this phase can honestly perform, and qualification is Phase 8
+ * (`ROADMAP.md` §15).
+ */
+export type AccountClaimStatus = "asserted" | "contested" | "retracted";
+
+/**
+ * The lifecycle of one piece of evidence.
+ *
+ * Every state records a fact about this record, and none of them is a verdict
+ * about the wider world:
+ *
+ * - `recorded`      — captured, with full provenance, from a research finding
+ *                     or from a source the workspace supplied directly.
+ * - `contradicted`  — another record for the same claim field carries a
+ *                     different value. **Both** records are marked; neither is
+ *                     deleted and no winner is declared.
+ * - `superseded`    — the workspace pointed this record at a named replacement
+ *                     for the same claim field. The old value, source and
+ *                     timestamps are all preserved. Terminal.
+ * - `rejected`      — the workspace rejected this record as support. Terminal.
+ *
+ * `superseded` and `rejected` are terminal: a record that was replaced or
+ * rejected cannot quietly come back, and a `contradicted` record cannot be
+ * returned to `recorded`, because that would resolve the conflict by fiat. A
+ * conflict is resolved only by an explicit supersession naming a real
+ * replacement, which leaves both sides readable.
+ */
+export type EvidenceStatus = "recorded" | "contradicted" | "superseded" | "rejected";
+
+/**
+ * How an evidence record came to exist.
+ *
+ * - `research_finding` — converted from a Phase 6 `ResearchFinding`, so the
+ *   full chain evidence → claim → finding → request → account is walkable.
+ * - `user_supplied`    — the workspace supplied the source directly, so there
+ *   is no research request and `researchFindingId` is `null`. A research
+ *   request is never invented to fill the gap.
+ */
+export type EvidenceProvenance = "research_finding" | "user_supplied";
+
+/**
+ * A structured assertion about an external account.
+ *
+ * Distinct from the Phase 2 {@link Claim}, which is a statement the *business
+ * itself* authored about itself with an approval status. These go the other
+ * way: an assertion about a company DEALORA does not own, derived from a
+ * permitted source and supported by one or more {@link Evidence} records. The
+ * two are never merged, because their trust directions are opposite.
+ *
+ * The claim stores only what the source supports. It holds no source URL — a
+ * citation belongs to the evidence that carries it, so the same claim can be
+ * supported by several sources without any of them being overwritten.
+ */
+export interface AccountClaim {
+  id: EntityId;
+  workspaceId: EntityId;
+  accountId: EntityId;
+  /** Observation bucket, exactly the Phase 6 categories (`ROADMAP.md` §13). */
+  category: ResearchCategory;
+  /** Stable field key inside the category, e.g. `products_services.offerings`. */
+  field: string;
+  value: string;
+  /** What kind of statement this is. `fact` still means "this source says so". */
+  claimKind: ResearchClaimKind;
+  status: AccountClaimStatus;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}
+
+/**
+ * One traceable, source-backed support for a claim.
+ *
+ * `ROADMAP.md` §14 asks evidence to be first-class rather than text hidden in a
+ * prompt, and lists its fields. The mapping is exact:
+ *
+ * | Roadmap field   | Field                                                        |
+ * | --------------- | ------------------------------------------------------------ |
+ * | `id`            | `id`                                                          |
+ * | `source`        | `sourceName` — which provider or record made the statement   |
+ * | `source_type`   | `source` — which permitted source kind (§43)                  |
+ * | `source_url`    | `sourceUrl` — `null` when the source supplied no reference   |
+ * | `claim`         | `accountClaimId` → `AccountClaim.value`                      |
+ * | `claim_type`    | `accountClaimId` → `AccountClaim.claimKind`                  |
+ * | `confidence`    | `confidence`                                                  |
+ * | `freshness`     | `freshness`                                                   |
+ * | `retrieved_at`  | `retrievedAt`                                                 |
+ * | `relevance`     | `relevance`                                                   |
+ * | `related_entity`| `accountId` — the entity the claim is about                   |
+ *
+ * Plus the provenance that makes the record auditable: `researchFindingId`,
+ * `provenance`, `sourceTitle`, `observedAt`, `status` and `note`.
+ *
+ * Every source field is a restatement of what the underlying record or
+ * provider actually supplied. A citation that does not exist is stored as
+ * `null`; it is never constructed, guessed or completed from a domain name.
+ */
+export interface Evidence {
+  id: EntityId;
+  /** Denormalized so evidence can never outlive its tenant boundary. */
+  workspaceId: EntityId;
+  /** ROADMAP's `related_entity`: the account this evidence is about. */
+  accountId: EntityId;
+  accountClaimId: EntityId;
+  /** The Phase 6 finding this came from. `null` for `user_supplied` provenance. */
+  researchFindingId: EntityId | null;
+  provenance: EvidenceProvenance;
+  /** The permitted source kind (DEALORA_BLUEPRINT.md §43). ROADMAP's `source_type`. */
+  source: ResearchSourceKind;
+  /** The provider or record that made the statement. ROADMAP's `source`. */
+  sourceName: string;
+  /** The source's own reference. `null` when it supplied none. */
+  sourceUrl: string | null;
+  sourceTitle: string | null;
+  /** When the source says the statement was true. `null` when unknown. */
+  observedAt: DateTime | null;
+  /** When DEALORA retrieved it. ROADMAP's `retrieved_at`. */
+  retrievedAt: DateTime;
+  /** Strength of support. Never an account, lead or buying-intent score. */
+  confidence: ResearchConfidence;
+  /** Temporal metadata, derived from `observedAt`. Never inferred from confidence. */
+  freshness: ResearchFreshness;
+  /** How directly the record relates to the claim context. Never a ranking. */
+  relevance: ResearchRelevance;
+  status: EvidenceStatus;
+  /** Bounded note. Not a store for free-form model output. */
+  note: string | null;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}

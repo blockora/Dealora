@@ -69,6 +69,11 @@ export type {
   ResearchRequest,
   ResearchRequestStatus,
   ResearchSourceKind,
+  AccountClaim,
+  AccountClaimStatus,
+  Evidence,
+  EvidenceStatus,
+  EvidenceProvenance,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -94,6 +99,8 @@ export {
   contactTable,
   researchRequestTable,
   researchFindingTable,
+  accountClaimTable,
+  evidenceTable,
   createTableSql,
   slugify,
   capString,

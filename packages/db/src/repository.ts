@@ -22,6 +22,10 @@ import type {
   ResearchFinding,
   ResearchRequest,
   ResearchRequestStatus,
+  AccountClaim,
+  AccountClaimStatus,
+  Evidence,
+  EvidenceStatus,
   User,
   Workspace,
   WorkspaceMember,
@@ -100,7 +104,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 6;
+export const LATEST_SCHEMA_VERSION = 7;
 
 export interface DbState {
   schemaVersion?: number;
@@ -121,6 +125,8 @@ export interface DbState {
   contacts?: Contact[];
   researchRequests?: ResearchRequest[];
   researchFindings?: ResearchFinding[];
+  accountClaims?: AccountClaim[];
+  evidence?: Evidence[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -146,6 +152,8 @@ export function emptyState(): CompleteDbState {
     contacts: [],
     researchRequests: [],
     researchFindings: [],
+    accountClaims: [],
+    evidence: [],
   };
 }
 
@@ -161,6 +169,9 @@ export function emptyState(): CompleteDbState {
  *
  * Step 6 (Phase 6 — Research Engine): add `research_requests` and
  * `research_findings`. Additive like every step before it.
+ *
+ * Step 7 (Phase 7 — Evidence System): add `account_claims` and `evidence`.
+ * Additive like every step before it, and no existing row is rewritten.
  */
 export function migrateState(input: DbState): CompleteDbState {
   const base = emptyState();
@@ -218,6 +229,16 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.researchFindings;
   }
 
+  // Phase 7 adds account claims and their evidence. Purely additive: an older
+  // document simply gains two empty tables and keeps every research finding it
+  // already had, so evidence can still be derived from them later.
+  if (version >= 7) {
+    state.accountClaims = Array.isArray(input.accountClaims)
+      ? input.accountClaims
+      : base.accountClaims;
+    state.evidence = Array.isArray(input.evidence) ? input.evidence : base.evidence;
+  }
+
   return state;
 }
 
@@ -254,6 +275,8 @@ type RowTable =
   | "contacts"
   | "researchRequests"
   | "researchFindings"
+  | "accountClaims"
+  | "evidence"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -1776,6 +1799,21 @@ export class Store {
     return { ok: true, value: finding };
   }
 
+  /**
+   * One finding, resolved through the caller's own authorization.
+   *
+   * Phase 7 needs this to convert a finding into evidence without trusting a
+   * caller-supplied account id: the finding itself carries the workspace and
+   * account it belongs to. Another tenant's finding is not found.
+   */
+  getResearchFinding(id: EntityId, userId: EntityId): Result<ResearchFinding, StorageError> {
+    const finding = this.findById("researchFindings", id);
+    if (!finding) return { ok: false, error: toError("NOT_FOUND", "research finding not found") };
+    const auth = this.requireWorkspace(finding.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: finding };
+  }
+
   /** A workspace's findings, newest first, optionally narrowed. */
   listResearchFindings(
     workspaceId: EntityId,
@@ -1821,6 +1859,237 @@ export class Store {
       ok: true,
       value: this.rows("researchFindings").filter((f) => f.researchRequestId === request.id).length,
     };
+  }
+
+  // --- Evidence (Phase 7) ---
+
+  /**
+   * Record a structured claim about an account.
+   *
+   * The account must live in the same workspace as the claim, so the
+   * invariant `AccountClaim.workspaceId === Account.workspaceId` is enforced at
+   * write time and not only by the caller.
+   */
+  createAccountClaim(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    accountId: EntityId;
+    category: AccountClaim["category"];
+    field: string;
+    value: string;
+    claimKind: AccountClaim["claimKind"];
+  }): Result<AccountClaim, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+    const account = this.findById("accounts", input.accountId);
+    if (!account || account.workspaceId !== input.workspaceId) {
+      return {
+        ok: false,
+        error: toError("INVALID", "account does not exist in this workspace"),
+      };
+    }
+    const stamp = toDateTime(now());
+    const claim: AccountClaim = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      accountId: account.id,
+      category: input.category,
+      field: input.field,
+      value: input.value,
+      claimKind: input.claimKind,
+      status: "asserted",
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    this.mutate("accountClaims", (rows) => rows.push(claim));
+    return { ok: true, value: claim };
+  }
+
+  getAccountClaim(id: EntityId, userId: EntityId): Result<AccountClaim, StorageError> {
+    const claim = this.findById("accountClaims", id);
+    if (!claim) return { ok: false, error: toError("NOT_FOUND", "claim not found") };
+    const auth = this.requireWorkspace(claim.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: claim };
+  }
+
+  /**
+   * One claim for one account field.
+   *
+   * The lookup a controlled evidence conversion needs: the same field on the
+   * same account always resolves to the same claim, so repeated research runs
+   * accumulate evidence against one assertion instead of minting a new claim
+   * per run.
+   */
+  findAccountClaimByField(
+    workspaceId: EntityId,
+    userId: EntityId,
+    accountId: EntityId,
+    category: AccountClaim["category"],
+    field: string,
+  ): Result<AccountClaim | null, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const found =
+      this.rows("accountClaims").find(
+        (c) =>
+          c.workspaceId === workspaceId &&
+          c.accountId === accountId &&
+          c.category === category &&
+          c.field === field,
+      ) ?? null;
+    return { ok: true, value: found };
+  }
+
+  /** A workspace's claims, newest first, optionally narrowed. */
+  listAccountClaims(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: {
+      accountId?: EntityId;
+      category?: AccountClaim["category"];
+      status?: AccountClaimStatus;
+    },
+  ): Result<AccountClaim[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("accountClaims").filter((c) => c.workspaceId === workspaceId);
+    const filtered = scoped.filter((c) => {
+      if (filter?.accountId && c.accountId !== filter.accountId) return false;
+      if (filter?.category && c.category !== filter.category) return false;
+      if (filter?.status && c.status !== filter.status) return false;
+      return true;
+    });
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) =>
+        a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : a.id.localeCompare(b.id),
+      ),
+    };
+  }
+
+  /**
+   * Move a claim along its lifecycle.
+   *
+   * Storage records the transition the domain decided; it does not decide
+   * whether the transition is legal — that rule lives in the domain, so there
+   * is exactly one place to audit.
+   */
+  updateAccountClaim(
+    id: EntityId,
+    input: { userId: EntityId; status: AccountClaimStatus },
+  ): Result<AccountClaim, StorageError> {
+    const claim = this.findById("accountClaims", id);
+    if (!claim) return { ok: false, error: toError("NOT_FOUND", "claim not found") };
+    const auth = this.requireWorkspace(claim.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    claim.status = input.status;
+    claim.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: claim };
+  }
+
+  /**
+   * Record one evidence record.
+   *
+   * The evidence inherits its workspace and account from the claim it
+   * supports: a caller cannot cite a claim in another account or tenant and
+   * have it accepted.
+   */
+  createEvidence(input: {
+    workspaceId: EntityId;
+    accountClaimId: EntityId;
+    evidence: Omit<
+      Evidence,
+      "id" | "workspaceId" | "accountId" | "accountClaimId" | "createdAt" | "updatedAt"
+    >;
+  }): Result<Evidence, StorageError> {
+    const claim = this.findById("accountClaims", input.accountClaimId);
+    if (!claim) return { ok: false, error: toError("NOT_FOUND", "claim not found") };
+    if (claim.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("INVALID", "claim does not exist in this workspace") };
+    }
+    const stamp = toDateTime(now());
+    const evidence: Evidence = {
+      ...input.evidence,
+      id: newId(),
+      workspaceId: claim.workspaceId,
+      accountId: claim.accountId,
+      accountClaimId: claim.id,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    this.mutate("evidence", (rows) => rows.push(evidence));
+    return { ok: true, value: evidence };
+  }
+
+  getEvidence(id: EntityId, userId: EntityId): Result<Evidence, StorageError> {
+    const record = this.findById("evidence", id);
+    if (!record) return { ok: false, error: toError("NOT_FOUND", "evidence not found") };
+    const auth = this.requireWorkspace(record.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: record };
+  }
+
+  /**
+   * A workspace's evidence, newest retrieval first, optionally narrowed.
+   *
+   * Nothing is filtered out by default: `superseded`, `contradicted` and
+   * `rejected` records stay listable, because an audit trail that hides the
+   * discarded half is not an audit trail.
+   */
+  listEvidence(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: {
+      accountId?: EntityId;
+      accountClaimId?: EntityId;
+      researchFindingId?: EntityId;
+      status?: EvidenceStatus;
+    },
+  ): Result<Evidence[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("evidence").filter((e) => e.workspaceId === workspaceId);
+    const filtered = scoped.filter((e) => {
+      if (filter?.accountId && e.accountId !== filter.accountId) return false;
+      if (filter?.accountClaimId && e.accountClaimId !== filter.accountClaimId) return false;
+      if (filter?.researchFindingId && e.researchFindingId !== filter.researchFindingId)
+        return false;
+      if (filter?.status && e.status !== filter.status) return false;
+      return true;
+    });
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) =>
+        a.retrievedAt < b.retrievedAt
+          ? 1
+          : a.retrievedAt > b.retrievedAt
+            ? -1
+            : a.id.localeCompare(b.id),
+      ),
+    };
+  }
+
+  /**
+   * Move an evidence record along its lifecycle.
+   *
+   * Status only — never a field mutation. An evidence record's source, value,
+   * timestamps and confidence are what the source said, and rewriting them
+   * would destroy the provenance the record exists to preserve.
+   */
+  updateEvidence(
+    id: EntityId,
+    input: { userId: EntityId; status: EvidenceStatus },
+  ): Result<Evidence, StorageError> {
+    const record = this.findById("evidence", id);
+    if (!record) return { ok: false, error: toError("NOT_FOUND", "evidence not found") };
+    const auth = this.requireWorkspace(record.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    record.status = input.status;
+    record.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: record };
   }
 
   /** Cleanup helper so tests and local runs do not leave files behind. */
@@ -1909,8 +2178,19 @@ export const db = {
   findResearchRequestByIdempotencyKey: store.findResearchRequestByIdempotencyKey.bind(store),
   updateResearchRequest: store.updateResearchRequest.bind(store),
   createResearchFinding: store.createResearchFinding.bind(store),
+  getResearchFinding: store.getResearchFinding.bind(store),
   listResearchFindings: store.listResearchFindings.bind(store),
   countResearchFindings: store.countResearchFindings.bind(store),
+
+  createAccountClaim: store.createAccountClaim.bind(store),
+  getAccountClaim: store.getAccountClaim.bind(store),
+  findAccountClaimByField: store.findAccountClaimByField.bind(store),
+  listAccountClaims: store.listAccountClaims.bind(store),
+  updateAccountClaim: store.updateAccountClaim.bind(store),
+  createEvidence: store.createEvidence.bind(store),
+  getEvidence: store.getEvidence.bind(store),
+  listEvidence: store.listEvidence.bind(store),
+  updateEvidence: store.updateEvidence.bind(store),
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),
   workspaceOwner: store.workspaceOwner.bind(store),

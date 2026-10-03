@@ -156,6 +156,9 @@ export const COLUMNS = {
   freshness: "freshness",
   relevance: "relevance",
   note: "note",
+  accountClaimId: "account_claim_id",
+  researchFindingId: "research_finding_id",
+  provenance: "provenance",
 } as const;
 
 export type ColumnName = (typeof COLUMNS)[keyof typeof COLUMNS];
@@ -226,6 +229,25 @@ export const researchRequestTable = "research_requests" as const;
  */
 export const researchFindingTable = "research_findings" as const;
 
+/**
+ * Table: structured claims about an external account (Phase 7).
+ *
+ * Not the Phase 2 `claims` table. Those are the business's own statements
+ * with an approval status; these are assertions about a company DEALORA does
+ * not own, derived from a permitted source. Keeping them apart is what stops
+ * a source-backed observation being presented as an approved internal claim.
+ */
+export const accountClaimTable = "account_claims" as const;
+
+/**
+ * Table: evidence (Phase 7).
+ *
+ * One row per traceable, source-backed support for an `account_claims` row.
+ * Records are never deleted: `superseded`, `contradicted` and `rejected` are
+ * statuses, so the audit trail is preserved by construction.
+ */
+export const evidenceTable = "evidence" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -245,6 +267,8 @@ export const tables = [
   contactTable,
   researchRequestTable,
   researchFindingTable,
+  accountClaimTable,
+  evidenceTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -330,6 +354,19 @@ export const indexes = {
     `${COLUMN(researchFindingTable, COLUMNS.workspaceId)} NOT NULL`,
     `${COLUMN(researchFindingTable, COLUMNS.accountId)} NOT NULL`,
     `${COLUMN(researchFindingTable, COLUMNS.researchRequestId)} NOT NULL`,
+  ],
+  accountClaims: [
+    `${COLUMN(accountClaimTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(accountClaimTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(accountClaimTable, COLUMNS.accountId)} NOT NULL`,
+    `${COLUMN(accountClaimTable, COLUMNS.status)} NOT NULL`,
+  ],
+  evidence: [
+    `${COLUMN(evidenceTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(evidenceTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(evidenceTable, COLUMNS.accountId)} NOT NULL`,
+    `${COLUMN(evidenceTable, COLUMNS.accountClaimId)} NOT NULL`,
+    `${COLUMN(evidenceTable, COLUMNS.status)} NOT NULL`,
   ],
 };
 
@@ -676,6 +713,54 @@ ${COLUMN(researchFindingTable, COLUMNS.accountId)} REFERENCES "${accountTable}"(
 ${COLUMN(researchFindingTable, COLUMNS.source)} CHECK (${COLUMN(researchFindingTable, COLUMNS.source)} IN ('account_record','approved_api','public_web')),
 ${COLUMN(researchFindingTable, COLUMNS.claimKind)} CHECK (${COLUMN(researchFindingTable, COLUMNS.claimKind)} IN ('fact','inference','hypothesis','recommendation')),
 ${COLUMN(researchFindingTable, COLUMNS.status)} CHECK (${COLUMN(researchFindingTable, COLUMNS.status)} IN ('recorded'))`,
+  ),
+  createTableSql(
+    accountClaimTable,
+    [
+      COLUMN(accountClaimTable, COLUMNS.id),
+      COLUMN(accountClaimTable, COLUMNS.workspaceId),
+      COLUMN(accountClaimTable, COLUMNS.accountId),
+      COLUMN(accountClaimTable, COLUMNS.category),
+      COLUMN(accountClaimTable, COLUMNS.field),
+      COLUMN(accountClaimTable, COLUMNS.value),
+      COLUMN(accountClaimTable, COLUMNS.claimKind),
+      COLUMN(accountClaimTable, COLUMNS.status),
+    ],
+    `${COLUMN(accountClaimTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(accountClaimTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(accountClaimTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(accountClaimTable, COLUMNS.claimKind)} CHECK (${COLUMN(accountClaimTable, COLUMNS.claimKind)} IN ('fact','inference','hypothesis','recommendation')),
+${COLUMN(accountClaimTable, COLUMNS.status)} CHECK (${COLUMN(accountClaimTable, COLUMNS.status)} IN ('asserted','contested','retracted'))`,
+  ),
+  createTableSql(
+    evidenceTable,
+    [
+      COLUMN(evidenceTable, COLUMNS.id),
+      COLUMN(evidenceTable, COLUMNS.workspaceId),
+      COLUMN(evidenceTable, COLUMNS.accountId),
+      COLUMN(evidenceTable, COLUMNS.accountClaimId),
+      COLUMN(evidenceTable, COLUMNS.researchFindingId),
+      COLUMN(evidenceTable, COLUMNS.provenance),
+      COLUMN(evidenceTable, COLUMNS.source),
+      COLUMN(evidenceTable, COLUMNS.sourceName),
+      COLUMN(evidenceTable, COLUMNS.sourceUrl),
+      COLUMN(evidenceTable, COLUMNS.sourceTitle),
+      COLUMN(evidenceTable, COLUMNS.observedAt),
+      COLUMN(evidenceTable, COLUMNS.retrievedAt),
+      COLUMN(evidenceTable, COLUMNS.confidence),
+      COLUMN(evidenceTable, COLUMNS.freshness),
+      COLUMN(evidenceTable, COLUMNS.relevance),
+      COLUMN(evidenceTable, COLUMNS.note),
+      COLUMN(evidenceTable, COLUMNS.status),
+    ],
+    `${COLUMN(evidenceTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(evidenceTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(evidenceTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(evidenceTable, COLUMNS.accountClaimId)} REFERENCES "${accountClaimTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(evidenceTable, COLUMNS.researchFindingId)} REFERENCES "${researchFindingTable}"("${COLUMNS.id}") ON DELETE SET NULL,
+${COLUMN(evidenceTable, COLUMNS.provenance)} CHECK (${COLUMN(evidenceTable, COLUMNS.provenance)} IN ('research_finding','user_supplied')),
+${COLUMN(evidenceTable, COLUMNS.source)} CHECK (${COLUMN(evidenceTable, COLUMNS.source)} IN ('account_record','approved_api','public_web')),
+${COLUMN(evidenceTable, COLUMNS.status)} CHECK (${COLUMN(evidenceTable, COLUMNS.status)} IN ('recorded','superseded','contradicted','rejected'))`,
   ),
 ].join("\n\n");
 
