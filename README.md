@@ -19,8 +19,9 @@ intelligence and execution layer around the revenue stack.
 
 The repository has completed **Phase 0 — Repository & Engineering Foundation**,
 **Phase 1 — Application Foundation**, **Phase 2 — Business Brain**,
-**Phase 3 — Revenue Goal Engine**, **Phase 4 — Revenue Plan Compiler**, and
-**Phase 5 — Account & Prospect Input** (see [`ROADMAP.md`](./ROADMAP.md)).
+**Phase 3 — Revenue Goal Engine**, **Phase 4 — Revenue Plan Compiler**,
+**Phase 5 — Account & Prospect Input**, and **Phase 6 — Research Engine** (see
+[`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
 with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
@@ -70,7 +71,24 @@ scored, qualified or contacted. Its gate — import and create target accounts
 and contacts, persist, reload and keep the relationship — is covered by
 `tests/phase5-gate.test.ts`.
 
-Next is **Phase 6 — Research & Evidence**.
+Phase 6 adds the Research Engine: an existing account becomes a research
+**request**, a permitted **provider** answers it, and the run produces structured
+**research findings** that each carry their claim, source, reference, retrieval
+time, confidence, freshness and relevance. Research runs only against permitted
+sources — user-provided data, authorized APIs, permitted public/business
+information and approved integrations — and the package contains no crawler, no
+credential handling and no way around authentication, robots/access controls, API
+restrictions or rate limits. Every statement is labelled `fact`, `inference`,
+`hypothesis` or `recommendation`, so inference is never filed as fact; a
+citation the source did not supply stays absent rather than being invented; and a
+finding is **research data, not evidence** — verification, linking and audit are
+Phase 7. Nothing here scores, qualifies, ranks, personalizes or contacts anyone,
+and no external research source is configured or simulated: out of the box only
+the workspace's own account record is researchable. Its gate — research an
+account, persist attributed findings, reload and keep the provenance — is
+covered by `tests/phase6-gate.test.ts`.
+
+Next is **Phase 7 — Evidence System**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -90,13 +108,14 @@ packages/       Shared TypeScript packages (built with project references)
   goal/         Revenue Goal domain, validation, lifecycle, goal parsing (Phase 3)
   plan/         Revenue Plan compiler, provenance, validation, lifecycle (Phase 4)
   account/      Account & contact input, validation, dedup, CSV import (Phase 5)
+  research/     Research requests, permitted-source providers, attributed findings (Phase 6)
   api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 11+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests (Phase 1-5 gates)
+tests/          Cross-package integration tests (Phase 1-6 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
@@ -107,9 +126,10 @@ toolchain ([0001](./docs/adr/0001-development-toolchain.md)), the Phase 1
 foundation ([0002](./docs/adr/0002-phase-1-application-foundation.md)), the
 Business Brain ([0003](./docs/adr/0003-business-brain.md)), the Revenue Goal
 Engine ([0004](./docs/adr/0004-revenue-goal-engine.md)), and the Revenue Plan
-Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)), and the Account
+Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)), the Account
 & Prospect Input layer
-([0006](./docs/adr/0006-account-prospect-input.md)).
+([0006](./docs/adr/0006-account-prospect-input.md)), and the Research Engine
+([0007](./docs/adr/0007-research-engine.md)).
 
 ## Getting started
 
@@ -149,10 +169,10 @@ convention and the currently supported keys are documented in
 
 The only key is `DB_DIR` — the directory the local store writes
 `dealora.json` into (defaults to `packages/db/src/data`, which is
-git-ignored). Phases 1-5 need no credential: passwords are hashed with
-scrypt, goal parsing, plan compilation and account deduplication are
-deterministic and take no model provider, and no secret is ever hardcoded or
-read at module scope.
+git-ignored). Phases 1-6 need no credential: passwords are hashed with
+scrypt, goal parsing, plan compilation, account deduplication and research
+normalization are deterministic and take no model provider, and no secret is
+ever hardcoded or read at module scope.
 
 ## License
 
