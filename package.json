@@ -23,8 +23,8 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run",
-    "test:watch": "vitest",
+    "test": "vitest run -c vitest.workspace.ts",
+    "test:watch": "vitest -c vitest.workspace.ts",
     "check": "sh ./scripts/verify.sh"
   },
   "devDependencies": {

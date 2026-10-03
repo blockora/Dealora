@@ -1,0 +1,16 @@
+{
+  "name": "@dealora/auth",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DEALORA user identity, sessions, and server-side authentication checks.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./types": "./dist/types.js"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

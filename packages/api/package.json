@@ -1,0 +1,19 @@
+{
+  "name": "@dealora/api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DEALORA REST API layer: handlers and application service.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./types": "./dist/types.js"
+  },
+  "dependencies": {
+    "@dealora/auth": "workspace:*",
+    "@dealora/db": "workspace:*"
+  },
+  "devDependencies": {}
+}

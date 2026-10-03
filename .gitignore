@@ -22,3 +22,6 @@ coverage/
 .DS_Store
 .idea/
 .vscode/
+
+# Generated store data (git-ignored; seeded from DB_DIR or the empty test store)
+data/
