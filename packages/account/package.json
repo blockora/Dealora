@@ -1,0 +1,19 @@
+{
+  "name": "@dealora/account",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DEALORA Account & Prospect Input: workspace-isolated storage of user-supplied target accounts and contacts, with deterministic deduplication and safe CSV import.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./types": "./dist/types.js"
+  },
+  "dependencies": {
+    "@dealora/core": "workspace:*",
+    "@dealora/db": "workspace:*"
+  },
+  "devDependencies": {}
+}
