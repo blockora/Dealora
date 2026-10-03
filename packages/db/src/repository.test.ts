@@ -12,7 +12,7 @@ import {
 } from "./repository.js";
 import type { DbState } from "./repository.js";
 import { toDateTime } from "./types.js";
-import type { Claim, RevenueGoal, RevenuePlan, User } from "./types.js";
+import type { Claim, ResearchFinding, RevenueGoal, RevenuePlan, User } from "./types.js";
 
 function seed(): Store {
   return new Store(emptyState());
@@ -1156,5 +1156,323 @@ describe("revenue goal history", () => {
     const afterReload = reloaded.listRevenueGoalEvents(created.value.id, owner.id);
     if (!isOk(afterReload)) throw new Error("history read failed");
     expect(afterReload.value.map((e) => e.toStatus)).toEqual(expected);
+  });
+});
+
+describe("research requests and findings", () => {
+  const researchAccount = (store: Store, workspaceId: string, userId: string) => {
+    const created = store.createAccount({
+      workspaceId,
+      createdBy: userId,
+      account: {
+        name: "Northwind Trading",
+        website: "https://northwind.example",
+        domain: "northwind.example",
+        industry: "Wholesale",
+        companySize: "120",
+        geography: "UK",
+        description: null,
+        source: "manual",
+        sourceReference: "q1-list.csv",
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(created)) throw new Error("seed account creation failed");
+    return created.value;
+  };
+
+  const findingInput = (
+    overrides: Partial<{
+      field: string;
+      value: string;
+      sourceUrl: string | null;
+      observedAt: string | null;
+      freshness: ResearchFinding["freshness"];
+      claimKind: ResearchFinding["claimKind"];
+    }> = {},
+  ) => ({
+    category: "company_overview" as const,
+    field: overrides.field ?? "website",
+    value: overrides.value ?? "https://northwind.example",
+    claimKind: overrides.claimKind ?? ("fact" as const),
+    source: "account_record" as const,
+    sourceName: "account_record",
+    sourceUrl:
+      overrides.sourceUrl === undefined ? "https://northwind.example" : overrides.sourceUrl,
+    sourceTitle: "workspace account record",
+    observedAt: overrides.observedAt === undefined ? null : overrides.observedAt,
+    retrievedAt: "2026-10-01T00:00:00.000Z",
+    confidence: "medium" as const,
+    freshness: overrides.freshness ?? ("unknown" as const),
+    relevance: "high" as const,
+    note: null,
+    status: "recorded" as const,
+  });
+
+  it("stores a request and its findings with their provenance", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Research Co");
+    const account = researchAccount(store, workspaceId, owner.id);
+
+    const request = store.createResearchRequest({
+      workspaceId,
+      requestedBy: owner.id,
+      accountId: account.id,
+      provider: "account_record",
+      categories: ["company_overview"],
+    });
+    if (!isOk(request)) throw new Error("research request creation failed");
+    expect(request.value.status).toBe("pending");
+    expect(request.value.workspaceId).toBe(workspaceId);
+    expect(request.value.findingCount).toBe(0);
+    expect(request.value.failureCode).toBeNull();
+    expect(request.value.startedAt).toBeNull();
+
+    const finding = store.createResearchFinding({
+      researchRequestId: request.value.id,
+      createdBy: owner.id,
+      finding: findingInput(),
+    });
+    if (!isOk(finding)) throw new Error("research finding creation failed");
+    // The finding inherits its tenant boundary from the request.
+    expect(finding.value.workspaceId).toBe(workspaceId);
+    expect(finding.value.accountId).toBe(account.id);
+    expect(finding.value.sourceUrl).toBe("https://northwind.example");
+    expect(finding.value.retrievedAt).toBe("2026-10-01T00:00:00.000Z");
+    expect(finding.value.status).toBe("recorded");
+
+    const listed = store.listResearchFindings(workspaceId, owner.id, {
+      researchRequestId: request.value.id,
+    });
+    if (!isOk(listed)) throw new Error("research finding listing failed");
+    expect(listed.value).toHaveLength(1);
+    const counted = store.countResearchFindings(request.value.id, owner.id);
+    if (!isOk(counted)) throw new Error("research finding count failed");
+    expect(counted.value).toBe(1);
+  });
+
+  it("refuses to research an account from another workspace", () => {
+    const store = seed();
+    const ownerA = makeOwner(store, "a@example.com");
+    const ownerB = makeOwner(store, "b@example.com");
+    const workspaceA = makeWorkspace(store, ownerA.id, "Research A");
+    const workspaceB = makeWorkspace(store, ownerB.id, "Research B");
+    const account = researchAccount(store, workspaceA, ownerA.id);
+
+    const crossWorkspace = store.createResearchRequest({
+      workspaceId: workspaceB,
+      requestedBy: ownerB.id,
+      accountId: account.id,
+      provider: "account_record",
+      categories: ["company_overview"],
+    });
+    if (!isErr(crossWorkspace)) throw new Error("cross-workspace research was allowed");
+    expect(crossWorkspace.error.code).toBe("INVALID");
+    expect(store.db.researchRequests).toHaveLength(0);
+  });
+
+  it("keeps findings and requests inside their own tenant", () => {
+    const store = seed();
+    const ownerA = makeOwner(store, "a@example.com");
+    const ownerB = makeOwner(store, "b@example.com");
+    const workspaceA = makeWorkspace(store, ownerA.id, "Tenant A");
+    const workspaceB = makeWorkspace(store, ownerB.id, "Tenant B");
+    const account = researchAccount(store, workspaceA, ownerA.id);
+
+    const request = store.createResearchRequest({
+      workspaceId: workspaceA,
+      requestedBy: ownerA.id,
+      accountId: account.id,
+      provider: "account_record",
+      categories: ["company_overview"],
+    });
+    if (!isOk(request)) throw new Error("research request creation failed");
+    store.createResearchFinding({
+      researchRequestId: request.value.id,
+      createdBy: ownerA.id,
+      finding: findingInput(),
+    });
+
+    // B cannot read, run, or discover the request by guessing ids.
+    expect(isErr(store.getResearchRequest(request.value.id, ownerB.id))).toBe(true);
+    const bList = store.listResearchRequests(workspaceB, ownerB.id);
+    if (!isOk(bList)) throw new Error("research listing failed");
+    expect(bList.value).toEqual([]);
+    const bFindings = store.listResearchFindings(workspaceB, ownerB.id);
+    if (!isOk(bFindings)) throw new Error("research findings listing failed");
+    expect(bFindings.value).toEqual([]);
+    const bActive = store.findActiveResearchRequest(
+      workspaceB,
+      ownerB.id,
+      account.id,
+      "account_record",
+    );
+    if (!isOk(bActive)) throw new Error("active research lookup failed");
+    expect(bActive.value).toBeNull();
+
+    // A still sees exactly its own row.
+    const aFindings = store.listResearchFindings(workspaceA, ownerA.id, {
+      accountId: account.id,
+    });
+    if (!isOk(aFindings)) throw new Error("research findings listing failed");
+    expect(aFindings.value).toHaveLength(1);
+  });
+
+  it("reports one active request per account and provider", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Active Research Co");
+    const account = researchAccount(store, workspaceId, owner.id);
+
+    const first = store.createResearchRequest({
+      workspaceId,
+      requestedBy: owner.id,
+      accountId: account.id,
+      provider: "account_record",
+      categories: ["company_overview"],
+    });
+    if (!isOk(first)) throw new Error("research request creation failed");
+
+    const active = store.findActiveResearchRequest(
+      workspaceId,
+      owner.id,
+      account.id,
+      "account_record",
+    );
+    if (!isOk(active)) throw new Error("active research lookup failed");
+    expect(active.value?.id).toBe(first.value.id);
+
+    // Running still occupies the slot.
+    store.updateResearchRequest(first.value.id, { userId: owner.id, status: "running" });
+    const whileRunning = store.findActiveResearchRequest(
+      workspaceId,
+      owner.id,
+      account.id,
+      "account_record",
+    );
+    if (!isOk(whileRunning)) throw new Error("active research lookup failed");
+    expect(whileRunning.value?.id).toBe(first.value.id);
+
+    // A finished request frees the slot for a later refresh.
+    store.updateResearchRequest(first.value.id, {
+      userId: owner.id,
+      status: "completed",
+      completedAt: "2026-10-01T00:00:00.000Z",
+      findingCount: 1,
+    });
+    const afterCompletion = store.findActiveResearchRequest(
+      workspaceId,
+      owner.id,
+      account.id,
+      "account_record",
+    );
+    if (!isOk(afterCompletion)) throw new Error("active research lookup failed");
+    expect(afterCompletion.value).toBeNull();
+  });
+
+  it("finds a request by its idempotency key within the workspace", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Idempotency Co");
+    const account = researchAccount(store, workspaceId, owner.id);
+
+    const created = store.createResearchRequest({
+      workspaceId,
+      requestedBy: owner.id,
+      accountId: account.id,
+      provider: "account_record",
+      categories: ["company_overview"],
+      idempotencyKey: "q1-refresh",
+    });
+    if (!isOk(created)) throw new Error("research request creation failed");
+
+    const found = store.findResearchRequestByIdempotencyKey(workspaceId, owner.id, "q1-refresh");
+    if (!isOk(found)) throw new Error("idempotency lookup failed");
+    expect(found.value?.id).toBe(created.value.id);
+
+    const missing = store.findResearchRequestByIdempotencyKey(workspaceId, owner.id, "other");
+    if (!isOk(missing)) throw new Error("idempotency lookup failed");
+    expect(missing.value).toBeNull();
+  });
+
+  it("records a failed run's reason and completion timestamp", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Failure Co");
+    const account = researchAccount(store, workspaceId, owner.id);
+
+    const request = store.createResearchRequest({
+      workspaceId,
+      requestedBy: owner.id,
+      accountId: account.id,
+      provider: "account_record",
+      categories: ["company_overview"],
+    });
+    if (!isOk(request)) throw new Error("research request creation failed");
+
+    const failed = store.updateResearchRequest(request.value.id, {
+      userId: owner.id,
+      status: "failed",
+      startedAt: "2026-10-01T00:00:00.000Z",
+      completedAt: "2026-10-01T00:00:05.000Z",
+      failureCode: "provider_unavailable",
+      failureMessage: "the research source is not available right now",
+    });
+    if (!isOk(failed)) throw new Error("research request update failed");
+    expect(failed.value.status).toBe("failed");
+    expect(failed.value.failureCode).toBe("provider_unavailable");
+    expect(failed.value.completedAt).toBe("2026-10-01T00:00:05.000Z");
+  });
+
+  it("preserves Phase 5 data when migrating a v5 document to v6", () => {
+    const v5 = emptyState();
+    v5.schemaVersion = 5;
+    const store = new Store(v5);
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "V5 Research Co");
+    const account = researchAccount(store, workspaceId, owner.id);
+
+    const migrated = migrateState(JSON.parse(JSON.stringify(store.db)) as never);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    // Phase 5 rows survive untouched.
+    expect(migrated.accounts).toHaveLength(1);
+    expect(migrated.accounts[0]?.id).toBe(account.id);
+    expect(migrated.accounts[0]?.sourceReference).toBe("q1-list.csv");
+    expect(migrated.contacts).toEqual([]);
+    // The Phase 6 tables are additive: an older document gains them empty.
+    expect(migrated.researchRequests).toEqual([]);
+    expect(migrated.researchFindings).toEqual([]);
+  });
+
+  it("keeps Phase 6 rows across a repeat migration", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Repeat Research Co");
+    const account = researchAccount(store, workspaceId, owner.id);
+    const request = store.createResearchRequest({
+      workspaceId,
+      requestedBy: owner.id,
+      accountId: account.id,
+      provider: "account_record",
+      categories: ["company_overview"],
+    });
+    if (!isOk(request)) throw new Error("research request creation failed");
+    store.createResearchFinding({
+      researchRequestId: request.value.id,
+      createdBy: owner.id,
+      finding: findingInput({ sourceUrl: null }),
+    });
+
+    const migrated = migrateState(JSON.parse(JSON.stringify(store.db)) as never);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    expect(migrated.researchRequests).toHaveLength(1);
+    expect(migrated.researchFindings).toHaveLength(1);
+    // Provenance is preserved exactly, including an absent source URL: a
+    // citation that was never supplied must not appear after a migration.
+    expect(migrated.researchFindings[0]?.sourceUrl).toBeNull();
+    expect(migrated.researchFindings[0]?.source).toBe("account_record");
+    expect(migrated.researchFindings[0]?.observedAt).toBeNull();
   });
 });

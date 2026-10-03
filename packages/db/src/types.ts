@@ -712,3 +712,161 @@ export interface Contact {
   createdAt: DateTime;
   updatedAt: DateTime;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6 — Research Engine (DEALORA_BLUEPRINT.md §12.3, ROADMAP.md §13)
+// ---------------------------------------------------------------------------
+
+/**
+ * Research request lifecycle.
+ *
+ * Deliberately minimal (ROADMAP.md does not ask for a workflow engine here):
+ * a request is created `pending`, executed once, and ends up `completed`,
+ * `failed` or `cancelled`. A `failed` request may be retried; `completed` and
+ * `cancelled` are terminal.
+ */
+export type ResearchRequestStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
+
+/**
+ * Why a research run ended without producing findings.
+ *
+ * Recorded on the request so a failure is an inspectable outcome rather than a
+ * silent one (DEALORA_BLUEPRINT.md §20: "Never silently pretend an action
+ * succeeded").
+ */
+export type ResearchFailureCode =
+  "provider_unavailable" | "provider_failed" | "invalid_provider_output" | "storage_failed";
+
+/**
+ * The kind of permitted source a finding came from
+ * (DEALORA_BLUEPRINT.md §43 — user-provided data, authorized APIs, permitted
+ * public/business information, approved integrations).
+ *
+ * There is no "unauthorized source" member: a source outside this list cannot
+ * be represented, let alone stored.
+ */
+export type ResearchSourceKind = "account_record" | "approved_api" | "public_web";
+
+/**
+ * The epistemic label carried by every research statement.
+ *
+ * ROADMAP.md §13: "Never treat inference as fact" and use explicit labels.
+ * `fact` means *this source states this* — it is not a claim that DEALORA has
+ * verified anything. Verification is the Evidence System's job (Phase 7).
+ */
+export type ResearchClaimKind = "fact" | "inference" | "hypothesis" | "recommendation";
+
+/**
+ * Research categories, exactly the list ROADMAP.md §13 gives for Phase 6:
+ * company overview, industry, business model, product/service information,
+ * recent announcements, hiring, expansion, leadership changes, relevant
+ * technology signals and public business changes.
+ *
+ * These are *observation buckets*, not scores. Nothing in this vocabulary
+ * expresses buying intent, funding, a technology fingerprint, competitor
+ * analysis or qualification — those are Phase 8 and later.
+ */
+export type ResearchCategory =
+  | "company_overview"
+  | "industry"
+  | "business_model"
+  | "products_services"
+  | "recent_announcements"
+  | "hiring"
+  | "expansion"
+  | "leadership_changes"
+  | "technology_signals"
+  | "public_business_changes";
+
+/**
+ * How much weight to give a statement, as a coarse band rather than a number.
+ *
+ * Bands, not percentages: DEALORA has no calibration data in this phase and
+ * must not invent a score it cannot defend.
+ */
+export type ResearchConfidence = "low" | "medium" | "high";
+
+/** How recently the source said the statement was true. */
+export type ResearchFreshness = "unknown" | "fresh" | "recent" | "stale";
+
+/** How close the statement is to what the request asked for. */
+export type ResearchRelevance = "low" | "medium" | "high";
+
+/**
+ * A research finding.
+ *
+ * Intermediate research output, deliberately **not** an evidence record: the
+ * Evidence System (Phase 7) owns verification, linking and audit. What a
+ * finding does carry, always, is provenance — which permitted source, when it
+ * was retrieved, and when the source said the statement was true.
+ *
+ * Every externally-derived finding keeps its `source`, `sourceName` and
+ * `retrievedAt`. `sourceUrl` is stored exactly as the provider returned it and
+ * is `null` when the provider supplied no reference: a citation is never
+ * invented.
+ */
+export interface ResearchFinding {
+  id: EntityId;
+  researchRequestId: EntityId;
+  /** Denormalized so findings can never outlive their tenant boundary. */
+  workspaceId: EntityId;
+  accountId: EntityId;
+  category: ResearchCategory;
+  /** Stable field key inside the category, e.g. `products_services.offerings`. */
+  field: string;
+  value: string;
+  claimKind: ResearchClaimKind;
+  source: ResearchSourceKind;
+  /** The provider that produced this finding. */
+  sourceName: string;
+  /** The provider's own citation. `null` when it returned none. */
+  sourceUrl: string | null;
+  sourceTitle: string | null;
+  /** When the source says the statement was true. `null` when unknown. */
+  observedAt: DateTime | null;
+  /** When DEALORA retrieved the statement. */
+  retrievedAt: DateTime;
+  confidence: ResearchConfidence;
+  freshness: ResearchFreshness;
+  relevance: ResearchRelevance;
+  /** Bounded provider note, never a store for free-form model output. */
+  note: string | null;
+  /**
+   * Phase 6 only records findings; it never withdraws or verifies them.
+   * Supersession and verification belong to the Evidence System.
+   */
+  status: "recorded";
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}
+
+/**
+ * One research job against one account.
+ *
+ * A request records *what was asked*, *which permitted provider answered*, and
+ * *how it ended*. It is workspace-scoped to exactly the account's workspace:
+ * `workspaceId === Account.workspaceId` is enforced on every path.
+ */
+export interface ResearchRequest {
+  id: EntityId;
+  workspaceId: EntityId;
+  accountId: EntityId;
+  requestedBy: EntityId;
+  /** The registered provider that will answer this request. */
+  provider: string;
+  status: ResearchRequestStatus;
+  categories: ResearchCategory[];
+  /**
+   * Optional caller-supplied key. Replaying a create with the same key returns
+   * the same request instead of starting a second job.
+   */
+  idempotencyKey: string | null;
+  /** How many findings this run recorded. Usage metadata, not a cost figure. */
+  findingCount: number;
+  failureCode: ResearchFailureCode | null;
+  failureMessage: string | null;
+  startedAt: DateTime | null;
+  completedAt: DateTime | null;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}

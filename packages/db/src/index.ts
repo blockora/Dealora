@@ -59,6 +59,16 @@ export type {
   Contact,
   ContactStatus,
   RecordSource,
+  ResearchCategory,
+  ResearchClaimKind,
+  ResearchConfidence,
+  ResearchFailureCode,
+  ResearchFinding,
+  ResearchFreshness,
+  ResearchRelevance,
+  ResearchRequest,
+  ResearchRequestStatus,
+  ResearchSourceKind,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -82,6 +92,8 @@ export {
   revenuePlanTable,
   accountTable,
   contactTable,
+  researchRequestTable,
+  researchFindingTable,
   createTableSql,
   slugify,
   capString,

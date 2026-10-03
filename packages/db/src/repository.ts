@@ -19,6 +19,9 @@ import type {
   AccountStatus,
   Contact,
   ContactStatus,
+  ResearchFinding,
+  ResearchRequest,
+  ResearchRequestStatus,
   User,
   Workspace,
   WorkspaceMember,
@@ -97,7 +100,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 5;
+export const LATEST_SCHEMA_VERSION = 6;
 
 export interface DbState {
   schemaVersion?: number;
@@ -116,6 +119,8 @@ export interface DbState {
   revenuePlans?: RevenuePlan[];
   accounts?: Account[];
   contacts?: Contact[];
+  researchRequests?: ResearchRequest[];
+  researchFindings?: ResearchFinding[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -139,6 +144,8 @@ export function emptyState(): CompleteDbState {
     revenuePlans: [],
     accounts: [],
     contacts: [],
+    researchRequests: [],
+    researchFindings: [],
   };
 }
 
@@ -151,6 +158,9 @@ export function emptyState(): CompleteDbState {
  * Step 3 (Phase 3 — Revenue Goal Engine): add `revenue_goals` and the
  * `revenue_goal_events` audit trail. Purely additive: no Phase 1 or Phase 2
  * row is rewritten or dropped.
+ *
+ * Step 6 (Phase 6 — Research Engine): add `research_requests` and
+ * `research_findings`. Additive like every step before it.
  */
 export function migrateState(input: DbState): CompleteDbState {
   const base = emptyState();
@@ -196,6 +206,18 @@ export function migrateState(input: DbState): CompleteDbState {
     state.contacts = Array.isArray(input.contacts) ? input.contacts : base.contacts;
   }
 
+  // Phase 6 adds research requests and their findings. Additive: research is a
+  // read-only layer over an existing account, so an older document simply
+  // gains two empty tables and keeps every account it already had.
+  if (version >= 6) {
+    state.researchRequests = Array.isArray(input.researchRequests)
+      ? input.researchRequests
+      : base.researchRequests;
+    state.researchFindings = Array.isArray(input.researchFindings)
+      ? input.researchFindings
+      : base.researchFindings;
+  }
+
   return state;
 }
 
@@ -230,6 +252,8 @@ type RowTable =
   | "revenuePlans"
   | "accounts"
   | "contacts"
+  | "researchRequests"
+  | "researchFindings"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -1564,6 +1588,241 @@ export class Store {
     return { ok: true, value: found ?? null };
   }
 
+  // --- Research (Phase 6) ---
+
+  /**
+   * Create a research request.
+   *
+   * The account must live in the same workspace as the request, so the
+   * invariant `ResearchRequest.workspaceId === Account.workspaceId` is
+   * enforced at write time and not only by the caller.
+   */
+  createResearchRequest(input: {
+    workspaceId: EntityId;
+    requestedBy: EntityId;
+    accountId: EntityId;
+    provider: string;
+    categories: ResearchRequest["categories"];
+    idempotencyKey?: string | null;
+  }): Result<ResearchRequest, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.requestedBy);
+    if (!auth.ok) return auth;
+    const account = this.findById("accounts", input.accountId);
+    if (!account || account.workspaceId !== input.workspaceId) {
+      return {
+        ok: false,
+        error: toError("INVALID", "account does not exist in this workspace"),
+      };
+    }
+    const stamp = toDateTime(now());
+    const request: ResearchRequest = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      accountId: account.id,
+      requestedBy: input.requestedBy,
+      provider: input.provider,
+      status: "pending",
+      categories: input.categories,
+      idempotencyKey: input.idempotencyKey ?? null,
+      findingCount: 0,
+      failureCode: null,
+      failureMessage: null,
+      startedAt: null,
+      completedAt: null,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    this.mutate("researchRequests", (rows) => rows.push(request));
+    return { ok: true, value: request };
+  }
+
+  getResearchRequest(id: EntityId, userId: EntityId): Result<ResearchRequest, StorageError> {
+    const request = this.findById("researchRequests", id);
+    if (!request) return { ok: false, error: toError("NOT_FOUND", "research request not found") };
+    const auth = this.requireWorkspace(request.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: request };
+  }
+
+  /** A workspace's research requests, newest first, optionally narrowed. */
+  listResearchRequests(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: {
+      accountId?: EntityId;
+      status?: ResearchRequestStatus;
+      provider?: string;
+    },
+  ): Result<ResearchRequest[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("researchRequests").filter((r) => r.workspaceId === workspaceId);
+    const filtered = scoped.filter((r) => {
+      if (filter?.accountId && r.accountId !== filter.accountId) return false;
+      if (filter?.status && r.status !== filter.status) return false;
+      if (filter?.provider && r.provider !== filter.provider) return false;
+      return true;
+    });
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) =>
+        a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : a.id.localeCompare(b.id),
+      ),
+    };
+  }
+
+  /**
+   * An in-flight request for the same account and provider.
+   *
+   * `pending` and `running` are the only non-terminal states, so this is the
+   * guard that stops a repeated request from creating a second active job.
+   */
+  findActiveResearchRequest(
+    workspaceId: EntityId,
+    userId: EntityId,
+    accountId: EntityId,
+    provider: string,
+  ): Result<ResearchRequest | null, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("researchRequests").find(
+      (r) =>
+        r.workspaceId === workspaceId &&
+        r.accountId === accountId &&
+        r.provider === provider &&
+        (r.status === "pending" || r.status === "running"),
+    );
+    return { ok: true, value: found ?? null };
+  }
+
+  /** Replay lookup for a caller-supplied idempotency key. */
+  findResearchRequestByIdempotencyKey(
+    workspaceId: EntityId,
+    userId: EntityId,
+    idempotencyKey: string,
+  ): Result<ResearchRequest | null, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("researchRequests").find(
+      (r) => r.workspaceId === workspaceId && r.idempotencyKey === idempotencyKey,
+    );
+    return { ok: true, value: found ?? null };
+  }
+
+  /**
+   * Move a request along its lifecycle.
+   *
+   * Storage records the transition the domain decided; it does not decide
+   * whether the transition is legal — that rule lives in the domain, so there
+   * is exactly one place to audit.
+   */
+  updateResearchRequest(
+    id: EntityId,
+    input: {
+      userId: EntityId;
+      status: ResearchRequestStatus;
+      startedAt?: string | null;
+      completedAt?: string | null;
+      failureCode?: ResearchRequest["failureCode"];
+      failureMessage?: string | null;
+      findingCount?: number;
+    },
+  ): Result<ResearchRequest, StorageError> {
+    const request = this.findById("researchRequests", id);
+    if (!request) return { ok: false, error: toError("NOT_FOUND", "research request not found") };
+    const auth = this.requireWorkspace(request.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    request.status = input.status;
+    if (input.startedAt !== undefined) request.startedAt = input.startedAt;
+    if (input.completedAt !== undefined) request.completedAt = input.completedAt;
+    if (input.failureCode !== undefined) request.failureCode = input.failureCode;
+    if (input.failureMessage !== undefined) request.failureMessage = input.failureMessage;
+    if (input.findingCount !== undefined) request.findingCount = input.findingCount;
+    request.updatedAt = toDateTime(now());
+    this.save();
+    return { ok: true, value: request };
+  }
+
+  /**
+   * Record one finding.
+   *
+   * The finding inherits the request's workspace and account: a provider can
+   * never attach a finding to a different account or another tenant's request.
+   */
+  createResearchFinding(input: {
+    researchRequestId: EntityId;
+    createdBy: EntityId;
+    finding: Omit<
+      ResearchFinding,
+      "id" | "workspaceId" | "accountId" | "researchRequestId" | "createdAt" | "updatedAt"
+    >;
+  }): Result<ResearchFinding, StorageError> {
+    const request = this.findById("researchRequests", input.researchRequestId);
+    if (!request) {
+      return { ok: false, error: toError("NOT_FOUND", "research request not found") };
+    }
+    const auth = this.requireWorkspace(request.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+    const finding: ResearchFinding = {
+      ...input.finding,
+      id: newId(),
+      workspaceId: request.workspaceId,
+      accountId: request.accountId,
+      researchRequestId: request.id,
+      createdAt: toDateTime(now()),
+      updatedAt: toDateTime(now()),
+    };
+    this.mutate("researchFindings", (rows) => rows.push(finding));
+    return { ok: true, value: finding };
+  }
+
+  /** A workspace's findings, newest first, optionally narrowed. */
+  listResearchFindings(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: {
+      researchRequestId?: EntityId;
+      accountId?: EntityId;
+      category?: ResearchFinding["category"];
+    },
+  ): Result<ResearchFinding[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("researchFindings").filter((f) => f.workspaceId === workspaceId);
+    const filtered = scoped.filter((f) => {
+      if (filter?.researchRequestId && f.researchRequestId !== filter.researchRequestId)
+        return false;
+      if (filter?.accountId && f.accountId !== filter.accountId) return false;
+      if (filter?.category && f.category !== filter.category) return false;
+      return true;
+    });
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) =>
+        a.retrievedAt < b.retrievedAt
+          ? 1
+          : a.retrievedAt > b.retrievedAt
+            ? -1
+            : a.id.localeCompare(b.id),
+      ),
+    };
+  }
+
+  /** Findings already recorded for one request: the basis of retry dedup. */
+  countResearchFindings(
+    researchRequestId: EntityId,
+    userId: EntityId,
+  ): Result<number, StorageError> {
+    const request = this.findById("researchRequests", researchRequestId);
+    if (!request) return { ok: false, error: toError("NOT_FOUND", "research request not found") };
+    const auth = this.requireWorkspace(request.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return {
+      ok: true,
+      value: this.rows("researchFindings").filter((f) => f.researchRequestId === request.id).length,
+    };
+  }
+
   /** Cleanup helper so tests and local runs do not leave files behind. */
   destroy(): void {
     try {
@@ -1642,6 +1901,16 @@ export const db = {
   updateContact: store.updateContact.bind(store),
   archiveContact: store.archiveContact.bind(store),
   findContactByEmail: store.findContactByEmail.bind(store),
+
+  createResearchRequest: store.createResearchRequest.bind(store),
+  getResearchRequest: store.getResearchRequest.bind(store),
+  listResearchRequests: store.listResearchRequests.bind(store),
+  findActiveResearchRequest: store.findActiveResearchRequest.bind(store),
+  findResearchRequestByIdempotencyKey: store.findResearchRequestByIdempotencyKey.bind(store),
+  updateResearchRequest: store.updateResearchRequest.bind(store),
+  createResearchFinding: store.createResearchFinding.bind(store),
+  listResearchFindings: store.listResearchFindings.bind(store),
+  countResearchFindings: store.countResearchFindings.bind(store),
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),
   workspaceOwner: store.workspaceOwner.bind(store),

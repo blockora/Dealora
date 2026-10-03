@@ -24,6 +24,10 @@
  * Business Brain stays a single canonical source of truth rather than a
  * competing set of records.
  *
+ * Relations (Phase 6 — Research Engine, ROADMAP.md §13):
+ *   Account 1 -- * ResearchRequest
+ *   ResearchRequest 1 -- * ResearchFinding
+ *
  * No other tables exist yet: ROADMAP.md §8 explicitly says "Not every entity
  * needs full functionality in Phase 1", and §9 lists further Business Brain
  * concepts (case studies, FAQs, competitors, playbooks) that the phases that
@@ -131,6 +135,27 @@ export const COLUMNS = {
   inferences: "inferences",
   approval: "approval",
   rationale: "rationale",
+  provider: "provider",
+  idempotencyKey: "idempotency_key",
+  categories: "categories",
+  findingCount: "finding_count",
+  failureCode: "failure_code",
+  failureMessage: "failure_message",
+  startedAt: "started_at",
+  completedAt: "completed_at",
+  researchRequestId: "research_request_id",
+  field: "field",
+  value: "value",
+  claimKind: "claim_kind",
+  sourceName: "source_name",
+  sourceUrl: "source_url",
+  sourceTitle: "source_title",
+  observedAt: "observed_at",
+  retrievedAt: "retrieved_at",
+  confidence: "confidence",
+  freshness: "freshness",
+  relevance: "relevance",
+  note: "note",
 } as const;
 
 export type ColumnName = (typeof COLUMNS)[keyof typeof COLUMNS];
@@ -185,6 +210,22 @@ export const accountTable = "accounts" as const;
 /** Table: contacts at a target account, supplied by the user (Phase 5). */
 export const contactTable = "contacts" as const;
 
+/**
+ * Table: research requests (Phase 6).
+ *
+ * One row per research job against an account. Holds what was asked and which
+ * permitted provider answers it — not the findings themselves.
+ */
+export const researchRequestTable = "research_requests" as const;
+
+/**
+ * Table: research findings (Phase 6).
+ *
+ * Structured, attributed observations. Not evidence: verification and linking
+ * are Phase 7, so nothing here carries a verification state.
+ */
+export const researchFindingTable = "research_findings" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -202,6 +243,8 @@ export const tables = [
   revenuePlanTable,
   accountTable,
   contactTable,
+  researchRequestTable,
+  researchFindingTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -275,6 +318,18 @@ export const indexes = {
   revenueGoalEvents: [
     `${COLUMN(revenueGoalEventTable, COLUMNS.id)} PRIMARY KEY`,
     `${COLUMN(revenueGoalEventTable, COLUMNS.goalId)} NOT NULL`,
+  ],
+  researchRequests: [
+    `${COLUMN(researchRequestTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(researchRequestTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(researchRequestTable, COLUMNS.accountId)} NOT NULL`,
+    `${COLUMN(researchRequestTable, COLUMNS.status)} NOT NULL`,
+  ],
+  researchFindings: [
+    `${COLUMN(researchFindingTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(researchFindingTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(researchFindingTable, COLUMNS.accountId)} NOT NULL`,
+    `${COLUMN(researchFindingTable, COLUMNS.researchRequestId)} NOT NULL`,
   ],
 };
 
@@ -567,6 +622,60 @@ ${COLUMN(contactTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUM
 ${COLUMN(contactTable, COLUMNS.ownerId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(contactTable, COLUMNS.source)} CHECK (${COLUMN(contactTable, COLUMNS.source)} IN ('manual','csv','approved_integration')),
 ${COLUMN(contactTable, COLUMNS.status)} CHECK (${COLUMN(contactTable, COLUMNS.status)} IN ('active','archived'))`,
+  ),
+  createTableSql(
+    researchRequestTable,
+    [
+      COLUMN(researchRequestTable, COLUMNS.id),
+      COLUMN(researchRequestTable, COLUMNS.workspaceId),
+      COLUMN(researchRequestTable, COLUMNS.accountId),
+      COLUMN(researchRequestTable, COLUMNS.ownerId),
+      COLUMN(researchRequestTable, COLUMNS.provider),
+      COLUMN(researchRequestTable, COLUMNS.status),
+      COLUMN(researchRequestTable, COLUMNS.categories),
+      COLUMN(researchRequestTable, COLUMNS.idempotencyKey),
+      COLUMN(researchRequestTable, COLUMNS.findingCount),
+      COLUMN(researchRequestTable, COLUMNS.failureCode),
+      COLUMN(researchRequestTable, COLUMNS.failureMessage),
+      COLUMN(researchRequestTable, COLUMNS.startedAt),
+      COLUMN(researchRequestTable, COLUMNS.completedAt),
+    ],
+    `${COLUMN(researchRequestTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(researchRequestTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(researchRequestTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(researchRequestTable, COLUMNS.ownerId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(researchRequestTable, COLUMNS.status)} CHECK (${COLUMN(researchRequestTable, COLUMNS.status)} IN ('pending','running','completed','failed','cancelled'))`,
+  ),
+  createTableSql(
+    researchFindingTable,
+    [
+      COLUMN(researchFindingTable, COLUMNS.id),
+      COLUMN(researchFindingTable, COLUMNS.workspaceId),
+      COLUMN(researchFindingTable, COLUMNS.researchRequestId),
+      COLUMN(researchFindingTable, COLUMNS.accountId),
+      COLUMN(researchFindingTable, COLUMNS.category),
+      COLUMN(researchFindingTable, COLUMNS.field),
+      COLUMN(researchFindingTable, COLUMNS.value),
+      COLUMN(researchFindingTable, COLUMNS.claimKind),
+      COLUMN(researchFindingTable, COLUMNS.source),
+      COLUMN(researchFindingTable, COLUMNS.sourceName),
+      COLUMN(researchFindingTable, COLUMNS.sourceUrl),
+      COLUMN(researchFindingTable, COLUMNS.sourceTitle),
+      COLUMN(researchFindingTable, COLUMNS.observedAt),
+      COLUMN(researchFindingTable, COLUMNS.retrievedAt),
+      COLUMN(researchFindingTable, COLUMNS.confidence),
+      COLUMN(researchFindingTable, COLUMNS.freshness),
+      COLUMN(researchFindingTable, COLUMNS.relevance),
+      COLUMN(researchFindingTable, COLUMNS.note),
+      COLUMN(researchFindingTable, COLUMNS.status),
+    ],
+    `${COLUMN(researchFindingTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(researchFindingTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(researchFindingTable, COLUMNS.researchRequestId)} REFERENCES "${researchRequestTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(researchFindingTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(researchFindingTable, COLUMNS.source)} CHECK (${COLUMN(researchFindingTable, COLUMNS.source)} IN ('account_record','approved_api','public_web')),
+${COLUMN(researchFindingTable, COLUMNS.claimKind)} CHECK (${COLUMN(researchFindingTable, COLUMNS.claimKind)} IN ('fact','inference','hypothesis','recommendation')),
+${COLUMN(researchFindingTable, COLUMNS.status)} CHECK (${COLUMN(researchFindingTable, COLUMNS.status)} IN ('recorded'))`,
   ),
 ].join("\n\n");
 
