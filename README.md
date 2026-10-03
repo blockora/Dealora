@@ -18,8 +18,9 @@ intelligence and execution layer around the revenue stack.
 ## Repository status
 
 The repository has completed **Phase 0 — Repository & Engineering Foundation**,
-**Phase 1 — Application Foundation**, **Phase 2 — Business Brain**, and
-**Phase 3 — Revenue Goal Engine** (see [`ROADMAP.md`](./ROADMAP.md)).
+**Phase 1 — Application Foundation**, **Phase 2 — Business Brain**,
+**Phase 3 — Revenue Goal Engine**, and **Phase 4 — Revenue Plan Compiler**
+(see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
 with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
@@ -43,7 +44,18 @@ is stored with its gaps rather than guessed at. Its gate — express a goal in
 natural language → get a structured, validated, persisted RevenueGoal — is
 covered by `tests/phase3-gate.test.ts`.
 
-Next is **Phase 4 — Revenue Plan Compiler**.
+Phase 4 adds the Revenue Plan Compiler: a complete `RevenueGoal` becomes an
+inspectable `RevenuePlan` covering ICP, buyer, sourcing, signal,
+qualification, outreach, follow-up, meeting, CRM, measurement and optimization
+strategy. Every statement in a plan is classified as a fact, inference,
+assumption, recommendation or unknown, so advice is never presented as
+something DEALORA knows; the plan references canonical Business Brain records
+instead of copying them, records the Brain digest it was compiled against, and
+never claims that approving it authorizes sending anything. Recompiling
+produces a new version and never destroys the previous one. Its gate — compile a
+goal into an inspectable plan — is covered by `tests/phase4-gate.test.ts`.
+
+Next is **Phase 5 — Account & Prospect Input**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -57,17 +69,18 @@ Next is **Phase 4 — Revenue Plan Compiler**.
 apps/           Web / API applications (Phase 2+)
 packages/       Shared TypeScript packages (built with project references)
   core/         Result types and cross-cutting helpers
-  db/           Schema, repository, tenant-isolated persistence (Phases 1-2)
+  db/           Schema, repository, tenant-isolated persistence (Phases 1-4)
   auth/         Identity, sessions, server-side authentication (Phase 1)
   brain/        Business Brain domain, claim safety, agent context (Phase 2)
   goal/         Revenue Goal domain, validation, lifecycle, goal parsing (Phase 3)
+  plan/         Revenue Plan compiler, provenance, validation, lifecycle (Phase 4)
   api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 11+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests (Phase 1-3 gates)
+tests/          Cross-package integration tests (Phase 1-4 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
@@ -76,8 +89,9 @@ cli/            Developer CLI (Phase 26+)
 Architecture decisions are recorded in [`docs/adr/`](./docs/adr/): the
 toolchain ([0001](./docs/adr/0001-development-toolchain.md)), the Phase 1
 foundation ([0002](./docs/adr/0002-phase-1-application-foundation.md)), the
-Business Brain ([0003](./docs/adr/0003-business-brain.md)), and the Revenue Goal
-Engine ([0004](./docs/adr/0004-revenue-goal-engine.md)).
+Business Brain ([0003](./docs/adr/0003-business-brain.md)), the Revenue Goal
+Engine ([0004](./docs/adr/0004-revenue-goal-engine.md)), and the Revenue Plan
+Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)).
 
 ## Getting started
 
@@ -117,9 +131,9 @@ convention and the currently supported keys are documented in
 
 The only key is `DB_DIR` — the directory the local store writes
 `dealora.json` into (defaults to `packages/db/src/data`, which is
-git-ignored). Phases 1-3 need no credential: passwords are hashed with
-scrypt, goal parsing is deterministic and takes no model provider, and no
-secret is ever hardcoded or read at module scope.
+git-ignored). Phases 1-4 need no credential: passwords are hashed with
+scrypt, goal parsing and plan compilation are deterministic and take no model
+provider, and no secret is ever hardcoded or read at module scope.
 
 ## License
 
