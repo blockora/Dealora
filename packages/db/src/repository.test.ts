@@ -737,3 +737,78 @@ describe("Phase 1 -> Phase 2 migration", () => {
     expect(migrated.claims[0]?.text).toBe("Kept");
   });
 });
+
+describe("revenue goal history", () => {
+  /**
+   * Events written in the same millisecond share a `createdAt`. An audit log
+   * must still read chronologically in that case: ordering by the random id
+   * would make the history non-deterministic.
+   */
+  it("keeps same-millisecond events in chronological order", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "History Co");
+
+    const created = store.createRevenueGoal({
+      workspaceId,
+      createdBy: owner.id,
+      goal: {
+        objective: "Book revenue",
+        targetMetric: "revenue",
+        targetValue: 1000,
+        currency: "USD",
+        timeWindow: { start: "2026-03-01", end: "2026-06-01" },
+        market: "B2B SaaS",
+        icpId: null,
+        buyerPersonaIds: [],
+        offerId: null,
+        economics: {
+          averageDealValue: null,
+          minimumContractValue: null,
+          targetCustomers: null,
+          currency: "USD",
+        },
+        constraints: {
+          geographies: [],
+          industries: [],
+          companySizes: [],
+          channels: [],
+          budget: null,
+          maxOutreachPerDay: null,
+          notes: null,
+        },
+        approvalPolicy: {
+          maxRiskLevel: "level_2_external_action",
+          externalActionsRequireApproval: true,
+          approverUserId: null,
+        },
+        successMetrics: [{ kind: "revenue", target: 1000, unit: "USD" }],
+        status: "draft",
+        completeness: "complete",
+        unknowns: [],
+        assumptions: [],
+      },
+    });
+    if (!isOk(created)) throw new Error("goal creation failed");
+
+    // Written back-to-back, so several events share a timestamp.
+    store.setRevenueGoalStatus(created.value.id, owner.id, "active");
+    store.setRevenueGoalStatus(created.value.id, owner.id, "paused");
+    store.setRevenueGoalStatus(created.value.id, owner.id, "active");
+    store.setRevenueGoalStatus(created.value.id, owner.id, "completed");
+    store.setRevenueGoalStatus(created.value.id, owner.id, "archived");
+
+    const expected = ["draft", "active", "paused", "active", "completed", "archived"];
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const events = store.listRevenueGoalEvents(created.value.id, owner.id);
+      if (!isOk(events)) throw new Error("history read failed");
+      expect(events.value.map((e) => e.toStatus)).toEqual(expected);
+    }
+
+    // The order survives a reload from the persisted document.
+    const reloaded = new Store(JSON.parse(JSON.stringify(store.db)) as never);
+    const afterReload = reloaded.listRevenueGoalEvents(created.value.id, owner.id);
+    if (!isOk(afterReload)) throw new Error("history read failed");
+    expect(afterReload.value.map((e) => e.toStatus)).toEqual(expected);
+  });
+});

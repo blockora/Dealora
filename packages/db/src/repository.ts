@@ -1125,11 +1125,21 @@ export class Store {
     if (!goal) return { ok: false, error: toError("NOT_FOUND", "revenue goal not found") };
     const auth = this.requireWorkspace(goal.workspaceId, userId);
     if (!auth.ok) return auth;
+    // Chronological order is the whole point of an audit log. Timestamps have
+    // millisecond resolution, so events written in the same millisecond tie;
+    // breaking that tie by `id` would order them randomly, because ids are
+    // random. Fall back to insertion order, which the stored array preserves,
+    // so the same persisted document always yields the same history.
     const events = this.rows("revenueGoalEvents")
-      .filter((e) => e.goalId === goalId)
-      .sort((a, b) =>
-        a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id.localeCompare(b.id),
-      );
+      .map((event, index) => ({ event, index }))
+      .filter((entry) => entry.event.goalId === goalId)
+      .sort((a, b) => {
+        if (a.event.createdAt !== b.event.createdAt) {
+          return a.event.createdAt < b.event.createdAt ? -1 : 1;
+        }
+        return a.index - b.index;
+      })
+      .map((entry) => entry.event);
     return { ok: true, value: events };
   }
 
