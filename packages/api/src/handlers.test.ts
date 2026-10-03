@@ -4,6 +4,8 @@ import type { Result } from "@dealora/core";
 import { Store, emptyState } from "@dealora/db";
 import { BusinessBrainService } from "@dealora/brain";
 import type { BrainRepository } from "@dealora/brain";
+import { RevenueGoalService, deterministicGoalParser } from "@dealora/goal";
+import type { GoalRepository } from "@dealora/goal";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -68,6 +70,22 @@ function fixture(): {
       getUser: (id) => store.getUser(id),
     },
     brain: new BusinessBrainService(store as unknown as BrainRepository),
+    goal: new RevenueGoalService(store as unknown as GoalRepository, deterministicGoalParser),
+    brainContext: (workspaceId, userId) => {
+      const auth = store.authorize(workspaceId, userId);
+      if (!auth.ok) throw new Error("business context unavailable");
+      const offers = store.listOffers(workspaceId, userId);
+      const icp = store.getIcp(workspaceId, userId);
+      const personas = store.listPersonas(workspaceId, userId);
+      if (!offers.ok || !icp.ok || !personas.ok) throw new Error("business context unavailable");
+      return {
+        workspaceId,
+        company: null,
+        offers: offers.value.map((o) => ({ id: o.id, name: o.name })),
+        icp: icp.value ? { id: icp.value.id } : null,
+        personas: personas.value.map((p) => ({ id: p.id, title: p.title })),
+      };
+    },
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -266,6 +284,200 @@ describe("API workspace isolation", () => {
   });
 });
 
+describe("API Revenue Goal routes", () => {
+  it("creates a goal from natural language and reads it back", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const created = (await dataOf(
+      handlers.createRevenueGoalFromTextHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: {
+            input:
+              "Generate $100,000 of qualified pipeline from mid-market SaaS companies in the next 90 days",
+          },
+        }),
+      ),
+    )) as { goal: { id: string; status: string; targetValue: number; completeness: string } };
+
+    expect(created.goal.targetValue).toBe(100000);
+    expect(created.goal.status).toBe("draft");
+    // No Business Brain offer exists in this fixture, so the goal records the
+    // gap instead of inventing a reference.
+    expect(created.goal.completeness).toBe("incomplete");
+
+    const fetched = await dataOf(
+      handlers.getRevenueGoalHandler(request({ token: tokenA, params: { id: created.goal.id } })),
+    );
+    expect(JSON.stringify(fetched)).toContain("qualified pipeline");
+  });
+
+  it("returns a parse draft without persisting a goal", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const parsed = (await dataOf(
+      handlers.parseRevenueGoalInputHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: { input: "$50,000 pipeline in the next 30 days" },
+        }),
+      ),
+    )) as { draft: { fields: Record<string, { value: unknown; origin: string } | undefined> } };
+
+    expect(parsed.draft.fields.targetValue?.value).toBe(50000);
+    expect(parsed.draft.fields.currency?.origin).toBe("assumption");
+
+    const listed = await dataOf(
+      handlers.listRevenueGoalsHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA } }),
+      ),
+    );
+    expect(JSON.stringify(listed)).not.toContain("pipeline");
+  });
+
+  it("rejects a goal request with no session token", async () => {
+    const { handlers, workspaceA } = fixture();
+    const error = await errorOf(
+      handlers.createRevenueGoalHandler(request({ params: { workspaceId: workspaceA }, body: {} })),
+    );
+    expect(error.code).toBe("UNAUTHENTICATED");
+  });
+
+  it("denies reading another tenant's goal", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB } = fixture();
+    const created = (await dataOf(
+      handlers.createRevenueGoalHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: {
+            objective: "Confidential target",
+            targetMetric: "revenue",
+            targetValue: 5000,
+            currency: "USD",
+          },
+        }),
+      ),
+    )) as { goal: { id: string } };
+
+    const error = await errorOf(
+      handlers.getRevenueGoalHandler(request({ token: tokenB, params: { id: created.goal.id } })),
+    );
+    expect(error.code).toBe("UNAUTHORIZED");
+    expect(JSON.stringify(error)).not.toContain("Confidential target");
+
+    const listError = await errorOf(
+      handlers.listRevenueGoalsHandler(
+        request({ token: tokenB, params: { workspaceId: workspaceA } }),
+      ),
+    );
+    expect(listError.code).toBe("UNAUTHORIZED");
+    // The other tenant's own workspace is untouched.
+    const own = await dataOf(
+      handlers.listRevenueGoalsHandler(
+        request({ token: tokenB, params: { workspaceId: workspaceB } }),
+      ),
+    );
+    expect(JSON.stringify(own)).not.toContain("Confidential target");
+  });
+
+  it("rejects an invalid status filter and an invalid transition", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const created = (await dataOf(
+      handlers.createRevenueGoalHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          body: {
+            objective: "Book revenue",
+            targetMetric: "revenue",
+            targetValue: 1000,
+            currency: "USD",
+          },
+        }),
+      ),
+    )) as { goal: { id: string } };
+
+    const filterError = await errorOf(
+      handlers.listRevenueGoalsHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          query: { status: "verified" },
+        }),
+      ),
+    );
+    expect(filterError.code).toBe("VALIDATION_ERROR");
+
+    // draft → completed is not a legal transition.
+    const transitionError = await errorOf(
+      handlers.changeRevenueGoalStatusHandler(
+        request({ token: tokenA, params: { id: created.goal.id }, body: { status: "completed" } }),
+      ),
+    );
+    expect(transitionError.code).toBe("CONFLICT");
+
+    const activated = (await dataOf(
+      handlers.changeRevenueGoalStatusHandler(
+        request({ token: tokenA, params: { id: created.goal.id }, body: { status: "active" } }),
+      ),
+    )) as { goal: { status: string } };
+    expect(activated.goal.status).toBe("active");
+  });
+
+  it("maps a goal storage failure to SERVER_ERROR without leaking internals", async () => {
+    const brokenRepo = {
+      authorize: () => ({ ok: true as const, value: {} }),
+      createRevenueGoal: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      listRevenueGoals: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      getRevenueGoal: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      updateRevenueGoal: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      setRevenueGoalStatus: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      listRevenueGoalEvents: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+    } as unknown as GoalRepository;
+
+    const store = new Store(emptyState());
+    const handlers = createHandlers({
+      identity: {
+        signup: () => {
+          throw new Error("not used");
+        },
+        authenticate: () => {
+          throw new Error("not used");
+        },
+        listWorkspaces: () => ({ ok: true as const, value: [] }),
+        getWorkspace: () => ({ ok: true as const, value: {} as never }),
+        authorize: () => ({ ok: true as const, value: {} as never }),
+        updateWorkspace: () => ({ ok: true as const, value: {} as never }),
+        getUser: () => ({ ok: true as const, value: {} as never }),
+      },
+      brain: new BusinessBrainService(store as unknown as BrainRepository),
+      goal: new RevenueGoalService(brokenRepo, deterministicGoalParser),
+      brainContext: () => ({
+        workspaceId: "w1",
+        company: null,
+        offers: [],
+        icp: null,
+        personas: [],
+      }),
+      resolveSession: () => ({ userId: "u1" }),
+    });
+
+    const error = await errorOf(
+      handlers.createRevenueGoalHandler(
+        request({
+          token: "t",
+          params: { workspaceId: "w1" },
+          body: { objective: "Book revenue", targetMetric: "revenue", targetValue: 1000 },
+        }),
+      ),
+    );
+    expect(error.code).toBe("SERVER_ERROR");
+    expect(error.message).toBe("unexpected failure");
+    expect(JSON.stringify(error)).not.toContain("UNAVAILABLE");
+  });
+});
+
 describe("API Business Brain routes", () => {
   it("creates a company and reads it back", async () => {
     const { handlers, tokenA, workspaceA } = fixture();
@@ -380,6 +592,15 @@ describe("API Business Brain routes", () => {
       brain: new BusinessBrainService({
         authorize: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       } as unknown as BrainRepository),
+      goal: new RevenueGoalService(
+        {
+          authorize: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as unknown as GoalRepository,
+        deterministicGoalParser,
+      ),
+      brainContext: () => {
+        throw new Error("business context unavailable");
+      },
       resolveSession: () => ({ userId: "u1" }),
     };
 

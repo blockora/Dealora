@@ -8,15 +8,21 @@ import type {
   Positioning,
 } from "@dealora/db";
 import type { BrainError, BusinessBrainService } from "@dealora/brain";
+import { GOAL_STATUSES } from "@dealora/goal";
+import type { GoalError, RevenueGoalService } from "@dealora/goal";
+import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 
 import type {
   ApiError,
+  ApiErrorCode,
   ApiHandler,
   ApiResponse,
   AuthenticatedActor,
+  BrainContextReader,
   IdentityService,
   RequestBody,
   SessionResolver,
+  WorkspaceBrainContext,
 } from "./types.js";
 import type { Result } from "@dealora/core";
 
@@ -64,6 +70,23 @@ function fromBrainError(error: BrainError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `GoalError` into the safe API error envelope.
+ *
+ * `INVALID_TRANSITION` surfaces as a CONFLICT because the caller's request
+ * conflicts with the goal's current state; `UNAVAILABLE` is never exposed.
+ */
+function fromGoalError(error: GoalError): ApiError {
+  if (error.code === "UNAVAILABLE") {
+    return { code: "SERVER_ERROR", message: "unexpected failure" };
+  }
+  const code: ApiErrorCode =
+    error.code === "INVALID_TRANSITION" ? "CONFLICT" : (error.code as ApiErrorCode);
+  const mapped: ApiError = { code, message: error.message };
+  if (error.details) mapped.details = error.details;
+  return mapped;
+}
+
 /** Parse a JSON body, tolerating already-parsed objects. */
 async function parseBody(req: RequestBody): Promise<Record<string, unknown> | ApiError> {
   const raw = req.body;
@@ -88,6 +111,8 @@ function isApiError(value: unknown): value is ApiError {
 export interface HandlerDeps {
   identity: IdentityService;
   brain: BusinessBrainService;
+  goal: RevenueGoalService;
+  brainContext: BrainContextReader;
   resolveSession: SessionResolver;
 }
 
@@ -461,6 +486,177 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok({ claim: result.value }) };
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 3 — Revenue Goal Engine
+  //
+  // Handlers stay translation-only: the workspace id comes from the route, the
+  // acting user from the session, and every rule (validation, reference
+  // checking, lifecycle) is enforced by the goal service.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Read the canonical workspace context used for goal references.
+   *
+   * Authorization runs first, against the session identity, so a caller from
+   * another tenant is denied with `UNAUTHORIZED` rather than being reported as
+   * an internal failure when the reader refuses the read.
+   */
+  async function workspaceContext(
+    workspaceId: string,
+    userId: string,
+  ): Promise<WorkspaceBrainContext | ApiError> {
+    const auth = deps.identity.authorize(workspaceId, userId);
+    if (!auth.ok) return toApiError(auth.error.code, "workspace not found");
+    try {
+      return await deps.brainContext(workspaceId, userId);
+    } catch {
+      return { code: "SERVER_ERROR", message: "unexpected failure" };
+    }
+  }
+
+  const createRevenueGoalHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const context = await workspaceContext(workspaceId, actor.userId);
+      if (isApiError(context)) return { ok: false, error: context };
+
+      const result = deps.goal.createRevenueGoal(workspaceId, actor.userId, body, context);
+      if (!result.ok) return { ok: false, error: fromGoalError(result.error) };
+      return { ok: true, value: ok({ goal: result.value }) };
+    });
+
+  const listRevenueGoalsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const rawStatus = req.query.status;
+      let status: GoalStatus | undefined;
+      if (typeof rawStatus === "string" && rawStatus !== "") {
+        if (!GOAL_STATUSES.includes(rawStatus as GoalStatus)) {
+          return Promise.resolve({
+            ok: false,
+            error: { code: "VALIDATION_ERROR", message: "invalid status filter" },
+          });
+        }
+        status = rawStatus as GoalStatus;
+      }
+      const result = deps.goal.listRevenueGoals(
+        workspaceId,
+        actor.userId,
+        status ? { status } : undefined,
+      );
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromGoalError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ goals: result.value }) });
+    });
+
+  const getRevenueGoalHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.goal.getRevenueGoal(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromGoalError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ goal: result.value }) });
+    });
+
+  const updateRevenueGoalHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const context = await workspaceContext(workspaceId, actor.userId);
+      if (isApiError(context)) return { ok: false, error: context };
+
+      // Status is never accepted through a field update: it has its own
+      // transition-validated route.
+      const { status: _status, ...patch } = body as Record<string, unknown> & { status?: unknown };
+      void _status;
+
+      const result = deps.goal.updateRevenueGoal(id, actor.userId, patch, context);
+      if (!result.ok) return { ok: false, error: fromGoalError(result.error) };
+      return { ok: true, value: ok({ goal: result.value }) };
+    });
+
+  const changeRevenueGoalStatusHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const result = deps.goal.changeRevenueGoalStatus(id, actor.userId, body.status);
+      if (!result.ok) return { ok: false, error: fromGoalError(result.error) };
+      return { ok: true, value: ok({ goal: result.value }) };
+    });
+
+  const archiveRevenueGoalHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.goal.archiveRevenueGoal(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromGoalError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ goal: result.value }) });
+    });
+
+  const revenueGoalHistoryHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.goal.goalHistory(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromGoalError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ history: result.value }) });
+    });
+
+  /**
+   * Parse a natural-language goal without persisting anything.
+   *
+   * The response includes the provenance of every field so a caller can see
+   * what was stated, what was inferred, and what is still unknown.
+   */
+  const parseRevenueGoalInputHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const context = await workspaceContext(workspaceId, actor.userId);
+      if (isApiError(context)) return { ok: false, error: context };
+
+      const input = typeof body.input === "string" ? body.input : "";
+      // The reference instant is injected so parsing is deterministic.
+      const now = new Date();
+      const result = deps.goal.parseRevenueGoalInput(input, context, now);
+      if (!result.ok) return { ok: false, error: fromGoalError(result.error) };
+      return { ok: true, value: ok({ draft: result.value }) };
+    });
+
+  /** Create a goal directly from natural language. */
+  const createRevenueGoalFromTextHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const context = await workspaceContext(workspaceId, actor.userId);
+      if (isApiError(context)) return { ok: false, error: context };
+
+      const input = typeof body.input === "string" ? body.input : "";
+      const now = new Date();
+      const result = deps.goal.createFromNaturalLanguage(
+        workspaceId,
+        actor.userId,
+        input,
+        context,
+        now,
+      );
+      if (!result.ok) return { ok: false, error: fromGoalError(result.error) };
+      return { ok: true, value: ok({ goal: result.value }) };
+    });
+
   /**
    * The agent-facing Business Brain context.
    *
@@ -501,6 +697,15 @@ export function createHandlers(deps: HandlerDeps) {
     updateClaimHandler,
     approveClaimHandler,
     getBusinessContextHandler,
+    createRevenueGoalHandler,
+    listRevenueGoalsHandler,
+    getRevenueGoalHandler,
+    updateRevenueGoalHandler,
+    changeRevenueGoalStatusHandler,
+    archiveRevenueGoalHandler,
+    revenueGoalHistoryHandler,
+    parseRevenueGoalInputHandler,
+    createRevenueGoalFromTextHandler,
   };
 }
 

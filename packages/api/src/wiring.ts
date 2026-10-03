@@ -2,10 +2,11 @@ import { store } from "@dealora/db";
 import { authenticate, signup, verifySession } from "@dealora/auth";
 import { getSessionIndex, createIndex } from "@dealora/auth";
 import { createBusinessBrainService } from "@dealora/brain";
+import { createRevenueGoalService } from "@dealora/goal";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
-import type { IdentityService } from "./types.js";
+import type { IdentityService, WorkspaceBrainContext } from "./types.js";
 
 /**
  * Default wiring for local/server use.
@@ -30,9 +31,51 @@ export function createDefaultHandlers(): ReturnType<typeof createHandlers> {
     getUser: (id) => store.getUser(id),
   };
 
+  const brain = createBusinessBrainService();
+
   const deps: HandlerDeps = {
     identity,
-    brain: createBusinessBrainService(),
+    brain,
+    goal: createRevenueGoalService(),
+    /**
+     * Goal references are validated against this canonical, workspace-scoped
+     * context. Reads go through the Business Brain service, which authorizes
+     * the caller first — a goal can never reference another tenant's data.
+     */
+    /**
+     * Goal references are validated against this canonical, workspace-scoped
+     * context. Authorization runs first, so a goal can never reference
+     * another tenant's offer, ICP or persona.
+     *
+     * The agent-facing BusinessContext deliberately omits record ids, so the
+     * reference ids are read from the tenant-scoped store instead.
+     */
+    brainContext: (workspaceId, userId): WorkspaceBrainContext => {
+      const auth = store.authorize(workspaceId, userId);
+      if (!auth.ok) {
+        throw new Error(`business context unavailable: ${auth.error.code}`);
+      }
+      const offers = store.listOffers(workspaceId, userId);
+      const icp = store.getIcp(workspaceId, userId);
+      const personas = store.listPersonas(workspaceId, userId);
+      const profile = store.getBusinessProfileFor(workspaceId, userId);
+      if (!offers.ok || !icp.ok || !personas.ok || !profile.ok) {
+        throw new Error("business context unavailable");
+      }
+      return {
+        workspaceId,
+        company: profile.value
+          ? {
+              name: profile.value.name,
+              market: profile.value.market,
+              industry: profile.value.industry,
+            }
+          : null,
+        offers: offers.value.map((o) => ({ id: o.id, name: o.name })),
+        icp: icp.value ? { id: icp.value.id } : null,
+        personas: personas.value.map((p) => ({ id: p.id, title: p.title })),
+      };
+    },
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());

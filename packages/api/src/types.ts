@@ -69,3 +69,23 @@ export interface IdentityService {
   ): Result<Workspace, { code: string }>;
   getUser(id: string): Result<User, { code: string }>;
 }
+
+/**
+ * Canonical Business Brain context the goal layer may read for references.
+ *
+ * Always workspace-scoped: the goal layer validates every reference against
+ * this, so a goal can never point outside its own tenant.
+ */
+export interface WorkspaceBrainContext {
+  workspaceId: string;
+  company: { name: string; market: string | null; industry: string | null } | null;
+  offers: { id: string; name: string }[];
+  icp: { id: string } | null;
+  personas: { id: string; title: string }[];
+}
+
+/** Reads the canonical context for one workspace. */
+export type BrainContextReader = (
+  workspaceId: string,
+  userId: string,
+) => Promise<WorkspaceBrainContext> | WorkspaceBrainContext;
