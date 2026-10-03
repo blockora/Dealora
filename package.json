@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "DEALORA — AI Revenue Operating System. Turns a revenue goal into an evidence-backed, permission-controlled, measurable and continuously optimized revenue workflow.",
+  "description": "DEALORA \u2014 AI Revenue Operating System. Turns a revenue goal into an evidence-backed, permission-controlled, measurable and continuously optimized revenue workflow.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -18,7 +18,7 @@
   },
   "scripts": {
     "build": "tsc -b tsconfig.json",
-    "typecheck": "tsc -b --noEmit",
+    "typecheck": "tsc -b tsconfig.json",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
@@ -29,6 +29,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.4",
     "eslint": "^10.11.0",
     "eslint-config-prettier": "^10.1.8",
     "prettier": "^3.9.9",
