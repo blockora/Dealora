@@ -6,6 +6,8 @@ import { createRevenueGoalService } from "@dealora/goal";
 import { createRevenuePlanService } from "@dealora/plan";
 import type { PlanBrainSnapshot } from "@dealora/plan";
 import { createAccountService } from "@dealora/account";
+import { AccountRecordProvider, createResearchService } from "@dealora/research";
+import type { ResearchProvider } from "@dealora/research";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -18,7 +20,9 @@ import type { IdentityService, WorkspaceBrainContext } from "./types.js";
  * index. The resulting `userId` is the only identity any handler sees, so
  * client-supplied identity fields cannot influence authorization.
  */
-export function createDefaultHandlers(): ReturnType<typeof createHandlers> {
+export function createDefaultHandlers(options?: {
+  researchProviders?: readonly ResearchProvider[];
+}): ReturnType<typeof createHandlers> {
   const identity: IdentityService = {
     signup,
     authenticate,
@@ -178,6 +182,19 @@ export function createDefaultHandlers(): ReturnType<typeof createHandlers> {
       store as never,
       (revenuePlanId, userId) => store.getRevenuePlan(revenuePlanId, userId) as never,
     ),
+    /**
+     * Research runs only through providers this deployment permits.
+     *
+     * The default set is the workspace's own account record — user-provided
+     * data, the one permitted source that needs no external access. No
+     * external source is configured and none is simulated: a deployment that
+     * has an authorized API or a permitted public source registers it here,
+     * with its own terms, rate limits and attribution.
+     */
+    research: createResearchService(store as never, [
+      new AccountRecordProvider(),
+      ...(options?.researchProviders ?? []),
+    ]),
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());

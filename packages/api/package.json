@@ -18,7 +18,8 @@
     "@dealora/core": "workspace:*",
     "@dealora/db": "workspace:*",
     "@dealora/goal": "workspace:*",
-    "@dealora/plan": "workspace:*"
+    "@dealora/plan": "workspace:*",
+    "@dealora/research": "workspace:*"
   },
   "devDependencies": {}
 }

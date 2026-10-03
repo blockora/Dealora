@@ -10,6 +10,12 @@ import { RevenuePlanService, deterministicPlanCompiler } from "@dealora/plan";
 import type { PlanBrainSnapshot, PlanRepository } from "@dealora/plan";
 import { AccountService } from "@dealora/account";
 import type { AccountRepository } from "@dealora/account";
+import {
+  AccountRecordProvider,
+  StaticResearchProvider,
+  createResearchService,
+} from "@dealora/research";
+import type { ResearchProvider } from "@dealora/research";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -21,7 +27,7 @@ import type { ApiError, ApiResponse, RequestBody } from "./types.js";
  * id exactly as the auth package does, so a handler only ever learns the
  * identity from the token.
  */
-function fixture(): {
+function fixture(options?: { researchProviders?: readonly ResearchProvider[] }): {
   handlers: ReturnType<typeof createHandlers>;
   tokenA: string;
   tokenB: string;
@@ -29,6 +35,7 @@ function fixture(): {
   workspaceB: string;
   userA: string;
   userB: string;
+  store: Store;
 } {
   const store = new Store(emptyState());
   const sessions = new Map<string, string>();
@@ -106,6 +113,10 @@ function fixture(): {
       store as unknown as AccountRepository,
       (revenuePlanId, userId) => store.getRevenuePlan(revenuePlanId, userId) as never,
     ),
+    research: createResearchService(store as never, [
+      new AccountRecordProvider(),
+      ...(options?.researchProviders ?? []),
+    ]),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -120,6 +131,7 @@ function fixture(): {
     workspaceB: wsBResult.value.id,
     userA: userAResult.value.id,
     userB: userBResult.value.id,
+    store,
   };
 }
 
@@ -579,6 +591,7 @@ describe("API Revenue Goal routes", () => {
         } as unknown as AccountRepository,
         () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       ),
+      research: createResearchService(store as never),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -907,6 +920,7 @@ describe("API Revenue Plan routes", () => {
         { authorize: () => ({ ok: true as const, value: {} }) } as unknown as AccountRepository,
         () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       ),
+      research: createResearchService(store as never),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1107,6 +1121,12 @@ describe("API Business Brain routes", () => {
           authorize: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
         } as unknown as AccountRepository,
         () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      ),
+      research: createResearchService(
+        {
+          authorize: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as never,
+        [new AccountRecordProvider()],
       ),
       resolveSession: () => ({ userId: "u1" }),
     };
@@ -1442,12 +1462,310 @@ describe("API Account & Contact routes", () => {
         } as unknown as AccountRepository,
         () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       ),
+      research: createResearchService(store as never),
       resolveSession: () => ({ userId: "u1" }),
     };
 
     const handlers = createHandlers(failing);
     const error = await errorOf(
       handlers.listAccountsHandler(request({ token: "t", params: { workspaceId: "w1" } })),
+    );
+    expect(error.code).toBe("SERVER_ERROR");
+    expect(error.message).toBe("unexpected failure");
+    expect(JSON.stringify(error)).not.toContain("UNAVAILABLE");
+  });
+});
+
+describe("API Research routes", () => {
+  type ResearchRow = {
+    id: string;
+    workspaceId: string;
+    accountId: string;
+    provider: string;
+    status: string;
+    categories: string[];
+    findingCount: number;
+    failureCode: string | null;
+    requestedBy?: string;
+  };
+
+  const observation = {
+    category: "company_overview",
+    field: "products_services.summary",
+    value: "The public site lists three service tiers.",
+    claimKind: "fact",
+    sourceUrl: "https://northwind.example/services",
+    sourceTitle: "Services page",
+    observedAt: "2026-09-01T00:00:00.000Z",
+    confidence: "medium",
+    relevance: "high",
+    note: null,
+  };
+
+  /** A provider declared by the test, not a real external retrieval. */
+  const declaredProvider = (id: string, findings: unknown[]): ResearchProvider =>
+    new StaticResearchProvider(id, "public_web", findings as never);
+
+  async function accountFor(handlers: unknown, token: string, workspaceId: string) {
+    return (await dataOf(
+      (handlers as ReturnType<typeof fixture>["handlers"]).createAccountHandler(
+        request({
+          token,
+          params: { workspaceId },
+          body: { name: "Northwind Trading", website: "https://northwind.example" },
+        }),
+      ),
+    )) as { account: { id: string } };
+  }
+
+  it("creates, runs and reads an attributed research request", async () => {
+    const { handlers, tokenA, workspaceA } = fixture({
+      researchProviders: [declaredProvider("public_site", [observation])],
+    });
+    const account = await accountFor(handlers, tokenA, workspaceA);
+
+    const created = (await dataOf(
+      handlers.createResearchRequestHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, accountId: account.account.id },
+          body: { provider: "public_site", categories: ["company_overview"] },
+        }),
+      ),
+    )) as { request: ResearchRow };
+    expect(created.request.status).toBe("pending");
+    expect(created.request.workspaceId).toBe(workspaceA);
+
+    const run = (await dataOf(
+      handlers.runResearchRequestHandler(
+        request({ token: tokenA, params: { id: created.request.id } }),
+      ),
+    )) as { request: ResearchRow; findings: { sourceUrl: string; retrievedAt: string }[] };
+    expect(run.request.status).toBe("completed");
+    expect(run.findings).toHaveLength(1);
+    expect(run.findings[0]?.sourceUrl).toBe("https://northwind.example/services");
+    expect(run.findings[0]?.retrievedAt).toBeTruthy();
+
+    const findings = (await dataOf(
+      handlers.getResearchFindingsHandler(
+        request({ token: tokenA, params: { id: created.request.id } }),
+      ),
+    )) as { findings: unknown[] };
+    expect(findings.findings).toHaveLength(1);
+
+    const listed = (await dataOf(
+      handlers.listResearchRequestsHandler(
+        request({ token: tokenA, params: { workspaceId: workspaceA } }),
+      ),
+    )) as { requests: ResearchRow[] };
+    expect(listed.requests).toHaveLength(1);
+  });
+
+  it("reports a failed run as a failed request, not as an empty success", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const account = await accountFor(handlers, tokenA, workspaceA);
+    const created = (await dataOf(
+      handlers.createResearchRequestHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, accountId: account.account.id },
+          body: { provider: "account_record" },
+        }),
+      ),
+    )) as { request: ResearchRow };
+
+    const run = (await dataOf(
+      handlers.runResearchRequestHandler(
+        request({ token: tokenA, params: { id: created.request.id } }),
+      ),
+    )) as { request: ResearchRow };
+    expect(run.request.status).toBe("completed");
+
+    // Running it again is an illegal transition, not a silent second pass.
+    const again = await errorOf(
+      handlers.runResearchRequestHandler(
+        request({ token: tokenA, params: { id: created.request.id } }),
+      ),
+    );
+    expect(again.code).toBe("CONFLICT");
+  });
+
+  it("refuses an unregistered provider as a validation failure", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const account = await accountFor(handlers, tokenA, workspaceA);
+    const error = await errorOf(
+      handlers.createResearchRequestHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, accountId: account.account.id },
+          body: { provider: "some_scraper" },
+        }),
+      ),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("rejects an invalid status filter and an unauthenticated caller", async () => {
+    const { handlers, workspaceA } = fixture();
+    const badStatus = await errorOf(
+      handlers.listResearchRequestsHandler(
+        request({
+          token: "token-alice",
+          params: { workspaceId: workspaceA },
+          query: { status: "x" },
+        }),
+      ),
+    );
+    expect(badStatus.code).toBe("VALIDATION_ERROR");
+
+    const anonymous = await errorOf(
+      handlers.listResearchRequestsHandler(request({ params: { workspaceId: workspaceA } })),
+    );
+    expect(anonymous.code).toBe("UNAUTHENTICATED");
+  });
+
+  it("enforces workspace isolation on every research entry point", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB } = fixture({
+      researchProviders: [declaredProvider("public_site", [observation])],
+    });
+    const account = await accountFor(handlers, tokenA, workspaceA);
+    const created = (await dataOf(
+      handlers.createResearchRequestHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, accountId: account.account.id },
+          body: { provider: "public_site" },
+        }),
+      ),
+    )) as { request: ResearchRow };
+    await dataOf(
+      handlers.runResearchRequestHandler(
+        request({ token: tokenA, params: { id: created.request.id } }),
+      ),
+    );
+
+    const denials = await Promise.all([
+      errorOf(
+        handlers.getResearchRequestHandler(
+          request({ token: tokenB, params: { id: created.request.id } }),
+        ),
+      ),
+      errorOf(
+        handlers.runResearchRequestHandler(
+          request({ token: tokenB, params: { id: created.request.id } }),
+        ),
+      ),
+      errorOf(
+        handlers.cancelResearchRequestHandler(
+          request({ token: tokenB, params: { id: created.request.id } }),
+        ),
+      ),
+      errorOf(
+        handlers.getResearchFindingsHandler(
+          request({ token: tokenB, params: { id: created.request.id } }),
+        ),
+      ),
+      errorOf(
+        handlers.listResearchRequestsHandler(
+          request({ token: tokenB, params: { workspaceId: workspaceA } }),
+        ),
+      ),
+    ]);
+    for (const denial of denials) {
+      expect(denial.code).toBe("UNAUTHORIZED");
+      // A denial discloses nothing about the other tenant's research.
+      expect(JSON.stringify(denial)).not.toContain("northwind.example");
+    }
+
+    // Researching another tenant's account is reported as "not found": the
+    // account must not even be revealed to exist.
+    const foreignAccount = await errorOf(
+      handlers.createResearchRequestHandler(
+        request({
+          token: tokenB,
+          params: { workspaceId: workspaceB, accountId: account.account.id },
+          body: { provider: "public_site" },
+        }),
+      ),
+    );
+    expect(foreignAccount.code).toBe("NOT_FOUND");
+    expect(JSON.stringify(foreignAccount)).not.toContain("northwind.example");
+  });
+
+  it("ignores a workspace or user identity supplied in the request body", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB } = fixture();
+    const account = await accountFor(handlers, tokenA, workspaceA);
+    const created = (await dataOf(
+      handlers.createResearchRequestHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, accountId: account.account.id },
+          body: {
+            provider: "account_record",
+            workspaceId: workspaceB,
+            userId: tokenB,
+            accountId: "some-other-account",
+          },
+        }),
+      ),
+    )) as { request: ResearchRow };
+
+    // The route's workspace and account win; the token's user owns it.
+    expect(created.request.workspaceId).toBe(workspaceA);
+    expect(created.request.accountId).toBe(account.account.id);
+    expect(created.request.requestedBy).not.toBe(tokenB);
+
+    const bView = (await dataOf(
+      handlers.listResearchRequestsHandler(
+        request({ token: tokenB, params: { workspaceId: workspaceB } }),
+      ),
+    )) as { requests: ResearchRow[] };
+    expect(bView.requests).toEqual([]);
+  });
+
+  it("maps a research storage failure to SERVER_ERROR without leaking internals", async () => {
+    const store = new Store(emptyState());
+    const handlers = createHandlers({
+      identity: {
+        signup: () => ({ user: {} as never, token: "" }),
+        authenticate: () => ({ user: {} as never, token: "" }),
+        listWorkspaces: () => ({ ok: true as const, value: [] }),
+        getWorkspace: () => ({ ok: true as const, value: {} as never }),
+        authorize: () => ({ ok: true as const, value: {} as never }),
+        updateWorkspace: () => ({ ok: true as const, value: {} as never }),
+        getUser: () => ({ ok: true as const, value: {} as never }),
+      },
+      brain: new BusinessBrainService(store as unknown as BrainRepository),
+      goal: new RevenueGoalService(store as unknown as GoalRepository, deterministicGoalParser),
+      brainContext: () => ({
+        workspaceId: "w1",
+        company: null,
+        offers: [],
+        icp: null,
+        personas: [],
+      }),
+      planContext: () => readPlanBrain(store, "w1", "u1"),
+      plan: new RevenuePlanService(
+        store as unknown as PlanRepository,
+        deterministicPlanCompiler,
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        () => readPlanBrain(store, "w1", "u1"),
+      ),
+      account: new AccountService(store as unknown as AccountRepository, () => ({
+        ok: false,
+        error: { code: "UNAVAILABLE" },
+      })),
+      research: createResearchService(
+        {
+          authorize: () => ({ ok: true as const, value: {} }),
+          listResearchRequests: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as never,
+        [new AccountRecordProvider()],
+      ),
+      resolveSession: () => ({ userId: "u1" }),
+    });
+    const error = await errorOf(
+      handlers.listResearchRequestsHandler(request({ token: "t", params: { workspaceId: "w1" } })),
     );
     expect(error.code).toBe("SERVER_ERROR");
     expect(error.message).toBe("unexpected failure");

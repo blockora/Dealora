@@ -14,9 +14,12 @@ import { PLAN_STATUSES } from "@dealora/plan";
 import type { PlanBrainReader, PlanError, RevenuePlanService } from "@dealora/plan";
 import { ACCOUNT_STATUSES, CONTACT_STATUSES } from "@dealora/account";
 import type { AccountError, AccountService } from "@dealora/account";
+import { RESEARCH_REQUEST_STATUSES } from "@dealora/research";
+import type { ResearchError, ResearchService } from "@dealora/research";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
+import type { ResearchRequestStatus } from "@dealora/db";
 
 import type {
   ApiError,
@@ -125,6 +128,29 @@ function fromAccountError(error: AccountError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `ResearchError` into the safe API error envelope.
+ *
+ * `UNAVAILABLE` is an internal condition and is never surfaced verbatim.
+ * An `UNSUPPORTED_PROVIDER` is the caller's mistake rather than ours, so it
+ * reads as a validation failure; an `INVALID_TRANSITION` conflicts with the
+ * request's current state, exactly as the goal and plan layers do.
+ */
+function fromResearchError(error: ResearchError): ApiError {
+  if (error.code === "UNAVAILABLE") {
+    return { code: "SERVER_ERROR", message: "unexpected failure" };
+  }
+  const code: ApiErrorCode =
+    error.code === "INVALID_TRANSITION"
+      ? "CONFLICT"
+      : error.code === "UNSUPPORTED_PROVIDER"
+        ? "VALIDATION_ERROR"
+        : (error.code as ApiErrorCode);
+  const mapped: ApiError = { code, message: error.message };
+  if (error.details) mapped.details = error.details;
+  return mapped;
+}
+
 /** Parse a JSON body, tolerating already-parsed objects. */
 async function parseBody(req: RequestBody): Promise<Record<string, unknown> | ApiError> {
   const raw = req.body;
@@ -154,6 +180,7 @@ export interface HandlerDeps {
   plan: RevenuePlanService;
   planContext: PlanBrainReader;
   account: AccountService;
+  research: ResearchService;
   resolveSession: SessionResolver;
 }
 
@@ -1039,6 +1066,109 @@ export function createHandlers(deps: HandlerDeps) {
       return Promise.resolve({ ok: true, value: ok({ contact: result.value }) });
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 6 — Research Engine
+  //
+  // Research over an account the workspace already supplied. These handlers
+  // ask the Research service to run a permitted provider and return its
+  // findings; they never fetch anything themselves, never verify a claim and
+  // never score, rank or contact the account.
+  //
+  // A run that fails is returned as a `failed` request with its recorded
+  // reason, not as an empty success: a caller can always tell the difference
+  // between "researched, nothing found" and "could not research".
+  // -------------------------------------------------------------------------
+
+  /** Request research for an existing account. */
+  const createResearchRequestHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const accountId = param(req, "accountId");
+      if (isApiError(accountId)) return { ok: false, error: accountId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      // Only the research fields are read. A `workspaceId` or `userId` in the
+      // body is ignored: the workspace is the route's, the identity the
+      // token's, and the account is the one the route names.
+      const result = deps.research.createResearchRequest(workspaceId, actor.userId, accountId, {
+        provider: body.provider,
+        categories: body.categories,
+        idempotencyKey: body.idempotencyKey,
+      });
+      if (!result.ok) return { ok: false, error: fromResearchError(result.error) };
+      return { ok: true, value: ok({ request: result.value }) };
+    });
+
+  const getResearchRequestHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.research.getResearchRequest(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromResearchError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ request: result.value }) });
+    });
+
+  const listResearchRequestsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const rawStatus = req.query.status;
+      let status: ResearchRequestStatus | undefined;
+      if (typeof rawStatus === "string" && rawStatus !== "") {
+        if (!RESEARCH_REQUEST_STATUSES.includes(rawStatus as ResearchRequestStatus)) {
+          return Promise.resolve({
+            ok: false,
+            error: { code: "VALIDATION_ERROR", message: "invalid status filter" },
+          });
+        }
+        status = rawStatus as ResearchRequestStatus;
+      }
+      const accountId =
+        typeof req.query.accountId === "string" && req.query.accountId !== ""
+          ? req.query.accountId
+          : undefined;
+
+      const result = deps.research.listResearchRequests(
+        workspaceId,
+        actor.userId,
+        status ? { status } : accountId ? { accountId } : undefined,
+      );
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromResearchError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ requests: result.value }) });
+    });
+
+  /** Execute a pending (or retryable failed) research request. */
+  const runResearchRequestHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const result = await deps.research.runResearchRequest(id, actor.userId);
+      if (!result.ok) return { ok: false, error: fromResearchError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** The attributed findings of one research request. */
+  const getResearchFindingsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.research.listFindingsForRequest(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromResearchError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ findings: result.value }) });
+    });
+
+  /** Stop a research request that has not finished. */
+  const cancelResearchRequestHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.research.cancelResearchRequest(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromResearchError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ request: result.value }) });
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -1094,6 +1224,12 @@ export function createHandlers(deps: HandlerDeps) {
     getContactHandler,
     updateContactHandler,
     archiveContactHandler,
+    createResearchRequestHandler,
+    getResearchRequestHandler,
+    listResearchRequestsHandler,
+    runResearchRequestHandler,
+    getResearchFindingsHandler,
+    cancelResearchRequestHandler,
   };
 }
 
