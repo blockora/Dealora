@@ -22,3 +22,9 @@ export type {
  * handler can never accept a client-supplied user id.
  */
 export { createDefaultHandlers } from "./wiring.js";
+
+/**
+ * The Evidence domain's public surface, re-exported so API consumers can type
+ * a response without depending on the domain package directly.
+ */
+export type { Evidence, EvidenceError, EvidenceStatus, AccountClaim } from "@dealora/evidence";

@@ -8,6 +8,7 @@ import type { PlanBrainSnapshot } from "@dealora/plan";
 import { createAccountService } from "@dealora/account";
 import { AccountRecordProvider, createResearchService } from "@dealora/research";
 import type { ResearchProvider } from "@dealora/research";
+import { createEvidenceService } from "@dealora/evidence";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -195,6 +196,13 @@ export function createDefaultHandlers(options?: {
       new AccountRecordProvider(),
       ...(options?.researchProviders ?? []),
     ]),
+    /**
+     * Evidence is the only writer that promotes a research observation into a
+     * source-backed record. It reads the finding from storage rather than
+     * trusting a caller's account id, and it makes no qualification decision:
+     * scoring, ranking and outreach are Phases 8-11.
+     */
+    evidence: createEvidenceService(store as never),
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());

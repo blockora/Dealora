@@ -16,6 +16,7 @@ import {
   createResearchService,
 } from "@dealora/research";
 import type { ResearchProvider } from "@dealora/research";
+import { createEvidenceService } from "@dealora/evidence";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -27,7 +28,11 @@ import type { ApiError, ApiResponse, RequestBody } from "./types.js";
  * id exactly as the auth package does, so a handler only ever learns the
  * identity from the token.
  */
-function fixture(options?: { researchProviders?: readonly ResearchProvider[] }): {
+function fixture(options?: {
+  researchProviders?: readonly ResearchProvider[];
+  /** A fixed clock for the evidence layer, so freshness is reproducible. */
+  evidenceClock?: () => Date;
+}): {
   handlers: ReturnType<typeof createHandlers>;
   tokenA: string;
   tokenB: string;
@@ -117,6 +122,7 @@ function fixture(options?: { researchProviders?: readonly ResearchProvider[] }):
       new AccountRecordProvider(),
       ...(options?.researchProviders ?? []),
     ]),
+    evidence: createEvidenceService(store as never, options?.evidenceClock),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -592,6 +598,7 @@ describe("API Revenue Goal routes", () => {
         () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       ),
       research: createResearchService(store as never),
+      evidence: createEvidenceService(store as never),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -921,6 +928,7 @@ describe("API Revenue Plan routes", () => {
         () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       ),
       research: createResearchService(store as never),
+      evidence: createEvidenceService(store as never),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1128,6 +1136,9 @@ describe("API Business Brain routes", () => {
         } as never,
         [new AccountRecordProvider()],
       ),
+      evidence: createEvidenceService({
+        authorize: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      } as never),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1463,6 +1474,7 @@ describe("API Account & Contact routes", () => {
         () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       ),
       research: createResearchService(store as never),
+      evidence: createEvidenceService(store as never),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1762,6 +1774,10 @@ describe("API Research routes", () => {
         } as never,
         [new AccountRecordProvider()],
       ),
+      evidence: createEvidenceService({
+        authorize: () => ({ ok: true as const, value: {} }),
+        listEvidence: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      } as never),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -1770,5 +1786,598 @@ describe("API Research routes", () => {
     expect(error.code).toBe("SERVER_ERROR");
     expect(error.message).toBe("unexpected failure");
     expect(JSON.stringify(error)).not.toContain("UNAVAILABLE");
+  });
+
+  it("never surfaces an evidence storage failure to the caller", async () => {
+    const store = new Store(emptyState());
+    const handlers = createHandlers({
+      identity: {
+        signup: () => ({ user: {} as never, token: "" }),
+        authenticate: () => ({ user: {} as never, token: "" }),
+        listWorkspaces: () => ({ ok: true as const, value: [] }),
+        getWorkspace: () => ({ ok: true as const, value: {} as never }),
+        authorize: () => ({ ok: true as const, value: {} as never }),
+        updateWorkspace: () => ({ ok: true as const, value: {} as never }),
+        getUser: () => ({ ok: true as const, value: {} as never }),
+      },
+      brain: new BusinessBrainService(store as unknown as BrainRepository),
+      goal: new RevenueGoalService(store as unknown as GoalRepository, deterministicGoalParser),
+      brainContext: () => ({
+        workspaceId: "w1",
+        company: null,
+        offers: [],
+        icp: null,
+        personas: [],
+      }),
+      planContext: () => readPlanBrain(store, "w1", "u1"),
+      plan: new RevenuePlanService(
+        store as unknown as PlanRepository,
+        deterministicPlanCompiler,
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        () => readPlanBrain(store, "w1", "u1"),
+      ),
+      account: new AccountService(store as unknown as AccountRepository, () => ({
+        ok: false,
+        error: { code: "UNAVAILABLE" },
+      })),
+      research: createResearchService(store as never),
+      evidence: createEvidenceService({
+        authorize: () => ({ ok: true as const, value: {} }),
+        listEvidence: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      } as never),
+      resolveSession: () => ({ userId: "u1" }),
+    });
+    const error = await errorOf(
+      handlers.listEvidenceHandler(request({ token: "t", params: { workspaceId: "w1" } })),
+    );
+    expect(error.code).toBe("SERVER_ERROR");
+    expect(error.message).toBe("unexpected failure");
+    expect(JSON.stringify(error)).not.toContain("UNAVAILABLE");
+  });
+});
+
+describe("API Evidence routes", () => {
+  type EvidenceRow = {
+    id: string;
+    workspaceId: string;
+    accountId: string;
+    accountClaimId: string;
+    researchFindingId: string | null;
+    provenance: string;
+    source: string;
+    sourceName: string;
+    sourceUrl: string | null;
+    sourceTitle: string | null;
+    observedAt: string | null;
+    retrievedAt: string;
+    confidence: string;
+    freshness: string;
+    relevance: string;
+    status: string;
+    note: string | null;
+  };
+  type ClaimRow = {
+    id: string;
+    workspaceId: string;
+    accountId: string;
+    category: string;
+    field: string;
+    value: string;
+    claimKind: string;
+    status: string;
+  };
+  type Outcome = { evidence: EvidenceRow; claim: ClaimRow; contradicted: EvidenceRow[] };
+
+  /** A declared provider, not a real external retrieval. */
+  const declaredProvider = (id: string, findings: unknown[]): ResearchProvider =>
+    new StaticResearchProvider(id, "public_web", findings as never);
+
+  const sizeObservation = (value: string) => ({
+    category: "company_overview",
+    field: "employee_count",
+    value,
+    claimKind: "fact",
+    sourceUrl: "https://registry.example/northwind",
+    sourceTitle: "Company registry entry",
+    observedAt: "2026-09-01T00:00:00.000Z",
+    confidence: "medium",
+    relevance: "high",
+    note: null,
+  });
+
+  async function seedAccount(
+    handlers: ReturnType<typeof fixture>["handlers"],
+    token: string,
+    workspaceId: string,
+  ): Promise<string> {
+    const created = (await dataOf(
+      handlers.createAccountHandler(
+        request({
+          token,
+          params: { workspaceId },
+          body: { name: "Northwind Trading", website: "https://northwind.example" },
+        }),
+      ),
+    )) as { account: { id: string } };
+    return created.account.id;
+  }
+
+  /** Research an account and return the recorded findings. */
+  async function research(
+    handlers: ReturnType<typeof fixture>["handlers"],
+    token: string,
+    workspaceId: string,
+    accountId: string,
+    providerId: string,
+  ): Promise<{ id: string; field: string }[]> {
+    const created = (await dataOf(
+      handlers.createResearchRequestHandler(
+        request({
+          token,
+          params: { workspaceId, accountId },
+          body: { provider: providerId },
+        }),
+      ),
+    )) as { request: { id: string } };
+    const run = (await dataOf(
+      handlers.runResearchRequestHandler(request({ token, params: { id: created.request.id } })),
+    )) as { findings: { id: string; field: string }[] };
+    return run.findings;
+  }
+
+  it("converts a finding into evidence and traces the claim back to it", async () => {
+    const { handlers, tokenA, workspaceA } = fixture({
+      researchProviders: [declaredProvider("registry", [sizeObservation("120")])],
+    });
+    const accountId = await seedAccount(handlers, tokenA, workspaceA);
+    const findings = await research(handlers, tokenA, workspaceA, accountId, "registry");
+    const findingId = findings[0]?.id ?? "";
+
+    const outcome = (await dataOf(
+      handlers.createEvidenceFromFindingHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, researchFindingId: findingId },
+        }),
+      ),
+    )) as Outcome;
+
+    // The source metadata came from the finding, not from the request.
+    expect(outcome.evidence.sourceName).toBe("registry");
+    expect(outcome.evidence.source).toBe("public_web");
+    expect(outcome.evidence.sourceUrl).toBe("https://registry.example/northwind");
+    expect(outcome.evidence.observedAt).toBe("2026-09-01T00:00:00.000Z");
+    expect(outcome.evidence.confidence).toBe("medium");
+    expect(outcome.evidence.relevance).toBe("high");
+    expect(outcome.evidence.freshness).toBeTruthy();
+    expect(outcome.evidence.provenance).toBe("research_finding");
+    expect(outcome.evidence.researchFindingId).toBe(findingId);
+    expect(outcome.evidence.status).toBe("recorded");
+
+    // The claim states the assertion and nothing more.
+    expect(outcome.claim.field).toBe("employee_count");
+    expect(outcome.claim.value).toBe("120");
+    expect(outcome.claim.claimKind).toBe("fact");
+    expect(outcome.claim.status).toBe("asserted");
+
+    // The traceability direction: claim -> evidence.
+    const support = (await dataOf(
+      handlers.listClaimEvidenceHandler(
+        request({ token: tokenA, params: { id: outcome.claim.id } }),
+      ),
+    )) as { evidence: EvidenceRow[] };
+    expect(support.evidence).toHaveLength(1);
+    expect(support.evidence[0]?.researchFindingId).toBe(findingId);
+
+    const one = (await dataOf(
+      handlers.getEvidenceHandler(request({ token: tokenA, params: { id: outcome.evidence.id } })),
+    )) as { evidence: EvidenceRow };
+    expect(one.evidence.id).toBe(outcome.evidence.id);
+  });
+
+  it("records user-supplied evidence and ignores identity in the body", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB, userA } = fixture();
+    const accountId = await seedAccount(handlers, tokenA, workspaceA);
+
+    const outcome = (await dataOf(
+      handlers.recordUserEvidenceHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, accountId },
+          body: {
+            category: "company_overview",
+            field: "geography",
+            value: "United Kingdom",
+            claimKind: "fact",
+            sourceName: "workspace account record",
+            confidence: "medium",
+            relevance: "high",
+            // A caller cannot name its own workspace, user or account.
+            workspaceId: workspaceB,
+            userId: userA,
+            source: "public_web",
+          },
+        }),
+      ),
+    )) as Outcome;
+
+    expect(outcome.evidence.workspaceId).toBe(workspaceA);
+    expect(outcome.evidence.accountId).toBe(accountId);
+    // The source kind follows from the provenance, not from the caller.
+    expect(outcome.evidence.source).toBe("account_record");
+    expect(outcome.evidence.provenance).toBe("user_supplied");
+    expect(outcome.evidence.researchFindingId).toBeNull();
+    expect(outcome.evidence.sourceUrl).toBeNull();
+    // No observation date supplied, so no currency is claimed.
+    expect(outcome.evidence.freshness).toBe("unknown");
+
+    // And nothing landed in the other tenant.
+    const bList = (await dataOf(
+      handlers.listEvidenceHandler(request({ token: tokenB, params: { workspaceId: workspaceB } })),
+    )) as { evidence: EvidenceRow[] };
+    expect(bList.evidence).toEqual([]);
+  });
+
+  it("preserves both sides of a contradiction and names neither the winner", async () => {
+    const { handlers, tokenA, workspaceA } = fixture({
+      researchProviders: [
+        declaredProvider("registry_a", [sizeObservation("50")]),
+        declaredProvider("registry_b", [sizeObservation("120")]),
+      ],
+    });
+    const accountId = await seedAccount(handlers, tokenA, workspaceA);
+
+    const aFindings = await research(handlers, tokenA, workspaceA, accountId, "registry_a");
+    const first = (await dataOf(
+      handlers.createEvidenceFromFindingHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, researchFindingId: aFindings[0]?.id ?? "" },
+        }),
+      ),
+    )) as Outcome;
+    expect(first.evidence.status).toBe("recorded");
+    expect(first.claim.status).toBe("asserted");
+
+    const bFindings = await research(handlers, tokenA, workspaceA, accountId, "registry_b");
+    const second = (await dataOf(
+      handlers.createEvidenceFromFindingHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, researchFindingId: bFindings[0]?.id ?? "" },
+        }),
+      ),
+    )) as Outcome;
+
+    // Both records exist, both are marked, and neither overwrote the other.
+    expect(second.contradicted).toHaveLength(1);
+    expect(second.contradicted[0]?.id).toBe(first.evidence.id);
+    expect(second.evidence.status).toBe("contradicted");
+    expect(second.claim.status).toBe("contested");
+
+    const all = (await dataOf(
+      handlers.listEvidenceHandler(request({ token: tokenA, params: { workspaceId: workspaceA } })),
+    )) as { evidence: EvidenceRow[] };
+    expect(all.evidence).toHaveLength(2);
+    expect(all.evidence.every((e) => e.status === "contradicted")).toBe(true);
+    // Each side still carries its own citation.
+    expect(new Set(all.evidence.map((e) => e.id)).size).toBe(2);
+    expect(all.evidence.every((e) => e.sourceUrl === "https://registry.example/northwind")).toBe(
+      true,
+    );
+
+    // A contested claim cannot be quietly returned to asserted.
+    const reverted = await errorOf(
+      handlers.changeAccountClaimStatusHandler(
+        request({ token: tokenA, params: { id: second.claim.id }, body: { status: "asserted" } }),
+      ),
+    );
+    expect(reverted.code).toBe("CONFLICT");
+  });
+
+  it("supersedes only when the replacement is named, and keeps the old record", async () => {
+    const { handlers, tokenA, workspaceA } = fixture({
+      researchProviders: [declaredProvider("registry", [sizeObservation("120")])],
+    });
+    const accountId = await seedAccount(handlers, tokenA, workspaceA);
+    const findings = await research(handlers, tokenA, workspaceA, accountId, "registry");
+
+    const outcome = (await dataOf(
+      handlers.createEvidenceFromFindingHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, researchFindingId: findings[0]?.id ?? "" },
+        }),
+      ),
+    )) as Outcome;
+
+    // Superseding by status alone is refused: it would record a supersession
+    // with nothing to supersede it.
+    const bare = await errorOf(
+      handlers.changeEvidenceStatusHandler(
+        request({
+          token: tokenA,
+          params: { id: outcome.evidence.id },
+          body: { status: "superseded" },
+        }),
+      ),
+    );
+    expect(bare.code).toBe("VALIDATION_ERROR");
+
+    // A second, agreeing record from the same account record.
+    const again = await research(handlers, tokenA, workspaceA, accountId, "registry");
+    const replacement = (await dataOf(
+      handlers.createEvidenceFromFindingHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, researchFindingId: again[0]?.id ?? "" },
+        }),
+      ),
+    )) as Outcome;
+
+    const superseded = (await dataOf(
+      handlers.supersedeEvidenceHandler(
+        request({
+          token: tokenA,
+          params: { id: outcome.evidence.id },
+          body: { replacementEvidenceId: replacement.evidence.id },
+        }),
+      ),
+    )) as { superseded: EvidenceRow; replacement: EvidenceRow };
+    expect(superseded.superseded.status).toBe("superseded");
+    expect(superseded.replacement.id).toBe(replacement.evidence.id);
+
+    // The old observation is history, not a deletion.
+    const reread = (await dataOf(
+      handlers.getEvidenceHandler(request({ token: tokenA, params: { id: outcome.evidence.id } })),
+    )) as { evidence: EvidenceRow };
+    expect(reread.evidence.status).toBe("superseded");
+    expect(reread.evidence.sourceUrl).toBe(outcome.evidence.sourceUrl);
+    expect(reread.evidence.retrievedAt).toBe(outcome.evidence.retrievedAt);
+    expect(reread.evidence.researchFindingId).toBe(outcome.evidence.researchFindingId);
+
+    // And a superseded record is terminal.
+    const changed = await errorOf(
+      handlers.changeEvidenceStatusHandler(
+        request({
+          token: tokenA,
+          params: { id: outcome.evidence.id },
+          body: { status: "rejected" },
+        }),
+      ),
+    );
+    expect(changed.code).toBe("CONFLICT");
+  });
+
+  it("rejects invalid statuses and unsupported values", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const accountId = await seedAccount(handlers, tokenA, workspaceA);
+    const outcome = (await dataOf(
+      handlers.recordUserEvidenceHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, accountId },
+          body: {
+            category: "company_overview",
+            field: "employee_count",
+            value: "120",
+            claimKind: "fact",
+            sourceName: "workspace account record",
+            confidence: "medium",
+            relevance: "high",
+          },
+        }),
+      ),
+    )) as Outcome;
+
+    // Nothing here can be marked verified, scored or qualified.
+    for (const status of ["verified", "qualified", "scored", "promoted"]) {
+      const error = await errorOf(
+        handlers.changeEvidenceStatusHandler(
+          request({
+            token: tokenA,
+            params: { id: outcome.evidence.id },
+            body: { status },
+          }),
+        ),
+      );
+      expect(error.code).toBe("VALIDATION_ERROR");
+    }
+
+    // A qualification-flavoured category is not a research category.
+    const badCategory = await errorOf(
+      handlers.recordUserEvidenceHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, accountId },
+          body: {
+            category: "buying_intent",
+            field: "intent",
+            value: "hot",
+            claimKind: "fact",
+            sourceName: "workspace account record",
+            confidence: "high",
+            relevance: "high",
+          },
+        }),
+      ),
+    );
+    expect(badCategory.code).toBe("VALIDATION_ERROR");
+
+    const badFilter = await errorOf(
+      handlers.listEvidenceHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          query: { status: "verified" },
+        }),
+      ),
+    );
+    expect(badFilter.code).toBe("VALIDATION_ERROR");
+
+    const badClaimFilter = await errorOf(
+      handlers.listAccountClaimsHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA },
+          query: { status: "qualified" },
+        }),
+      ),
+    );
+    expect(badClaimFilter.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("withdraws a claim softly and keeps its evidence readable", async () => {
+    const { handlers, tokenA, workspaceA } = fixture({
+      researchProviders: [declaredProvider("registry", [sizeObservation("120")])],
+    });
+    const accountId = await seedAccount(handlers, tokenA, workspaceA);
+    const findings = await research(handlers, tokenA, workspaceA, accountId, "registry");
+    const outcome = (await dataOf(
+      handlers.createEvidenceFromFindingHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, researchFindingId: findings[0]?.id ?? "" },
+        }),
+      ),
+    )) as Outcome;
+
+    const retracted = (await dataOf(
+      handlers.changeAccountClaimStatusHandler(
+        request({ token: tokenA, params: { id: outcome.claim.id }, body: { status: "retracted" } }),
+      ),
+    )) as { claim: ClaimRow };
+    expect(retracted.claim.status).toBe("retracted");
+
+    // The evidence that supported it survives the withdrawal.
+    const support = (await dataOf(
+      handlers.listClaimEvidenceHandler(
+        request({ token: tokenA, params: { id: outcome.claim.id } }),
+      ),
+    )) as { evidence: EvidenceRow[] };
+    expect(support.evidence).toHaveLength(1);
+
+    // A retracted claim is terminal.
+    const revived = await errorOf(
+      handlers.changeAccountClaimStatusHandler(
+        request({ token: tokenA, params: { id: outcome.claim.id }, body: { status: "asserted" } }),
+      ),
+    );
+    expect(revived.code).toBe("CONFLICT");
+  });
+
+  it("enforces workspace isolation and never reveals a foreign finding", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB } = fixture({
+      researchProviders: [declaredProvider("registry", [sizeObservation("120")])],
+    });
+    const accountId = await seedAccount(handlers, tokenA, workspaceA);
+    const findings = await research(handlers, tokenA, workspaceA, accountId, "registry");
+    const findingId = findings[0]?.id ?? "";
+    const outcome = (await dataOf(
+      handlers.createEvidenceFromFindingHandler(
+        request({
+          token: tokenA,
+          params: { workspaceId: workspaceA, researchFindingId: findingId },
+        }),
+      ),
+    )) as Outcome;
+
+    const denials = await Promise.all([
+      // Another tenant cannot convert, read or list this evidence.
+      errorOf(
+        handlers.createEvidenceFromFindingHandler(
+          request({
+            token: tokenB,
+            params: { workspaceId: workspaceB, researchFindingId: findingId },
+          }),
+        ),
+      ),
+      errorOf(
+        handlers.getEvidenceHandler(
+          request({ token: tokenB, params: { id: outcome.evidence.id } }),
+        ),
+      ),
+      errorOf(
+        handlers.getAccountClaimHandler(
+          request({ token: tokenB, params: { id: outcome.claim.id } }),
+        ),
+      ),
+      errorOf(
+        handlers.listClaimEvidenceHandler(
+          request({ token: tokenB, params: { id: outcome.claim.id } }),
+        ),
+      ),
+      errorOf(
+        handlers.changeEvidenceStatusHandler(
+          request({
+            token: tokenB,
+            params: { id: outcome.evidence.id },
+            body: { status: "rejected" },
+          }),
+        ),
+      ),
+      errorOf(
+        handlers.changeAccountClaimStatusHandler(
+          request({
+            token: tokenB,
+            params: { id: outcome.claim.id },
+            body: { status: "retracted" },
+          }),
+        ),
+      ),
+      // Nor write evidence into another tenant's account.
+      errorOf(
+        handlers.recordUserEvidenceHandler(
+          request({
+            token: tokenB,
+            params: { workspaceId: workspaceB, accountId },
+            body: {
+              category: "company_overview",
+              field: "employee_count",
+              value: "999",
+              claimKind: "fact",
+              sourceName: "workspace account record",
+              confidence: "high",
+              relevance: "high",
+            },
+          }),
+        ),
+      ),
+    ]);
+
+    for (const denial of denials) {
+      // A foreign account or finding is not even revealed to exist.
+      expect(["UNAUTHORIZED", "NOT_FOUND"]).toContain(denial.code);
+      expect(JSON.stringify(denial)).not.toContain("northwind");
+      expect(JSON.stringify(denial)).not.toContain("registry.example");
+    }
+
+    // The other tenant sees nothing at all.
+    const bList = (await dataOf(
+      handlers.listEvidenceHandler(request({ token: tokenB, params: { workspaceId: workspaceB } })),
+    )) as { evidence: EvidenceRow[] };
+    expect(bList.evidence).toEqual([]);
+    const bClaims = (await dataOf(
+      handlers.listAccountClaimsHandler(
+        request({ token: tokenB, params: { workspaceId: workspaceB } }),
+      ),
+    )) as { claims: ClaimRow[] };
+    expect(bClaims.claims).toEqual([]);
+  });
+
+  it("requires authentication", async () => {
+    const { handlers, workspaceA } = fixture();
+    const denials = await Promise.all([
+      errorOf(handlers.listEvidenceHandler(request({ params: { workspaceId: workspaceA } }))),
+      errorOf(handlers.listAccountClaimsHandler(request({ params: { workspaceId: workspaceA } }))),
+      errorOf(handlers.getEvidenceHandler(request({ params: { id: "e1" } }))),
+      errorOf(handlers.getAccountClaimHandler(request({ params: { id: "c1" } }))),
+      errorOf(
+        handlers.createEvidenceFromFindingHandler(
+          request({ params: { workspaceId: workspaceA, researchFindingId: "f1" } }),
+        ),
+      ),
+    ]);
+    for (const denial of denials) expect(denial.code).toBe("UNAUTHENTICATED");
   });
 });

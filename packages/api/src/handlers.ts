@@ -16,10 +16,12 @@ import { ACCOUNT_STATUSES, CONTACT_STATUSES } from "@dealora/account";
 import type { AccountError, AccountService } from "@dealora/account";
 import { RESEARCH_REQUEST_STATUSES } from "@dealora/research";
 import type { ResearchError, ResearchService } from "@dealora/research";
+import { ACCOUNT_CLAIM_STATUSES, EVIDENCE_STATUSES } from "@dealora/evidence";
+import type { EvidenceError, EvidenceService } from "@dealora/evidence";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
-import type { ResearchRequestStatus } from "@dealora/db";
+import type { AccountClaimStatus, EvidenceStatus, ResearchRequestStatus } from "@dealora/db";
 
 import type {
   ApiError,
@@ -151,6 +153,29 @@ function fromResearchError(error: ResearchError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `EvidenceError` into the safe API error envelope.
+ *
+ * `UNAVAILABLE` is an internal condition and is never surfaced verbatim. An
+ * `UNSUPPORTED_SOURCE` is the caller's mistake rather than ours, so it reads as
+ * a validation failure; an `INVALID_TRANSITION` conflicts with the record's
+ * current state, exactly as the goal, plan and research layers do.
+ */
+function fromEvidenceError(error: EvidenceError): ApiError {
+  if (error.code === "UNAVAILABLE") {
+    return { code: "SERVER_ERROR", message: "unexpected failure" };
+  }
+  const code: ApiErrorCode =
+    error.code === "INVALID_TRANSITION"
+      ? "CONFLICT"
+      : error.code === "UNSUPPORTED_SOURCE"
+        ? "VALIDATION_ERROR"
+        : (error.code as ApiErrorCode);
+  const mapped: ApiError = { code, message: error.message };
+  if (error.details) mapped.details = error.details;
+  return mapped;
+}
+
 /** Parse a JSON body, tolerating already-parsed objects. */
 async function parseBody(req: RequestBody): Promise<Record<string, unknown> | ApiError> {
   const raw = req.body;
@@ -181,6 +206,7 @@ export interface HandlerDeps {
   planContext: PlanBrainReader;
   account: AccountService;
   research: ResearchService;
+  evidence: EvidenceService;
   resolveSession: SessionResolver;
 }
 
@@ -1169,6 +1195,247 @@ export function createHandlers(deps: HandlerDeps) {
       return Promise.resolve({ ok: true, value: ok({ request: result.value }) });
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 7 — Evidence System
+  //
+  // Evidence makes a research observation traceable, and a claim traceable
+  // back to its evidence. These handlers translate; they never fetch a source,
+  // never judge whether a claim is true, and never score, rank or contact the
+  // account.
+  //
+  // The workspace always comes from the route and the identity always from the
+  // session. A `workspaceId`, `userId`, `accountId` or `researchFindingId` in a
+  // body is not proof of anything: ownership is re-verified server-side, and
+  // another tenant's finding is reported as not found rather than revealed.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Record evidence for a research finding, and the claim it supports.
+   *
+   * The finding id is the only input: the account, workspace, source,
+   * timestamps, confidence and freshness all come from the stored finding, so
+   * a caller cannot cite one account's observation in support of another's.
+   */
+  const createEvidenceFromFindingHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const researchFindingId = param(req, "researchFindingId");
+      if (isApiError(researchFindingId)) {
+        return Promise.resolve({ ok: false, error: researchFindingId });
+      }
+
+      const result = deps.evidence.createEvidenceFromFinding(
+        workspaceId,
+        actor.userId,
+        researchFindingId,
+      );
+      if (!result.ok) {
+        return Promise.resolve({ ok: false, error: fromEvidenceError(result.error) });
+      }
+      // `contradicted` is returned rather than hidden: a caller can always see
+      // that a competing observation already existed.
+      return Promise.resolve({ ok: true, value: ok(result.value) });
+    });
+
+  /**
+   * Record evidence for a source the workspace supplied directly.
+   *
+   * The provenance path with no research request behind it. The account is the
+   * route's, and the record is attributed to the workspace's own account
+   * record rather than to an external source DEALORA has not read.
+   */
+  const recordUserEvidenceHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const accountId = param(req, "accountId");
+      if (isApiError(accountId)) return { ok: false, error: accountId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      // Only the evidence fields are read. `workspaceId`, `userId` and
+      // `accountId` in the body are ignored in favour of the route's.
+      const result = deps.evidence.recordUserSuppliedEvidence(
+        workspaceId,
+        actor.userId,
+        accountId,
+        {
+          category: body.category,
+          field: body.field,
+          value: body.value,
+          claimKind: body.claimKind,
+          sourceName: body.sourceName,
+          sourceUrl: body.sourceUrl,
+          sourceTitle: body.sourceTitle,
+          observedAt: body.observedAt,
+          confidence: body.confidence,
+          relevance: body.relevance,
+          note: body.note,
+        },
+      );
+      if (!result.ok) return { ok: false, error: fromEvidenceError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** One evidence record, with the provenance that supports it. */
+  const getEvidenceHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.evidence.getEvidence(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromEvidenceError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ evidence: result.value }) });
+    });
+
+  /**
+   * A workspace's evidence, optionally narrowed to one account or status.
+   *
+   * Superseded, contradicted and rejected records are listed like any other:
+   * a trail that hides the discarded half is not a trail.
+   */
+  const listEvidenceHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+
+      const rawStatus = req.query.status;
+      let status: EvidenceStatus | undefined;
+      if (typeof rawStatus === "string" && rawStatus !== "") {
+        if (!EVIDENCE_STATUSES.includes(rawStatus as EvidenceStatus)) {
+          return Promise.resolve({
+            ok: false,
+            error: {
+              code: "VALIDATION_ERROR",
+              message: `status must be one of: ${EVIDENCE_STATUSES.join(", ")}`,
+            },
+          });
+        }
+        status = rawStatus as EvidenceStatus;
+      }
+      const accountId =
+        typeof req.query.accountId === "string" && req.query.accountId !== ""
+          ? req.query.accountId
+          : undefined;
+
+      const filter: { accountId?: string; status?: EvidenceStatus } = {};
+      if (status) filter.status = status;
+      if (accountId) filter.accountId = accountId;
+
+      const result = deps.evidence.listEvidence(
+        workspaceId,
+        actor.userId,
+        Object.keys(filter).length > 0 ? filter : undefined,
+      );
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromEvidenceError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ evidence: result.value }) });
+    });
+
+  /** Mark one record rejected, or contested. Status only, never a field edit. */
+  const changeEvidenceStatusHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.evidence.changeEvidenceStatus(id, actor.userId, body.status);
+      if (!result.ok) return { ok: false, error: fromEvidenceError(result.error) };
+      return { ok: true, value: ok({ evidence: result.value }) };
+    });
+
+  /**
+   * Point one record at its replacement.
+   *
+   * The replacement is named, never inferred: DEALORA does not decide that the
+   * newer observation is the true one.
+   */
+  const supersedeEvidenceHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.evidence.supersedeEvidence(id, actor.userId, body.replacementEvidenceId);
+      if (!result.ok) return { ok: false, error: fromEvidenceError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** One claim about an account. */
+  const getAccountClaimHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.evidence.getAccountClaim(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromEvidenceError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ claim: result.value }) });
+    });
+
+  /** A workspace's claims, optionally narrowed to one account or status. */
+  const listAccountClaimsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+
+      const rawStatus = req.query.status;
+      let status: AccountClaimStatus | undefined;
+      if (typeof rawStatus === "string" && rawStatus !== "") {
+        if (!ACCOUNT_CLAIM_STATUSES.includes(rawStatus as AccountClaimStatus)) {
+          return Promise.resolve({
+            ok: false,
+            error: {
+              code: "VALIDATION_ERROR",
+              message: `status must be one of: ${ACCOUNT_CLAIM_STATUSES.join(", ")}`,
+            },
+          });
+        }
+        status = rawStatus as AccountClaimStatus;
+      }
+      const accountId =
+        typeof req.query.accountId === "string" && req.query.accountId !== ""
+          ? req.query.accountId
+          : undefined;
+
+      const filter: { accountId?: string; status?: AccountClaimStatus } = {};
+      if (status) filter.status = status;
+      if (accountId) filter.accountId = accountId;
+
+      const result = deps.evidence.listAccountClaims(
+        workspaceId,
+        actor.userId,
+        Object.keys(filter).length > 0 ? filter : undefined,
+      );
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromEvidenceError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ claims: result.value }) });
+    });
+
+  /**
+   * Every record supporting one claim — the traceability direction this phase
+   * exists to provide.
+   */
+  const listClaimEvidenceHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.evidence.listEvidenceForClaim(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromEvidenceError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ evidence: result.value }) });
+    });
+
+  /** Withdraw a claim, or flag it contested. Soft: the evidence stays readable. */
+  const changeAccountClaimStatusHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.evidence.changeAccountClaimStatus(id, actor.userId, body.status);
+      if (!result.ok) return { ok: false, error: fromEvidenceError(result.error) };
+      return { ok: true, value: ok({ claim: result.value }) };
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -1230,6 +1497,16 @@ export function createHandlers(deps: HandlerDeps) {
     runResearchRequestHandler,
     getResearchFindingsHandler,
     cancelResearchRequestHandler,
+    createEvidenceFromFindingHandler,
+    recordUserEvidenceHandler,
+    getEvidenceHandler,
+    listEvidenceHandler,
+    changeEvidenceStatusHandler,
+    supersedeEvidenceHandler,
+    getAccountClaimHandler,
+    listAccountClaimsHandler,
+    listClaimEvidenceHandler,
+    changeAccountClaimStatusHandler,
   };
 }
 
