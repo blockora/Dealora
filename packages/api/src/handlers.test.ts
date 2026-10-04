@@ -37,6 +37,11 @@ import {
   createDraftReader,
   createOutboundService,
 } from "@dealora/outbound";
+import {
+  createConversationService,
+  createOutboundReader,
+  createSuppressionWriter,
+} from "@dealora/conversation";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -121,6 +126,22 @@ function registryWithSandbox(): ProviderRegistry {
   const registry = new ProviderRegistry();
   registry.register("email", new SandboxEmailProvider());
   return registry;
+}
+
+/**
+ * Wire the Conversation service the way the production wiring does.
+ *
+ * The same narrow readers and the same Phase 11 suppression list, so a route
+ * test that records a response exercises the real engine and the real opt-out
+ * mechanism rather than a stand-in.
+ */
+function conversationService(store: Store, clock?: () => Date) {
+  return createConversationService(
+    store as never,
+    createOutboundReader(store as never),
+    createSuppressionWriter(store as never),
+    clock,
+  );
 }
 
 /**
@@ -269,6 +290,7 @@ function fixture(options?: {
     personalization: personalizationService(store),
     approval: approvalService(store),
     outbound: outboundService(store),
+    conversation: conversationService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -749,6 +771,7 @@ describe("API Revenue Goal routes", () => {
       personalization: personalizationService(store),
       approval: approvalService(store),
       outbound: outboundService(store),
+      conversation: conversationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1083,6 +1106,7 @@ describe("API Revenue Plan routes", () => {
       personalization: personalizationService(store),
       approval: approvalService(store),
       outbound: outboundService(store),
+      conversation: conversationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1298,6 +1322,7 @@ describe("API Business Brain routes", () => {
       personalization: personalizationService(failingStore),
       approval: approvalService(failingStore),
       outbound: outboundService(failingStore),
+      conversation: conversationService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1638,6 +1663,7 @@ describe("API Account & Contact routes", () => {
       personalization: personalizationService(store),
       approval: approvalService(store),
       outbound: outboundService(store),
+      conversation: conversationService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1945,6 +1971,7 @@ describe("API Research routes", () => {
       personalization: personalizationService(store),
       approval: approvalService(store),
       outbound: outboundService(store),
+      conversation: conversationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -1996,6 +2023,7 @@ describe("API Research routes", () => {
       personalization: personalizationService(store),
       approval: approvalService(store),
       outbound: outboundService(store),
+      conversation: conversationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3135,6 +3163,7 @@ describe("API Qualification routes", () => {
         { byId: () => null, latestVersion: () => null },
       ),
       outbound: outboundService(store),
+      conversation: conversationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 

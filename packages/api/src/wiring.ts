@@ -30,6 +30,11 @@ import {
   createOutboundService,
 } from "@dealora/outbound";
 import type { OutboundProvider } from "@dealora/outbound";
+import {
+  createConversationService,
+  createOutboundReader,
+  createSuppressionWriter,
+} from "@dealora/conversation";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -343,6 +348,18 @@ export function createDefaultHandlers(options?: {
       createDraftReader(store as never),
       createContactReader(store as never),
       providerRegistry(options?.outboundProviders),
+    ),
+    /**
+     * The response boundary reads two things and no more: whether an outbound
+     * action actually went out, and the address it went to. It writes to the
+     * **same** Phase 11 suppression list the send path already checks, so an
+     * opt-out recorded here is honoured by the existing send logic with no new
+     * mechanism and nothing to keep in sync.
+     */
+    conversation: createConversationService(
+      store as never,
+      createOutboundReader(store as never),
+      createSuppressionWriter(store as never),
     ),
     resolveSession: (token) => {
       try {

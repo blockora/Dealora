@@ -15,6 +15,7 @@
     { "path": "packages/personalization" },
     { "path": "packages/approval" },
     { "path": "packages/outbound" },
+    { "path": "packages/conversation" },
     { "path": "packages/api" }
   ]
 }

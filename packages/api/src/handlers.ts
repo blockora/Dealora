@@ -25,6 +25,7 @@ import type { PersonalizationError, PersonalizationService } from "@dealora/pers
 import { APPROVAL_STATUSES } from "@dealora/approval";
 import type { ApprovalError, ApprovalService } from "@dealora/approval";
 import type { OutboundError, OutboundService } from "@dealora/outbound";
+import type { ConversationError, ConversationService } from "@dealora/conversation";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -325,6 +326,43 @@ function fromOutboundError(error: OutboundError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `ConversationError` into the safe API error envelope.
+ *
+ * Written as an exhaustive switch, with no cast, so the `ApiErrorCode`
+ * annotation is a real guarantee: TypeScript accepts the function only while
+ * every member of the domain's error union has a case, which is what stops a new
+ * domain code from reaching the wire as something the transport contract does not
+ * define. (`fromOutboundError` above needed an IIFE for exactly that reason.)
+ *
+ * `UNSUPPORTED_CLASSIFIER_VERSION` becomes `VALIDATION_ERROR`, because a caller
+ * naming a rule set this deployment does not implement has sent a bad request —
+ * which is a different situation from a conflict, and retrying will not help.
+ *
+ * `UNAVAILABLE` is an internal condition and is never surfaced verbatim.
+ */
+function fromConversationError(error: ConversationError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+      case "UNSUPPORTED_CLASSIFIER_VERSION":
+        return "VALIDATION_ERROR";
+      case "CONFLICT":
+        return "CONFLICT";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = [...error.details];
+  return mapped;
+}
+
 export interface HandlerDeps {
   identity: IdentityService;
   brain: BusinessBrainService;
@@ -339,6 +377,7 @@ export interface HandlerDeps {
   personalization: PersonalizationService;
   approval: ApprovalService;
   outbound: OutboundService;
+  conversation: ConversationService;
   resolveSession: SessionResolver;
 }
 
@@ -2190,6 +2229,114 @@ export function createHandlers(deps: HandlerDeps) {
       });
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 12 — Conversation Engine
+  //
+  // These handlers record a response that was actually received and read it
+  // with the deterministic classifier. They are the read-and-recommend half
+  // of the revenue loop, and deliberately the *only* thing Phase 12 can do
+  // through the API: none of these routes sends a message, creates an
+  // approval, writes evidence, or schedules anything.
+  //
+  // Nothing about the reading is accepted from a caller. There is no `intent`,
+  // `confidence`, `signals`, `recommendedNextAction`,
+  // `humanInterventionRequired` or `suppressed` field that is read: the
+  // classifier decides those from the recorded text alone. A client cannot
+  // label a customer's reply, and it cannot make one look urgent.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Record one inbound response and classify it.
+   *
+   * Only `outboundActionId`, the text itself and its provenance are read from
+   * the body. The contact and account are resolved server-side from the sent
+   * action, and an action that was never sent is not found — so a response
+   * cannot be filed against a contact DEALORA never actually wrote to.
+   */
+  const createInboundMessageHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const outboundActionId = param(req, "outboundActionId");
+      if (isApiError(outboundActionId)) return { ok: false, error: outboundActionId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.conversation.recordInbound(
+        workspaceId,
+        actor.userId,
+        outboundActionId,
+        {
+          body: body.body,
+          subject: body.subject,
+          fromAddress: body.fromAddress,
+          providerMessageId: body.providerMessageId,
+        },
+        { source: body.source, receivedAt: body.receivedAt },
+      );
+      if (!result.ok) return { ok: false, error: fromConversationError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** One recorded response with its classification and its audit trail. */
+  const getInboundMessageHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const result = deps.conversation.inspectResponse(id, actor.userId);
+      if (!result.ok) return { ok: false, error: fromConversationError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** A workspace's recorded responses, newest first. */
+  const listInboundMessagesHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const result = deps.conversation.listInbound(workspaceId, actor.userId, {
+        outboundActionId: req.query.outboundActionId,
+        contactId: req.query.contactId,
+      });
+      if (!result.ok) return { ok: false, error: fromConversationError(result.error) };
+      return { ok: true, value: ok({ messages: result.value }) };
+    });
+
+  /** A workspace's classifications, newest first, optionally by intent. */
+  const listConversationClassificationsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const result = deps.conversation.listClassifications(workspaceId, actor.userId, {
+        intent: req.query.intent,
+        outboundActionId: req.query.outboundActionId,
+      });
+      if (!result.ok) return { ok: false, error: fromConversationError(result.error) };
+      return { ok: true, value: ok({ classifications: result.value }) };
+    });
+
+  /** One classification's append-only audit trail, oldest first. */
+  const conversationHistoryHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const result = deps.conversation.classificationHistory(id, actor.userId);
+      if (!result.ok) return { ok: false, error: fromConversationError(result.error) };
+      return { ok: true, value: ok({ events: result.value }) };
+    });
+
+  /**
+   * The conversation policy this deployment enforces, plus the rule set it
+   * reads with — readable before any response exists.
+   */
+  const getConversationPolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const result = deps.conversation.policy(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromConversationError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -2288,6 +2435,16 @@ export function createHandlers(deps: HandlerDeps) {
     createOutboundSuppressionHandler,
     listOutboundSuppressionsHandler,
     getOutboundPolicyHandler,
+
+    // -------------------------------------------------------------------------
+    // Phase 12 — Conversation Engine
+    // -------------------------------------------------------------------------
+    createInboundMessageHandler,
+    getInboundMessageHandler,
+    listInboundMessagesHandler,
+    listConversationClassificationsHandler,
+    conversationHistoryHandler,
+    getConversationPolicyHandler,
   };
 }
 

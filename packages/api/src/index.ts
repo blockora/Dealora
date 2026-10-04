@@ -63,6 +63,26 @@ export type {
 } from "@dealora/outbound";
 
 /**
+ * The Conversation domain's public surface, re-exported so API consumers can
+ * type a classification response without depending on the domain package
+ * directly.
+ */
+export type {
+  ConversationClassification,
+  ConversationConfidence,
+  ConversationDisposition,
+  ConversationError,
+  ConversationEvent,
+  ConversationEventKind,
+  ConversationIntent,
+  ConversationPolicyView,
+  ConversationResult,
+  ConversationSignalKind,
+  InboundMessage,
+  InboundSource,
+} from "@dealora/conversation";
+
+/**
  * The Qualification domain's public surface, re-exported so API consumers can
  * type a qualification response without depending on the domain package
  * directly.
