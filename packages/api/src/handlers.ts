@@ -98,8 +98,7 @@ function fromGoalError(error: GoalError): ApiError {
   if (error.code === "UNAVAILABLE") {
     return { code: "SERVER_ERROR", message: "unexpected failure" };
   }
-  const code: ApiErrorCode =
-    error.code === "INVALID_TRANSITION" ? "CONFLICT" : (error.code as ApiErrorCode);
+  const code: ApiErrorCode = error.code === "INVALID_TRANSITION" ? "CONFLICT" : error.code;
   const mapped: ApiError = { code, message: error.message };
   if (error.details) mapped.details = error.details;
   return mapped;
@@ -115,8 +114,7 @@ function fromPlanError(error: PlanError): ApiError {
   if (error.code === "UNAVAILABLE") {
     return { code: "SERVER_ERROR", message: "unexpected failure" };
   }
-  const code: ApiErrorCode =
-    error.code === "INVALID_TRANSITION" ? "CONFLICT" : (error.code as ApiErrorCode);
+  const code: ApiErrorCode = error.code === "INVALID_TRANSITION" ? "CONFLICT" : error.code;
   const mapped: ApiError = { code, message: error.message };
   if (error.details) mapped.details = error.details;
   return mapped;
@@ -132,7 +130,7 @@ function fromAccountError(error: AccountError): ApiError {
   if (error.code === "UNAVAILABLE") {
     return { code: "SERVER_ERROR", message: "unexpected failure" };
   }
-  const mapped: ApiError = { code: error.code as ApiErrorCode, message: error.message };
+  const mapped: ApiError = { code: error.code, message: error.message };
   if (error.details) mapped.details = error.details;
   return mapped;
 }
@@ -154,7 +152,7 @@ function fromResearchError(error: ResearchError): ApiError {
       ? "CONFLICT"
       : error.code === "UNSUPPORTED_PROVIDER"
         ? "VALIDATION_ERROR"
-        : (error.code as ApiErrorCode);
+        : error.code;
   const mapped: ApiError = { code, message: error.message };
   if (error.details) mapped.details = error.details;
   return mapped;
@@ -177,7 +175,7 @@ function fromEvidenceError(error: EvidenceError): ApiError {
       ? "CONFLICT"
       : error.code === "UNSUPPORTED_SOURCE"
         ? "VALIDATION_ERROR"
-        : (error.code as ApiErrorCode);
+        : error.code;
   const mapped: ApiError = { code, message: error.message };
   if (error.details) mapped.details = error.details;
   return mapped;
@@ -196,7 +194,7 @@ function fromQualificationError(error: QualificationError): ApiError {
     return { code: "SERVER_ERROR", message: "unexpected failure" };
   }
   const code: ApiErrorCode =
-    error.code === "UNSUPPORTED_RULE_VERSION" ? "VALIDATION_ERROR" : (error.code as ApiErrorCode);
+    error.code === "UNSUPPORTED_RULE_VERSION" ? "VALIDATION_ERROR" : error.code;
   const mapped: ApiError = { code, message: error.message };
   if (error.details) mapped.details = error.details;
   return mapped;
@@ -215,9 +213,7 @@ function fromPersonalizationError(error: PersonalizationError): ApiError {
     return { code: "SERVER_ERROR", message: "unexpected failure" };
   }
   const code: ApiErrorCode =
-    error.code === "UNSUPPORTED_RENDERER_VERSION"
-      ? "VALIDATION_ERROR"
-      : (error.code as ApiErrorCode);
+    error.code === "UNSUPPORTED_RENDERER_VERSION" ? "VALIDATION_ERROR" : error.code;
   const mapped: ApiError = { code, message: error.message };
   if (error.details) mapped.details = error.details;
   return mapped;
