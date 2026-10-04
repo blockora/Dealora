@@ -20,8 +20,10 @@ intelligence and execution layer around the revenue stack.
 The repository has completed **Phase 0 — Repository & Engineering Foundation**,
 **Phase 1 — Application Foundation**, **Phase 2 — Business Brain**,
 **Phase 3 — Revenue Goal Engine**, **Phase 4 — Revenue Plan Compiler**,
-**Phase 5 — Account & Prospect Input**, **Phase 6 — Research Engine**, and
-**Phase 7 — Evidence System** (see [`ROADMAP.md`](./ROADMAP.md)).
+**Phase 5 — Account & Prospect Input**, **Phase 6 — Research Engine**,
+**Phase 7 — Evidence System**, **Phase 8 — Qualification Engine**,
+**Phase 9 — Personalization Engine**, **Phase 10 — Approval Engine**, and
+**Phase 11 — First Outbound Integration** (see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
 with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
@@ -130,7 +132,52 @@ prioritizes or books anything: a qualification is an input to those later phases
 never their output. Its gate — inspect why an account received a score, end to
 end — is covered by `tests/phase8-gate.test.ts`.
 
-Next is **Phase 9 — Personalization Engine**.
+Phase 9 adds the Personalization Engine: a qualified account becomes an
+immutable, versioned **draft** whose every factual statement is an
+evidence-backed observation quoted verbatim and attributed to its source, or an
+approved Business Brain claim, or the offer's own description. Anything the
+system could not honestly state — an unapproved price, a contested observation
+— is recorded in `warnings` rather than smoothed over. The renderer is
+deterministic, states its own version and its own refusals, and the whole layer
+is a document: it carries no recipient, no channel, no provider and no send
+state. Regenerating inserts a new version rather than rewriting one, because a
+human may already have read it. Its gate is covered by
+`tests/phase9-gate.test.ts`.
+
+Phase 10 adds the Approval Engine: the human control that Phase 4 and Phase 8
+explicitly deferred. An approval binds one **exact** immutable draft version
+plus a digest of the exact content the reviewer is shown, and that digest is
+re-derived at decision time — so an approval can only ever mean "I read *this*
+text". The reviewer identity and the instant are taken from the session in both
+the service and the storage layer, so a client cannot name its own approver or
+backdate a decision. Exactly one of six states is a yes; a score, a threshold, a
+timer or silence reaches none of them, expiry closes a request rather than
+approving it, and a rejection or change request must say why. Every state leaves
+an append-only audit event naming who and when. The phase ships **no execute
+route**: it makes a send possible and does not make one happen. Its gate is
+covered by `tests/phase10-gate.test.ts`.
+
+Phase 11 adds the first outbound integration — **exactly one channel, email** —
+behind a narrow provider interface. Nothing leaves the system without a persisted
+human approval of the exact draft version, and the send path **re-derives that
+approval from stored rows itself** rather than asking the component that wrote
+it, re-checking the whole chain on every send: ownership, the exact version, the
+digest, the approval's validity, the deliverable destination resolved from the
+contact record, the opt-out list, a configured provider, and an attempt budget.
+`sent` is written from exactly one place, on a provider confirmation, and the
+schema constrains `sent_at` to a `sent` action — so a refusal, a thrown call or a
+malformed provider answer is recorded as a failure and can never be reported as a
+delivery. One approval yields at most one message, enforced both by the system
+and by the provider's idempotency key. Retries are explicit, human-initiated and
+capped; there is no scheduler, no queue, no retry loop and no mass-outreach
+surface. The shipped provider is a **sandbox** that performs no network I/O and
+records what it accepted, because no outbound credential is configured in this
+repository — every delivery claim in the tests means "the provider recorded it",
+never "DEALORA asserted it". Its gate is covered by
+`tests/phase11-gate.test.ts`, and the three phases together by
+`tests/phases9-11-integration.test.ts`.
+
+Next is **Phase 12 — Conversation Engine**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -153,13 +200,16 @@ packages/       Shared TypeScript packages (built with project references)
   research/     Research requests, permitted-source providers, attributed findings (Phase 6)
   evidence/     Evidence, account claims, provenance, contradiction, supersession (Phase 7)
   qualification/ Qualification criteria, deterministic scoring, explainable results (Phase 8)
+  personalization/ Evidence-backed draft rendering, warnings, determinism (Phase 9)
+  approval/      Human approval of one exact draft version, audit trail (Phase 10)
+  outbound/      One email channel behind a provider interface, opt-outs, delivery state (Phase 11)
   api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
-integrations/   External system adapters (Phase 11+)
+integrations/   External system adapters (Phase 12+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests (Phase 1-8 gates)
+tests/          Cross-package integration tests (Phase 1-11 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
@@ -174,8 +224,10 @@ Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)), the Account
 & Prospect Input layer
 ([0006](./docs/adr/0006-account-prospect-input.md)), the Research Engine
 ([0007](./docs/adr/0007-research-engine.md)), the Evidence System
-([0008](./docs/adr/0008-evidence-system.md)), and the Qualification Engine
-([0009](./docs/adr/0009-qualification-engine.md)).
+([0008](./docs/adr/0008-evidence-system.md)), the Qualification Engine
+([0009](./docs/adr/0009-qualification-engine.md)), the Approval Engine
+([0010](./docs/adr/0010-approval-engine.md)), and the First Outbound Integration
+([0011](./docs/adr/0011-first-outbound-integration.md)).
 
 ## Getting started
 
@@ -215,11 +267,14 @@ convention and the currently supported keys are documented in
 
 The only key is `DB_DIR` — the directory the local store writes
 `dealora.json` into (defaults to `packages/db/src/data`, which is
-git-ignored). Phases 1-8 need no credential: passwords are hashed with
+git-ignored). Phases 1-11 need no credential: passwords are hashed with
 scrypt, goal parsing, plan compilation, account deduplication, research
-normalization, evidence conversion and qualification scoring are deterministic
-and take no model provider, and no secret is ever hardcoded or read at module
-scope.
+normalization, evidence conversion, qualification scoring, draft rendering and
+approval decisions are deterministic and take no model provider, and no secret is
+ever hardcoded or read at module scope. Phase 11 ships a **sandbox** outbound
+provider that performs no network I/O; registering a real provider is an explicit
+deployment decision whose keys must be documented here in the same commit that
+introduces them.
 
 ## License
 

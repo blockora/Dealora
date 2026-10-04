@@ -61,14 +61,19 @@ silently skipped by both `tsc -b` and the typecheck gate.
 | -------- | -------- | ------------------------------------------------------------------------------------------------ |
 | `DB_DIR` | No       | Directory the local store writes `dealora.json` into. Defaults to `packages/db/src/data` (git-ignored). |
 
+Phases 2-11 add no keys. The table is intentionally short: see the phase notes
+above for why the Personalization, Approval and Outbound engines all run
+credential-free.
+
 Phase 1 needs no credential: passwords are hashed with scrypt and a per-user
 salt, sessions are opaque random tokens, and the test suite runs without any
 secret. Add new keys to this table in the same commit that introduces them.
 
-Phases 1-8 add no further keys and require no LLM provider key: the Business
+Phases 1-11 add no further keys and require no LLM provider key: the Business
 Brain, the Revenue Goal Engine, the Revenue Plan Compiler, the Account &
-Prospect Input layer, the Research Engine, the Evidence System and the
-Qualification Engine are deterministic data layers. The Research Engine ships
+Prospect Input layer, the Research Engine, the Evidence System, the
+Qualification Engine, the Personalization Engine, the Approval Engine and the
+Outbound Engine are deterministic data layers. The Research Engine ships
 with one permitted provider — the workspace's own account record — so no
 external source credential is configured or read; registering an authorized API
 or a permitted public source is an explicit deployment decision and its key must
@@ -76,7 +81,20 @@ be documented here in the same commit that introduces it. The Evidence System
 adds no key of its own: it only cites sources the Research Engine already holds.
 The Qualification Engine adds no key either: it scores from the Business Brain
 ICP, a Revenue Goal window and the evidence already stored, and calls no model
-provider.
+provider. The Personalization Engine renders deterministically from stored
+records and calls nothing. The Approval Engine adds no key: a decision is
+recorded from the session and the server's clock.
+
+The Outbound Engine is where a credential would first appear, and it is
+deliberately not there yet. It ships **one** provider, `sandbox_email`, which
+performs no network I/O and records what it accepted — so no outbound credential
+is configured, read or required, and the test suite runs without any secret.
+Registering a real provider is an explicit deployment decision: pass it to
+`createDefaultHandlers({ outboundProviders: [...] })`, implement the narrow
+`OutboundProvider` interface, and **document its keys in this table in the same
+commit that introduces it**. The send boundary does not change when a provider is
+substituted, and no provider may ever be given an approval record, a workspace
+id or anything else that would let it skip a human decision.
 
 ## Quality gates
 
@@ -92,6 +110,29 @@ run `bun run check`, and confirm for non-trivial work:
   platform restriction bypass.
 - **Documentation** — update docs/ADRs when architecture or behavior changes.
   Never document functionality that does not exist.
+
+### Boundaries that later phases must not cross
+
+Phases 9-11 established a chain whose whole value is that each link is
+verifiable. If you extend it, these properties have to keep holding, and a test
+has to say so:
+
+- **A draft is a document, not an action.** Generating content never authorizes
+  content, and creating an approval creates no outbound action.
+- **An approval is a permission, never a trigger.** Only an explicit, in-date
+  human decision about one exact immutable draft version authorizes anything —
+  never a score, a threshold, a timer or silence.
+- **The consumer re-derives authorization, it does not ask the writer.** Phase 11
+  reads the persisted approval rows itself. A new consumer must do the same
+  rather than calling Phase 10 and believing it.
+- **A failure is never a delivery.** Any new state that means "it went out" must
+  be reachable from exactly one place, on a real confirmation, and the schema
+  should constrain the timestamp so a failure cannot be mistaken for a success.
+- **No client field describes the outcome.** Identity, provider, status, recipient
+  and provider results are server-derived. If a new route accepts one of them in
+  a body, it is a defect.
+- **No mass surface.** One channel, no scheduler, no queue, no retry loop, no
+  campaign or bulk concept. If a change adds one, it needs a new ADR.
 
 ## Commit conventions
 
