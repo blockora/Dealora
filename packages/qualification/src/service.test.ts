@@ -942,6 +942,81 @@ describe("qualification determinism and auditability", () => {
     expect(one.score).toBe(100);
   });
 
+  it("quotes the same observation whatever order the records arrive in", () => {
+    const store = seed();
+    const { owner, workspaceId, account, icp, goal } = scenario(store, {
+      email: "permutation@example.com",
+      workspaceName: "Permutation Co",
+    });
+    seedCompleteEvidence(store, workspaceId, owner.id, account.id);
+    const claims = store.listAccountClaims(workspaceId, owner.id, { accountId: account.id });
+    const evidence = store.listEvidence(workspaceId, owner.id, { accountId: account.id });
+    if (!isOk(claims) || !isOk(evidence)) throw new Error("fixture read failed");
+
+    const evaluate = (ordered: { claims: AccountClaim[]; evidence: EvidenceRecord[] }) =>
+      evaluateQualification({
+        accountId: account.id,
+        icp: icp as QualificationIcpSnapshot,
+        goal,
+        claims: ordered.claims,
+        evidence: ordered.evidence,
+      });
+
+    // `listAccountClaims` breaks equal creation timestamps by id and ids are
+    // random, so the order it returns is an artifact of insertion rather than a
+    // property of the evidence. Re-ordering the very same records must not move
+    // a single byte of the evaluation, including which observation is quoted.
+    const forward = evaluate({ claims: claims.value, evidence: evidence.value });
+    const reversed = evaluate({
+      claims: [...claims.value].reverse(),
+      evidence: [...evidence.value].reverse(),
+    });
+    const rotated = evaluate({
+      claims: [...claims.value.slice(2), ...claims.value.slice(0, 2)],
+      evidence: [...evidence.value.slice(3), ...evidence.value.slice(0, 3)],
+    });
+
+    expect(JSON.stringify(reversed)).toBe(JSON.stringify(forward));
+    expect(JSON.stringify(rotated)).toBe(JSON.stringify(forward));
+    // And it is the evaluation's content, not an accident: the account still
+    // resolves to the same score from the same citations.
+    expect(forward.score).toBe(100);
+    expect(forward.state).toBe("qualified");
+  });
+
+  it("stays identical across independently seeded workspaces holding the same facts", () => {
+    const build = () => {
+      const store = seed();
+      const { owner, workspaceId, account, icp, goal } = scenario(store, {
+        email: "crossworld@example.com",
+        workspaceName: "Cross World Co",
+      });
+      seedCompleteEvidence(store, workspaceId, owner.id, account.id);
+      const claims = store.listAccountClaims(workspaceId, owner.id, { accountId: account.id });
+      const evidence = store.listEvidence(workspaceId, owner.id, { accountId: account.id });
+      if (!isOk(claims) || !isOk(evidence)) throw new Error("fixture read failed");
+      return evaluateQualification({
+        accountId: account.id,
+        icp: icp as QualificationIcpSnapshot,
+        goal,
+        claims: claims.value,
+        evidence: evidence.value,
+      });
+    };
+
+    // Each world mints its own random ids, so its claims come back in its own
+    // order. Everything the engine quotes must be the same in all of them.
+    const first = build();
+    for (let world = 0; world < 6; world += 1) {
+      const other = build();
+      // Only the ids are allowed to differ between two worlds holding the same
+      // facts, and those are compared by count for exactly that reason.
+      expect(JSON.stringify(other).replace(/"[0-9a-f-]{36}"/g, '"id"')).toBe(
+        JSON.stringify(first).replace(/"[0-9a-f-]{36}"/g, '"id"'),
+      );
+    }
+  });
+
   it("orders its references identically every run", () => {
     const store = seed();
     const { owner, workspaceId, account, icp, goal, planId } = scenario(store, {

@@ -105,6 +105,40 @@ function weakestBand(bands: readonly (ResearchConfidence | null)[]): ResearchCon
   return weakest;
 }
 
+/**
+ * A fixed order for the one observation a criterion quotes.
+ *
+ * The evaluator has to return the same answer from the same *records*,
+ * whatever order storage happens to hand them over in. `listAccountClaims`
+ * breaks equal creation timestamps by id and ids are random, so a claim's
+ * position in that array is an artifact of insertion rather than a property of
+ * the evidence: two workspaces holding identical findings can receive them in
+ * different orders, and the same workspace rebuilt from the same inputs can
+ * receive them differently on the next run. Sorting by id would only make that
+ * artifact repeatable inside one store, so the order is taken from the claim's
+ * own content instead — category, then field, then value.
+ *
+ * Claims that agree on all three are indistinguishable in the result anyway:
+ * they quote the same value, contribute the same confidence bands and add
+ * their ids to an already-sorted set. So this is a total order over everything
+ * the stored result can actually show, which is what makes a score
+ * re-derivable from the records it was taken from.
+ */
+function byQuotedContent(a: ClaimReading, b: ClaimReading): number {
+  // Compared one field at a time rather than as a joined string, so no
+  // separator can ever be mistaken for part of a category or a value.
+  return (
+    compareText(a.claim.category, b.claim.category) ||
+    compareText(a.claim.field, b.claim.field) ||
+    compareText(a.claim.value, b.claim.value)
+  );
+}
+
+/** Two strings in a fixed order, so no comparison is ever left undecided. */
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 /** A stable order for reference lists, so two runs serialize identically. */
 function sortedIds(ids: Iterable<EntityId>): EntityId[] {
   return [...new Set(ids)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
@@ -244,10 +278,13 @@ function evaluateTerms(
   icp: QualificationIcpSnapshot,
   readings: readonly ClaimReading[],
 ): CriterionDraft {
+  // Sorted first, so the claim quoted and the reasons built from the list are
+  // properties of the evidence rather than of the order it arrived in.
+  const ordered = [...readings].sort(byQuotedContent);
   const terms = icpTerms(icp, rule.icpList ?? "industries");
 
   if (rule.kind === "term_absent") {
-    const readable = readings.filter(
+    const readable = ordered.filter(
       (reading) =>
         isReadable(reading) && (reading.support.length > 0 || reading.conflict.length > 0),
     );
@@ -344,7 +381,7 @@ function evaluateTerms(
   // fiat.
   let found: Observation = { kind: "absent" };
   for (const key of rule.claimFields) {
-    for (const candidate of readings) {
+    for (const candidate of ordered) {
       if (fieldKey(candidate.claim.category, candidate.claim.field) !== key) continue;
       const observation = observe(candidate);
       if (observation.kind === "absent") continue;
@@ -433,12 +470,14 @@ function evaluateCategories(
   goal: QualificationGoalSnapshot | null,
   readings: readonly ClaimReading[],
 ): CriterionDraft {
-  const relevant = readings.filter(
-    (reading) =>
-      isReadable(reading) &&
-      rule.categories.includes(reading.claim.category) &&
-      (reading.support.length > 0 || reading.conflict.length > 0),
-  );
+  const relevant = [...readings]
+    .sort(byQuotedContent)
+    .filter(
+      (reading) =>
+        isReadable(reading) &&
+        rule.categories.includes(reading.claim.category) &&
+        (reading.support.length > 0 || reading.conflict.length > 0),
+    );
   const allEvidence = relevant.flatMap((reading) => [...reading.support, ...reading.conflict]);
   const allIds = allEvidence.map((record) => record.id);
   const allClaims = relevant.map((reading) => reading.claim.id);
