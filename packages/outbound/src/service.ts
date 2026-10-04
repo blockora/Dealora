@@ -272,6 +272,17 @@ export class OutboundService {
 
     const existing = this.repo.findOutboundActionByApproval(action.approvalId, userId);
     if (!existing.ok) return err(fromStorage(existing.error.code, "outbound action unavailable"));
+    // The action this send is about, and the action the approval already points
+    // at, must be the same record. Storage enforces one action per approval, so
+    // they always are — and stating the invariant here means a by-approval lookup
+    // can never quietly stand in for the action that was fetched and authorized.
+    if (existing.value !== null && existing.value.id !== action.id) {
+      return err(
+        outboundError("CONFLICT", "this approval is already bound to a different outbound action", [
+          { field: "approvalId", message: "one approval authorizes exactly one action" },
+        ]),
+      );
+    }
 
     const now = this.clock();
     const authorized = authorizesSend({
@@ -283,7 +294,7 @@ export class OutboundService {
         workspaceId: draft.value.workspaceId,
         version: draft.value.version,
       },
-      existing: existing.value,
+      existing: action,
       now,
     });
     if (!authorized.ok) {
@@ -293,9 +304,6 @@ export class OutboundService {
         ]),
       );
     }
-    if (existing.value === null) {
-      return err(outboundError("NOT_FOUND", "outbound action not found"));
-    }
 
     // Ownership of the recipient, re-checked: the contact must still be this
     // workspace's, still active, and still holding the address the action names.
@@ -304,7 +312,7 @@ export class OutboundService {
     }
     const contact = this.requireContact(workspaceId, userId, draft.value.contactId);
     if (!contact.ok) return contact;
-    if (contact.value.id !== existing.value.contactId) {
+    if (contact.value.id !== action.contactId) {
       return err(
         outboundError("CONFLICT", "the recipient changed since this action was staged", [
           { field: "contactId", message: "the staged recipient is no longer the draft's" },
@@ -318,7 +326,7 @@ export class OutboundService {
         ]),
       );
     }
-    if (contact.value.email !== existing.value.recipientEmail) {
+    if (contact.value.email !== action.recipientEmail) {
       return err(
         outboundError("CONFLICT", "the recipient's address changed since this action was staged", [
           {
@@ -328,7 +336,7 @@ export class OutboundService {
         ]),
       );
     }
-    if (!isDeliverableAddress(existing.value.recipientEmail)) {
+    if (!isDeliverableAddress(action.recipientEmail)) {
       return err(
         outboundError("VALIDATION_ERROR", "the recipient address is not deliverable", [
           { field: "recipientEmail", message: "a send needs a valid recipient address" },
@@ -338,12 +346,12 @@ export class OutboundService {
 
     // Opt-out protection, checked before the provider is resolved and therefore
     // long before it is called.
-    const suppressed = this.repo.isSuppressed(workspaceId, userId, existing.value.recipientEmail);
+    const suppressed = this.repo.isSuppressed(workspaceId, userId, action.recipientEmail);
     if (!suppressed.ok)
       return err(fromStorage(suppressed.error.code, "suppression list unavailable"));
     if (suppressed.value) {
       const recorded = this.repo.recordOutboundFailure({
-        id: existing.value.id,
+        id: action.id,
         userId,
         provider: "none",
         failureCode: "suppressed",
@@ -351,13 +359,7 @@ export class OutboundService {
         failedAt: now.toISOString(),
       });
       if (recorded.ok) {
-        this.recordEvent(
-          workspaceId,
-          userId,
-          existing.value.id,
-          "failed",
-          "suppressed before send",
-        );
+        this.recordEvent(workspaceId, userId, action.id, "failed", "suppressed before send");
       }
       return err(
         outboundError("SUPPRESSED", "the recipient has opted out of being contacted", [
@@ -367,41 +369,33 @@ export class OutboundService {
     }
 
     // A configured provider, or nothing happens.
-    const provider = this.providers.providerFor(existing.value.channel);
+    const provider = this.providers.providerFor(action.channel);
     if (provider === null) {
       return err(
-        outboundError(
-          "PROVIDER_UNAVAILABLE",
-          `no provider is configured for ${existing.value.channel}`,
-          [{ field: "provider", message: "configure a provider before sending" }],
-        ),
+        outboundError("PROVIDER_UNAVAILABLE", `no provider is configured for ${action.channel}`, [
+          { field: "provider", message: "configure a provider before sending" },
+        ]),
       );
     }
 
     // Mark the attempt *before* calling out, so a process that dies mid-call
     // leaves `sending` behind rather than a `ready` action that looks unsent.
     const attempted = this.repo.recordOutboundAttempt({
-      id: existing.value.id,
+      id: action.id,
       userId,
       provider: provider.name,
       attemptedAt: now.toISOString(),
     });
     if (!attempted.ok)
       return err(fromStorage(attempted.error.code, "the send could not be started"));
-    this.recordEvent(
-      workspaceId,
-      userId,
-      existing.value.id,
-      "send_attempted",
-      `provider ${provider.name}`,
-    );
+    this.recordEvent(workspaceId, userId, action.id, "send_attempted", `provider ${provider.name}`);
 
     // --- the provider call, inside a guard that cannot mark anything sent ----
     let outcome: ProviderOutcome;
     try {
       outcome = await this.callProvider(provider, {
-        idempotencyKey: idempotencyKey(existing.value.id),
-        to: existing.value.recipientEmail,
+        idempotencyKey: idempotencyKey(action.id),
+        to: action.recipientEmail,
         subject: draft.value.subject,
         body: draft.value.body,
       });
@@ -416,7 +410,7 @@ export class OutboundService {
 
     if (outcome.accepted) {
       const sent = this.repo.confirmOutboundSent({
-        id: existing.value.id,
+        id: action.id,
         userId,
         provider: provider.name,
         // The provider's own reference, or `null`. A provider that confirmed
@@ -429,7 +423,7 @@ export class OutboundService {
       this.recordEvent(
         workspaceId,
         userId,
-        existing.value.id,
+        action.id,
         "sent",
         outcome.providerReference === null
           ? "confirmed by provider"
@@ -439,7 +433,7 @@ export class OutboundService {
         action: sent.value,
         provider: provider.name,
         delivered: true,
-        events: this.history(existing.value.id, userId),
+        events: this.history(action.id, userId),
       });
     }
 
@@ -447,7 +441,7 @@ export class OutboundService {
     // carries a `sentAt`: the schema constrains that column to `sent` actions.
     const code = outcome.failureCode ?? "provider_rejected";
     const failed = this.repo.recordOutboundFailure({
-      id: existing.value.id,
+      id: action.id,
       userId,
       provider: provider.name,
       failureCode: code,
@@ -455,13 +449,7 @@ export class OutboundService {
       failedAt: this.clock().toISOString(),
     });
     if (!failed.ok) return err(fromStorage(failed.error.code, "the failure could not be recorded"));
-    this.recordEvent(
-      workspaceId,
-      userId,
-      existing.value.id,
-      "failed",
-      `${code}: ${outcome.message}`,
-    );
+    this.recordEvent(workspaceId, userId, action.id, "failed", `${code}: ${outcome.message}`);
     return err(
       outboundError("PROVIDER_FAILED", "the provider did not accept the message", [
         { field: "status", message: `${code}: ${outcome.message}` },

@@ -2728,9 +2728,19 @@ export class Store {
    * An action is created only once every precondition already holds: the caller
    * is a member of the workspace, the referenced draft version exists **in this
    * workspace**, the approval record exists **in this workspace and is bound to
-   * that same draft version**, and the contact exists here too. The approval's
-   * `status` is deliberately *not* checked here — deciding whether an approval
-   * currently authorizes a send is the service's question, re-asked
+   * that same draft version**, the contact exists here too, and **no action has
+   * already been raised for that approval**.
+   *
+   * That last check is the storage half of an invariant the send path depends on
+   * entirely: *one approval authorizes at most one message*. The service already
+   * returns the existing action instead of creating a second one, but an
+   * invariant that only one caller respects is a convention, not a guarantee —
+   * exactly the reasoning `createApprovalRequest` and `decideApproval` already
+   * apply. Enforcing it here means a second action for the same approval cannot
+   * exist at all, so duplicate-send protection cannot be bypassed by any path.
+   *
+   * The approval's `status` is deliberately *not* checked here — deciding whether
+   * an approval currently authorizes a send is the service's question, re-asked
    * independently at send time, and duplicating the rule here would give one
    * answer in two places.
    *
@@ -2762,6 +2772,19 @@ export class Store {
   }): Result<OutboundAction, StorageError> {
     const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
     if (!auth.ok) return auth;
+
+    // One approval, one action. Refused rather than silently deduplicated: the
+    // caller asked for a new action, and the honest answer is that the approval
+    // has already been spent on one.
+    const existingForApproval = this.rows("outboundActions").find(
+      (row) => row.approvalId === input.action.approvalId,
+    );
+    if (existingForApproval) {
+      return {
+        ok: false,
+        error: toError("CONFLICT", "this approval already has an outbound action"),
+      };
+    }
 
     const draft = this.findById("personalizedDrafts", input.action.draftId);
     if (!draft || draft.workspaceId !== input.workspaceId) {

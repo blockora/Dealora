@@ -2214,3 +2214,456 @@ describe("qualification evaluations", () => {
     if (isErr(absent)) expect(absent.error.code).toBe("NOT_FOUND");
   });
 });
+
+/**
+ * Storage-level guards for the two phases whose security claims rest on this
+ * layer.
+ *
+ * Every other test of approvals and outbound goes through a service. That proves
+ * the services behave; it does not prove that the *storage* refuses what the
+ * services rely on it refusing. These tests close that gap, because the storage
+ * guards are the root of several load-bearing claims:
+ *
+ * - no path can create an already-approved approval request;
+ * - a decision cannot be taken twice, and a decided request cannot be re-decided;
+ * - one approval raises at most one outbound action;
+ * - nothing but a confirmation reaches `sent`, and a failure never carries a
+ *   delivery timestamp;
+ * - a foreign workspace's draft, approval and contact are all refused.
+ */
+describe("approval requests and outbound actions", () => {
+  interface Fixture {
+    store: Store;
+    ownerId: string;
+    workspaceId: string;
+    accountId: string;
+    contactId: string;
+    draftId: string;
+    draftVersion: number;
+    approvalId: string;
+  }
+
+  /** A workspace with a draft, plus a pending approval request for it. */
+  function seeded(name = "Acme", email = "owner@example.com"): Fixture {
+    const store = seed();
+    const owner = makeOwner(store, email);
+    const workspaceId = makeWorkspace(store, owner.id, name);
+    const account = store.createAccount({
+      workspaceId,
+      createdBy: owner.id,
+      account: {
+        name: "Northwind",
+        website: null,
+        domain: "northwind.example",
+        industry: "SaaS",
+        companySize: "50-200",
+        geography: "Germany",
+        description: null,
+        source: "manual",
+        sourceReference: null,
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(account)) throw new Error("seed account creation failed");
+    const contact = store.createContact({
+      workspaceId,
+      createdBy: owner.id,
+      contact: {
+        accountId: account.value.id,
+        firstName: "Ada",
+        lastName: "Lovelace",
+        fullName: "Ada Lovelace",
+        jobTitle: "VP Support",
+        email: "ada@northwind.example",
+        phone: null,
+        profileUrl: null,
+        source: "manual",
+        sourceReference: null,
+        status: "active",
+      },
+    });
+    if (!isOk(contact)) throw new Error("seed contact creation failed");
+    const draft = store.createDraft({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.value.id,
+      draft: {
+        contactId: contact.value.id,
+        rendererVersion: "deterministic-1.0.0",
+        contextDigest: "fnv1a-seed",
+        qualificationId: null,
+        offerId: null,
+        subject: "Support Automation for Northwind",
+        body: "Hi Ada,\n\nAbout Support Automation: we build support automation.",
+        personalizationPoints: [],
+        approvedClaimIds: [],
+        warnings: [],
+      },
+    });
+    if (!isOk(draft)) throw new Error("seed draft creation failed");
+    const approval = store.createApprovalRequest({
+      workspaceId,
+      createdBy: owner.id,
+      approval: {
+        actionKind: "send_message",
+        riskLevel: "level_2_external_action",
+        draftId: draft.value.id,
+        draftVersion: draft.value.version,
+        previewSubject: draft.value.subject,
+        previewDigest: "fnv1a-preview",
+        expiresAt: null,
+      },
+    });
+    if (!isOk(approval)) throw new Error("seed approval creation failed");
+    return {
+      store,
+      ownerId: owner.id,
+      workspaceId,
+      accountId: account.value.id,
+      contactId: contact.value.id,
+      draftId: draft.value.id,
+      draftVersion: draft.value.version,
+      approvalId: approval.value.id,
+    };
+  }
+
+  /** The outbound action payload for an approval, as the service builds it. */
+  function actionFor(fixture: Fixture, approvalId = fixture.approvalId) {
+    return {
+      channel: "email" as const,
+      draftId: fixture.draftId,
+      draftVersion: fixture.draftVersion,
+      draftDigest: "fnv1a-draft",
+      approvalId,
+      contactId: fixture.contactId,
+      recipientEmail: "ada@northwind.example",
+    };
+  }
+
+  it("creates an action only in a state no caller supplied", () => {
+    const fixture = seeded();
+    const created = fixture.store.createOutboundAction({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      action: actionFor(fixture),
+    });
+    expect(isOk(created)).toBe(true);
+    if (!isOk(created)) return;
+    // Everything the provider will later own is written blank, and `sent` is not
+    // reachable from a creation call at all.
+    expect(created.value.status).toBe("ready");
+    expect(created.value.provider).toBeNull();
+    expect(created.value.attemptCount).toBe(0);
+    expect(created.value.providerReference).toBeNull();
+    expect(created.value.failureCode).toBeNull();
+    expect(created.value.sentAt).toBeNull();
+    expect(created.value.completedAt).toBeNull();
+  });
+
+  it("raises at most one action per approval, at the storage layer", () => {
+    const fixture = seeded();
+    const first = fixture.store.createOutboundAction({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      action: actionFor(fixture),
+    });
+    expect(isOk(first)).toBe(true);
+
+    // The duplicate-send guarantee does not rest on one caller checking first.
+    const second = fixture.store.createOutboundAction({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      action: actionFor(fixture),
+    });
+    expect(isErr(second)).toBe(true);
+    if (!isErr(second)) return;
+    expect(second.error.code).toBe("CONFLICT");
+
+    const listed = fixture.store.listOutboundActions(fixture.workspaceId, fixture.ownerId);
+    expect(isOk(listed)).toBe(true);
+    if (!isOk(listed)) return;
+    expect(listed.value).toHaveLength(1);
+  });
+
+  it("refuses an action for another workspace's draft, approval or contact", () => {
+    const a = seeded("Acme", "a@example.com");
+    const b = seeded("Globex", "b@example.com");
+
+    // Tenant B naming tenant A's draft.
+    const foreignDraft = b.store.createOutboundAction({
+      workspaceId: b.workspaceId,
+      createdBy: b.ownerId,
+      action: { ...actionFor(b), draftId: a.draftId },
+    });
+    expect(isErr(foreignDraft)).toBe(true);
+
+    // Tenant B naming tenant A's approval.
+    const foreignApproval = b.store.createOutboundAction({
+      workspaceId: b.workspaceId,
+      createdBy: b.ownerId,
+      action: { ...actionFor(b), approvalId: a.approvalId },
+    });
+    expect(isErr(foreignApproval)).toBe(true);
+
+    // Tenant B naming tenant A's contact.
+    const foreignContact = b.store.createOutboundAction({
+      workspaceId: b.workspaceId,
+      createdBy: b.ownerId,
+      action: { ...actionFor(b), contactId: a.contactId },
+    });
+    expect(isErr(foreignContact)).toBe(true);
+
+    // And nothing was written for any of them.
+    const listed = b.store.listOutboundActions(b.workspaceId, b.ownerId);
+    expect(isOk(listed)).toBe(true);
+    if (!isOk(listed)) return;
+    expect(listed.value).toHaveLength(0);
+  });
+
+  it("refuses an action whose approval covers a different draft version", () => {
+    const fixture = seeded();
+    const created = fixture.store.createOutboundAction({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      action: actionFor(fixture),
+    });
+    if (!isOk(created)) return;
+
+    // A version the draft lineage never had.
+    const imaginary = fixture.store.createOutboundAction({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      action: {
+        ...actionFor(fixture),
+        draftVersion: 99,
+        approvalId: `${fixture.approvalId}-other`,
+      },
+    });
+    expect(isErr(imaginary)).toBe(true);
+  });
+
+  it("reaches `sent` only from a confirmation, and never from a failure", () => {
+    const fixture = seeded();
+    const created = fixture.store.createOutboundAction({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      action: actionFor(fixture),
+    });
+    if (!isOk(created)) return;
+    const id = created.value.id;
+    const at = toDateTime(new Date("2026-10-01T00:00:00.000Z"));
+
+    // A `ready` action cannot be confirmed out of order.
+    const early = fixture.store.confirmOutboundSent({
+      id,
+      userId: fixture.ownerId,
+      provider: "sandbox_email",
+      providerReference: "ref-1",
+      sentAt: at,
+    });
+    expect(isErr(early)).toBe(true);
+    if (!isErr(early)) return;
+    expect(early.error.code).toBe("CONFLICT");
+
+    // Open an attempt, then fail it.
+    const attempted = fixture.store.recordOutboundAttempt({
+      id,
+      userId: fixture.ownerId,
+      provider: "sandbox_email",
+      attemptedAt: at,
+    });
+    expect(isOk(attempted)).toBe(true);
+    if (!isOk(attempted)) return;
+    expect(attempted.value.status).toBe("sending");
+    expect(attempted.value.attemptCount).toBe(1);
+
+    const failed = fixture.store.recordOutboundFailure({
+      id,
+      userId: fixture.ownerId,
+      provider: "sandbox_email",
+      failureCode: "provider_unavailable",
+      failureMessage: "the provider is down",
+      failedAt: at,
+    });
+    expect(isOk(failed)).toBe(true);
+    if (!isOk(failed)) return;
+    // A failure is not a delivery, on every field that could imply one.
+    expect(failed.value.status).toBe("failed");
+    expect(failed.value.sentAt).toBeNull();
+    expect(failed.value.providerReference).toBeNull();
+    expect(failed.value.failureCode).toBe("provider_unavailable");
+
+    // Retry, then confirm. Only now is it sent.
+    const retried = fixture.store.recordOutboundAttempt({
+      id,
+      userId: fixture.ownerId,
+      provider: "sandbox_email",
+      attemptedAt: at,
+    });
+    expect(isOk(retried)).toBe(true);
+    if (!isOk(retried)) return;
+    expect(retried.value.attemptCount).toBe(2);
+
+    const sent = fixture.store.confirmOutboundSent({
+      id,
+      userId: fixture.ownerId,
+      provider: "sandbox_email",
+      providerReference: "ref-2",
+      sentAt: at,
+    });
+    expect(isOk(sent)).toBe(true);
+    if (!isOk(sent)) return;
+    expect(sent.value.status).toBe("sent");
+    expect(sent.value.sentAt).toBe(at);
+    expect(sent.value.providerReference).toBe("ref-2");
+
+    // A sent action is terminal: no further attempt, failure or cancellation.
+    for (const attempt of [
+      fixture.store.recordOutboundAttempt({
+        id,
+        userId: fixture.ownerId,
+        provider: "sandbox_email",
+        attemptedAt: at,
+      }),
+      fixture.store.recordOutboundFailure({
+        id,
+        userId: fixture.ownerId,
+        provider: "sandbox_email",
+        failureCode: "provider_unavailable",
+        failureMessage: "again",
+        failedAt: at,
+      }),
+      fixture.store.cancelOutboundAction(id, fixture.ownerId, "changed my mind", at),
+    ]) {
+      expect(isErr(attempt)).toBe(true);
+      if (!isErr(attempt)) return;
+      expect(attempt.error.code).toBe("CONFLICT");
+    }
+  });
+
+  it("records a pre-flight refusal without claiming a provider attempt", () => {
+    const fixture = seeded();
+    const created = fixture.store.createOutboundAction({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      action: actionFor(fixture),
+    });
+    if (!isOk(created)) return;
+    const id = created.value.id;
+    const at = toDateTime(new Date("2026-10-01T00:00:00.000Z"));
+
+    // A suppression is found before the provider is resolved, so the action is
+    // still `ready`: no provider handled it and no attempt was spent.
+    const refused = fixture.store.recordOutboundFailure({
+      id,
+      userId: fixture.ownerId,
+      provider: "none",
+      failureCode: "suppressed",
+      failureMessage: "the recipient has opted out",
+      failedAt: at,
+    });
+    expect(isOk(refused)).toBe(true);
+    if (!isOk(refused)) return;
+    expect(refused.value.status).toBe("failed");
+    expect(refused.value.failureCode).toBe("suppressed");
+    expect(refused.value.provider).toBeNull();
+    expect(refused.value.attemptCount).toBe(0);
+    expect(refused.value.attemptedAt).toBeNull();
+    expect(refused.value.sentAt).toBeNull();
+  });
+
+  it("refuses a second decision, and refuses a decided request outright", () => {
+    const fixture = seeded();
+    const at = toDateTime(new Date("2026-10-01T00:00:00.000Z"));
+
+    const decided = fixture.store.decideApproval({
+      id: fixture.approvalId,
+      userId: fixture.ownerId,
+      decision: "approved",
+      reason: null,
+      decidedAt: at,
+    });
+    expect(isOk(decided)).toBe(true);
+    if (!isOk(decided)) return;
+    expect(decided.value.status).toBe("approved");
+    expect(decided.value.decidedBy).toBe(fixture.ownerId);
+
+    // A second decision is refused rather than overwriting the first.
+    const again = fixture.store.decideApproval({
+      id: fixture.approvalId,
+      userId: fixture.ownerId,
+      decision: "rejected",
+      reason: "changed my mind",
+      decidedAt: at,
+    });
+    expect(isErr(again)).toBe(true);
+    if (!isErr(again)) return;
+    expect(again.error.code).toBe("CONFLICT");
+
+    // And a decided request cannot be closed like a pending one either.
+    const closed = fixture.store.closeApproval({
+      id: fixture.approvalId,
+      userId: fixture.ownerId,
+      status: "cancelled",
+      reason: null,
+      decidedAt: at,
+    });
+    expect(isErr(closed)).toBe(true);
+    if (!isErr(closed)) return;
+    expect(closed.error.code).toBe("CONFLICT");
+
+    // The first decision stands.
+    const stored = fixture.store.getApprovalRequest(fixture.approvalId, fixture.ownerId);
+    expect(isOk(stored)).toBe(true);
+    if (!isOk(stored)) return;
+    expect(stored.value.status).toBe("approved");
+    expect(stored.value.decision).toBe("approved");
+  });
+
+  it("normalizes suppressions, keeps them unique per address, and scopes them per workspace", () => {
+    const fixture = seeded();
+    const first = fixture.store.createOutboundSuppression({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      suppression: { email: "Ada@Northwind.Example", reason: "asked us to stop" },
+    });
+    expect(isOk(first)).toBe(true);
+    if (!isOk(first)) return;
+    // An opt-out is about a person, not about the casing they typed.
+    expect(first.value.email).toBe("ada@northwind.example");
+    expect(first.value.createdBy).toBe(fixture.ownerId);
+
+    // The same address twice is one record, so the list stays auditable.
+    const again = fixture.store.createOutboundSuppression({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      suppression: { email: "ada@northwind.example", reason: "asked us to stop" },
+    });
+    expect(isOk(again)).toBe(true);
+    if (!isOk(again)) return;
+    expect(again.value.id).toBe(first.value.id);
+
+    const listed = fixture.store.listOutboundSuppressions(fixture.workspaceId, fixture.ownerId);
+    expect(isOk(listed)).toBe(true);
+    if (!isOk(listed)) return;
+    expect(listed.value).toHaveLength(1);
+
+    // One tenant's opt-out never silences another's sends.
+    const other = seeded("Globex", "b@example.com");
+    const elsewhere = other.store.isSuppressed(
+      other.workspaceId,
+      other.ownerId,
+      "ada@northwind.example",
+    );
+    expect(isOk(elsewhere)).toBe(true);
+    if (!isOk(elsewhere)) return;
+    expect(elsewhere.value).toBe(false);
+
+    // And a non-member cannot read the list at all.
+    const denied = fixture.store.listOutboundSuppressions(fixture.workspaceId, other.ownerId);
+    expect(isErr(denied)).toBe(true);
+    if (!isErr(denied)) return;
+    expect(denied.error.code).toBe("UNAUTHORIZED");
+  });
+});

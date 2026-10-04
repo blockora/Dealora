@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Store, emptyState } from "@dealora/db";
+import { isOk } from "@dealora/core";
 import type { PersonalizedDraft } from "@dealora/db";
 
 import {
@@ -821,5 +822,66 @@ describe("OutboundService", () => {
     for (const forbidden of ["execute", "dispatch", "autosend", "schedule", "start"]) {
       expect(surface.some((name) => name === forbidden)).toBe(false);
     }
+  });
+});
+
+describe("OutboundService concurrency", () => {
+  it("admits exactly one of two simultaneous sends, and records one attempt", async () => {
+    const fixture = seeded();
+    approve(fixture);
+    const staged = fixture.service.stageOutbound(
+      fixture.workspaceId,
+      fixture.userId,
+      fixture.draft.id,
+    );
+    if (!staged.ok) throw new Error("staging failed");
+
+    // Two sends started together, as a double-clicked button or a retried request
+    // would produce. Exactly one may reach the provider.
+    const [first, second] = await Promise.all([
+      fixture.service.sendOutbound(fixture.workspaceId, fixture.userId, staged.value.id),
+      fixture.service.sendOutbound(fixture.workspaceId, fixture.userId, staged.value.id),
+    ]);
+
+    const delivered = [first, second].filter((r) => r.ok);
+    const refused = [first, second].filter((r) => !r.ok);
+    expect(delivered).toHaveLength(1);
+    expect(refused).toHaveLength(1);
+    const refusal = refused[0];
+    if (refusal === undefined || refusal.ok) throw new Error("expected one refusal");
+    expect(refusal.error.code).toBe("CONFLICT");
+
+    // One attempt was recorded and one message was accepted — not two.
+    const stored = fixture.service.getOutbound(staged.value.id, fixture.userId);
+    if (!stored.ok) throw new Error("read failed");
+    expect(stored.value.status).toBe("sent");
+    expect(stored.value.attemptCount).toBe(1);
+    expect(fixture.provider.callCount()).toBe(1);
+    expect(fixture.provider.deliveries()).toHaveLength(1);
+  });
+
+  it("refuses a second staging of one approval under concurrent requests", async () => {
+    const fixture = seeded();
+    approve(fixture);
+
+    const results = await Promise.all([
+      Promise.resolve(
+        fixture.service.stageOutbound(fixture.workspaceId, fixture.userId, fixture.draft.id),
+      ),
+      Promise.resolve(
+        fixture.service.stageOutbound(fixture.workspaceId, fixture.userId, fixture.draft.id),
+      ),
+    ]);
+
+    // Both calls are answered, and they name the same action: staging is
+    // idempotent, so a retry cannot produce a second sendable record.
+    const ids = new Set(results.map((r) => (r.ok ? r.value.id : "refused")));
+    expect(ids.size).toBe(1);
+    expect(results.every((r) => r.ok)).toBe(true);
+
+    const listed = fixture.store.listOutboundActions(fixture.workspaceId, fixture.userId);
+    expect(isOk(listed)).toBe(true);
+    if (!isOk(listed)) return;
+    expect(listed.value).toHaveLength(1);
   });
 });
