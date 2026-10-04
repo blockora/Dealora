@@ -22,6 +22,8 @@ import { SUPPORTED_RULE_VERSIONS } from "@dealora/qualification";
 import type { QualificationError, QualificationService } from "@dealora/qualification";
 import { SUPPORTED_RENDERER_VERSIONS } from "@dealora/personalization";
 import type { PersonalizationError, PersonalizationService } from "@dealora/personalization";
+import { APPROVAL_STATUSES } from "@dealora/approval";
+import type { ApprovalError, ApprovalService } from "@dealora/approval";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -220,6 +222,47 @@ function fromPersonalizationError(error: PersonalizationError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `ApprovalError` into the safe API error envelope.
+ *
+ * The mapping is total and written out case by case, never asserted: a domain
+ * code that this table did not list could not be given an `ApiErrorCode`, and
+ * the cast that used to stand here would have emitted a code the transport
+ * contract does not define.
+ *
+ * Four domain codes are all "this request is not decidable any more", and all
+ * four map to `CONFLICT` — a deadline passed, the previewed text moved, a
+ * request that was already decided, a request that was cancelled or expired.
+ * They stay distinguishable to the caller through their messages and details,
+ * which name the actual cause, because "you cannot decide this any more" and
+ * "the text you were shown has changed" call for different fixes.
+ *
+ * `UNAVAILABLE` is an internal condition and is never surfaced verbatim.
+ */
+function fromApprovalError(error: ApprovalError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+        return "VALIDATION_ERROR";
+      case "CONFLICT":
+      case "EXPIRED":
+      case "PREVIEW_MISMATCH":
+      case "INVALID_TRANSITION":
+        return "CONFLICT";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = error.details;
+  return mapped;
+}
+
 /** Parse a JSON body, tolerating already-parsed objects. */
 async function parseBody(req: RequestBody): Promise<Record<string, unknown> | ApiError> {
   const raw = req.body;
@@ -253,6 +296,7 @@ export interface HandlerDeps {
   evidence: EvidenceService;
   qualification: QualificationService;
   personalization: PersonalizationService;
+  approval: ApprovalService;
   resolveSession: SessionResolver;
 }
 
@@ -1753,6 +1797,182 @@ export function createHandlers(deps: HandlerDeps) {
       return Promise.resolve({ ok: true, value: ok(result.value) });
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 10 — Approval Engine
+  //
+  // These handlers create and record a persisted human decision. They decide
+  // nothing themselves and execute nothing: the identity is always the
+  // session's, and the only state a request is ever created in is `pending`.
+  //
+  // Nothing about the decision is accepted from a caller. An `approved`,
+  // `decidedBy`, `decidedAt`, `status` or `decision` field in a body is not
+  // read — the decision route takes exactly one field, the decision itself, and
+  // the reviewer is the authenticated user. A client cannot name its own
+  // approver, cannot backdate a decision, and cannot turn a request into an
+  // approval by asking twice.
+  //
+  // There is no execute route here. An approval authorizes a send; the send is
+  // Phase 11, and it re-verifies these records independently before it calls a
+  // provider.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Put one exact draft version up for a human decision.
+   *
+   * The draft and version come from the route. The request is bound to both,
+   * plus a digest of the exact content the reviewer is about to see, so
+   * "which version was approved?" is a stored answer rather than a
+   * reconstruction.
+   */
+  const createApprovalRequestHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const draftId = param(req, "draftId");
+      if (isApiError(draftId)) return { ok: false, error: draftId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      // Only the two lifecycle selectors are read. Everything that would
+      // constitute a decision is ignored in favour of the session.
+      const result = deps.approval.requestApproval(workspaceId, actor.userId, draftId, {
+        draftVersion: body.draftVersion,
+        expiresInDays: body.expiresInDays,
+      });
+      if (!result.ok) return { ok: false, error: fromApprovalError(result.error) };
+      return { ok: true, value: ok({ approval: result.value }) };
+    });
+
+  /**
+   * Record one explicit human decision.
+   *
+   * Exactly one field is read: the decision. The reviewer is the session's
+   * user, the instant is the server's clock, and a rejection or change request
+   * must say why — so "who approved this, and when?" is answerable from the
+   * stored record alone.
+   */
+  const decideApprovalRequestHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      // Only `decision` and `reason` are read. `decidedBy`, `decidedAt`,
+      // `status`, `approved` and `expiresAt` in a body are ignored: the
+      // reviewer and the instant are the server's to record.
+      const result = deps.approval.recordDecision(
+        workspaceId,
+        actor.userId,
+        id,
+        body.decision,
+        body.reason,
+      );
+      if (!result.ok) return { ok: false, error: fromApprovalError(result.error) };
+      return { ok: true, value: ok({ approval: result.value.request, event: result.value.event }) };
+    });
+
+  /** Withdraw a pending request. Terminal, and never a decision. */
+  const cancelApprovalRequestHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.approval.cancelApproval(workspaceId, actor.userId, id, body.reason);
+      if (!result.ok) return { ok: false, error: fromApprovalError(result.error) };
+      return { ok: true, value: ok({ approval: result.value }) };
+    });
+
+  /** One request, as stored. */
+  const getApprovalRequestHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.approval.getApprovalRequest(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromApprovalError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ approval: result.value }) });
+    });
+
+  /**
+   * What a reviewer sees: the request plus the exact content of the draft
+   * version it is bound to, including everything the renderer declined to state.
+   */
+  const previewApprovalRequestHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.approval.previewApproval(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromApprovalError(result.error) });
+      return Promise.resolve({ ok: true, value: ok(result.value) });
+    });
+
+  /** A workspace's requests, newest first, optionally narrowed. */
+  const listApprovalRequestsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+
+      const rawStatus = req.query.status;
+      let status: string | undefined;
+      if (typeof rawStatus === "string" && rawStatus !== "") {
+        if (!APPROVAL_STATUSES.includes(rawStatus as never)) {
+          return Promise.resolve({
+            ok: false,
+            error: {
+              code: "VALIDATION_ERROR" as const,
+              message: `status must be one of: ${APPROVAL_STATUSES.join(", ")}`,
+            },
+          });
+        }
+        status = rawStatus;
+      }
+      const draftId =
+        typeof req.query.draftId === "string" && req.query.draftId !== ""
+          ? req.query.draftId
+          : undefined;
+      const decidedBy =
+        typeof req.query.decidedBy === "string" && req.query.decidedBy !== ""
+          ? req.query.decidedBy
+          : undefined;
+
+      const result = deps.approval.listApprovals(workspaceId, actor.userId, {
+        status,
+        draftId,
+        decidedBy,
+      });
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromApprovalError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ approvals: result.value }) });
+    });
+
+  /**
+   * The whole audit trail for one request: who asked, who decided, what, when
+   * and why. Append-only, so it survives whatever happens to the request row.
+   */
+  const approvalHistoryHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.approval.approvalHistory(id, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromApprovalError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ history: result.value }) });
+    });
+
+  /** The policy this deployment enforces, readable before any request exists. */
+  const getApprovalPolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const result = deps.approval.describeApprovalPolicy(workspaceId, actor.userId);
+      if (!result.ok) return Promise.resolve({ ok: false, error: fromApprovalError(result.error) });
+      return Promise.resolve({ ok: true, value: ok(result.value) });
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -1834,6 +2054,14 @@ export function createHandlers(deps: HandlerDeps) {
     getPersonalizedDraftHandler,
     listPersonalizedDraftsHandler,
     getPersonalizedDraftEvidenceHandler,
+    createApprovalRequestHandler,
+    decideApprovalRequestHandler,
+    cancelApprovalRequestHandler,
+    getApprovalRequestHandler,
+    previewApprovalRequestHandler,
+    listApprovalRequestsHandler,
+    approvalHistoryHandler,
+    getApprovalPolicyHandler,
   };
 }
 

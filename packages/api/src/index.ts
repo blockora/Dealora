@@ -31,6 +31,20 @@ export type { Evidence, EvidenceError, EvidenceStatus, AccountClaim } from "@dea
 export type { DraftPersonalizationPoint } from "@dealora/db";
 
 /**
+ * The Approval domain's public surface, re-exported so API consumers can type
+ * an approval response without depending on the domain package directly.
+ */
+export type {
+  ApprovalDecision,
+  ApprovalPolicyView,
+  ApprovalPreview,
+  ApprovalRequest,
+  ApprovalRequestEvent,
+  ApprovalRiskLevel,
+  ApprovalStatus,
+} from "@dealora/approval";
+
+/**
  * The Qualification domain's public surface, re-exported so API consumers can
  * type a qualification response without depending on the domain package
  * directly.

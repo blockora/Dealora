@@ -20,6 +20,7 @@ import {
   toOfferSnapshot,
   toQualificationSnapshot,
 } from "@dealora/personalization";
+import { createApprovalService, toApprovalDraftSnapshot } from "@dealora/approval";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -286,6 +287,26 @@ export function createDefaultHandlers(options?: {
         },
       },
     ),
+    /**
+     * Approval reads exactly one thing from the rest of the system: the subject,
+     * body, warnings and version of a draft, so a reviewer is shown the precise
+     * text the decision will cover.
+     *
+     * Each read is authorized before it is used and returns `null` for a record
+     * that does not exist or belongs to another workspace, so a foreign draft is
+     * never revealed to exist. The boundary never sees the evidence behind a
+     * draft, never re-renders anything, and never touches a provider.
+     */
+    approval: createApprovalService(store as never, {
+      byId: (draftId, userId) => {
+        const found = store.getDraft(draftId, userId);
+        return found.ok ? toApprovalDraftSnapshot(found.value) : null;
+      },
+      latestVersion: (draftId, userId) => {
+        const found = store.getDraft(draftId, userId);
+        return found.ok ? toApprovalDraftSnapshot(found.value) : null;
+      },
+    }),
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());

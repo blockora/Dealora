@@ -28,6 +28,7 @@ import {
   toOfferSnapshot,
   toQualificationSnapshot,
 } from "@dealora/personalization";
+import { createApprovalService, toApprovalDraftSnapshot } from "@dealora/approval";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -59,6 +60,30 @@ function qualificationService(store: Store, clock?: () => Date) {
       const plan = store.getRevenuePlan(planId, userId);
       return plan.ok ? plan.value : null;
     }),
+    clock,
+  );
+}
+
+/**
+ * Wire the Approval service the way the production wiring does.
+ *
+ * The reader is the same narrow one `createDefaultHandlers` builds: a draft's
+ * subject, body, warnings and version. Route tests then exercise the real
+ * service rather than a stand-in.
+ */
+function approvalService(store: Store, clock?: () => Date) {
+  return createApprovalService(
+    store as never,
+    {
+      byId: (draftId, userId) => {
+        const found = store.getDraft(draftId, userId);
+        return found.ok ? toApprovalDraftSnapshot(found.value) : null;
+      },
+      latestVersion: (draftId, userId) => {
+        const found = store.getDraft(draftId, userId);
+        return found.ok ? toApprovalDraftSnapshot(found.value) : null;
+      },
+    },
     clock,
   );
 }
@@ -207,6 +232,7 @@ function fixture(options?: {
     evidence: createEvidenceService(store as never, options?.evidenceClock),
     qualification: qualificationService(store, options?.evidenceClock),
     personalization: personalizationService(store),
+    approval: approvalService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -685,6 +711,7 @@ describe("API Revenue Goal routes", () => {
       evidence: createEvidenceService(store as never),
       qualification: qualificationService(store),
       personalization: personalizationService(store),
+      approval: approvalService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1017,6 +1044,7 @@ describe("API Revenue Plan routes", () => {
       evidence: createEvidenceService(store as never),
       qualification: qualificationService(store),
       personalization: personalizationService(store),
+      approval: approvalService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1230,6 +1258,7 @@ describe("API Business Brain routes", () => {
       } as never),
       qualification: qualificationService(failingStore),
       personalization: personalizationService(failingStore),
+      approval: approvalService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1568,6 +1597,7 @@ describe("API Account & Contact routes", () => {
       evidence: createEvidenceService(store as never),
       qualification: qualificationService(store),
       personalization: personalizationService(store),
+      approval: approvalService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1873,6 +1903,7 @@ describe("API Research routes", () => {
       } as never),
       qualification: qualificationService(store),
       personalization: personalizationService(store),
+      approval: approvalService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -1922,6 +1953,7 @@ describe("API Research routes", () => {
       } as never),
       qualification: qualificationService(store),
       personalization: personalizationService(store),
+      approval: approvalService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3052,6 +3084,13 @@ describe("API Qualification routes", () => {
         } as never,
         { latest: () => null, byId: () => null },
         { byId: () => null, listActive: () => [] },
+      ),
+      approval: createApprovalService(
+        {
+          authorize: () => ({ ok: true as const, value: {} }),
+          listApprovalRequests: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as never,
+        { byId: () => null, latestVersion: () => null },
       ),
       resolveSession: () => ({ userId: "u1" }),
     });

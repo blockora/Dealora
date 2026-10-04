@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@dealora/account": "workspace:*",
+    "@dealora/approval": "workspace:*",
     "@dealora/auth": "workspace:*",
     "@dealora/brain": "workspace:*",
     "@dealora/core": "workspace:*",
