@@ -29,6 +29,14 @@ import {
   toQualificationSnapshot,
 } from "@dealora/personalization";
 import { createApprovalService, toApprovalDraftSnapshot } from "@dealora/approval";
+import {
+  ProviderRegistry,
+  SandboxEmailProvider,
+  createApprovalVerifier,
+  createContactReader,
+  createDraftReader,
+  createOutboundService,
+} from "@dealora/outbound";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -86,6 +94,33 @@ function approvalService(store: Store, clock?: () => Date) {
     },
     clock,
   );
+}
+
+/**
+ * Wire the Outbound service the way the production wiring does.
+ *
+ * The readers are the same narrow ones `createDefaultHandlers` builds — a draft,
+ * a contact, and an approval verifier that reads the persisted rows — and the
+ * provider is the sandbox, which performs no network I/O and records what it
+ * accepted. Route tests then exercise the real send boundary rather than a
+ * stand-in.
+ */
+function outboundService(store: Store, clock?: () => Date) {
+  return createOutboundService(
+    store as never,
+    createApprovalVerifier(store as never),
+    createDraftReader(store as never),
+    createContactReader(store as never),
+    registryWithSandbox(),
+    clock,
+  );
+}
+
+/** A registry holding only the sandbox email provider. */
+function registryWithSandbox(): ProviderRegistry {
+  const registry = new ProviderRegistry();
+  registry.register("email", new SandboxEmailProvider());
+  return registry;
 }
 
 /**
@@ -233,6 +268,7 @@ function fixture(options?: {
     qualification: qualificationService(store, options?.evidenceClock),
     personalization: personalizationService(store),
     approval: approvalService(store),
+    outbound: outboundService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -712,6 +748,7 @@ describe("API Revenue Goal routes", () => {
       qualification: qualificationService(store),
       personalization: personalizationService(store),
       approval: approvalService(store),
+      outbound: outboundService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1045,6 +1082,7 @@ describe("API Revenue Plan routes", () => {
       qualification: qualificationService(store),
       personalization: personalizationService(store),
       approval: approvalService(store),
+      outbound: outboundService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1259,6 +1297,7 @@ describe("API Business Brain routes", () => {
       qualification: qualificationService(failingStore),
       personalization: personalizationService(failingStore),
       approval: approvalService(failingStore),
+      outbound: outboundService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1598,6 +1637,7 @@ describe("API Account & Contact routes", () => {
       qualification: qualificationService(store),
       personalization: personalizationService(store),
       approval: approvalService(store),
+      outbound: outboundService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1904,6 +1944,7 @@ describe("API Research routes", () => {
       qualification: qualificationService(store),
       personalization: personalizationService(store),
       approval: approvalService(store),
+      outbound: outboundService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -1954,6 +1995,7 @@ describe("API Research routes", () => {
       qualification: qualificationService(store),
       personalization: personalizationService(store),
       approval: approvalService(store),
+      outbound: outboundService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3092,6 +3134,7 @@ describe("API Qualification routes", () => {
         } as never,
         { byId: () => null, latestVersion: () => null },
       ),
+      outbound: outboundService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 

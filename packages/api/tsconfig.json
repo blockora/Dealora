@@ -42,6 +42,9 @@
     },
     {
       "path": "../approval"
+    },
+    {
+      "path": "../outbound"
     }
   ]
 }

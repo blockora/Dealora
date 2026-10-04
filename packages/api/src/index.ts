@@ -45,6 +45,24 @@ export type {
 } from "@dealora/approval";
 
 /**
+ * The Outbound domain's public surface, re-exported so API consumers can type an
+ * outbound response without depending on the domain package directly.
+ */
+export type {
+  OutboundAction,
+  OutboundActionStatus,
+  OutboundChannel,
+  OutboundError,
+  OutboundEvent,
+  OutboundEventKind,
+  OutboundFailureCode,
+  OutboundPolicyView,
+  OutboundProvider,
+  OutboundSendResult,
+  OutboundSuppression,
+} from "@dealora/outbound";
+
+/**
  * The Qualification domain's public surface, re-exported so API consumers can
  * type a qualification response without depending on the domain package
  * directly.

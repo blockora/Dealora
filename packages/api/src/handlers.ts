@@ -24,6 +24,7 @@ import { SUPPORTED_RENDERER_VERSIONS } from "@dealora/personalization";
 import type { PersonalizationError, PersonalizationService } from "@dealora/personalization";
 import { APPROVAL_STATUSES } from "@dealora/approval";
 import type { ApprovalError, ApprovalService } from "@dealora/approval";
+import type { OutboundError, OutboundService } from "@dealora/outbound";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -284,6 +285,50 @@ function isApiError(value: unknown): value is ApiError {
   return typeof value === "object" && value !== null && "code" in value && "message" in value;
 }
 
+/**
+ * Translate a domain `OutboundError` into the safe API error envelope.
+ *
+ * Written case by case rather than asserted, so no domain code can be emitted
+ * over the wire as a code the transport contract does not define. `ApiErrorCode`
+ * is the Phase 1 vocabulary and stays closed; the five refusals that have no code
+ * of their own there — no approval, a suppression, an unconfigured provider, a
+ * provider refusal and an internal failure — all become `CONFLICT` except the
+ * last, which becomes `SERVER_ERROR`.
+ *
+ * They stay distinguishable to the caller through their messages and details,
+ * and that distinction matters: "a human has not approved this" and "this person
+ * must not be contacted" call for completely different actions, and collapsing
+ * them into one opaque conflict would make the second look like an ordinary
+ * retry. The details name the actual cause in every case.
+ *
+ * `UNAVAILABLE` is an internal condition and is never surfaced verbatim.
+ */
+function fromOutboundError(error: OutboundError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+        return "VALIDATION_ERROR";
+      case "CONFLICT":
+        return "CONFLICT";
+      case "UNAPPROVED":
+      case "SUPPRESSED":
+      case "PROVIDER_UNAVAILABLE":
+      case "PROVIDER_FAILED":
+        return "CONFLICT";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = [...error.details];
+  return mapped;
+}
+
 export interface HandlerDeps {
   identity: IdentityService;
   brain: BusinessBrainService;
@@ -297,6 +342,7 @@ export interface HandlerDeps {
   qualification: QualificationService;
   personalization: PersonalizationService;
   approval: ApprovalService;
+  outbound: OutboundService;
   resolveSession: SessionResolver;
 }
 
@@ -1973,6 +2019,181 @@ export function createHandlers(deps: HandlerDeps) {
       return Promise.resolve({ ok: true, value: ok(result.value) });
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 11 — First Outbound Integration
+  //
+  // These handlers move an approved message to one configured provider. They
+  // are the only routes in the API that can cause anything to leave the
+  // system, and each one is explicit: nothing here is scheduled, queued or
+  // retried automatically, and a send only happens because an authenticated
+  // request asked for it.
+  //
+  // Nothing about the send is accepted from a caller. There is no `approved`,
+  // `status`, `provider`, `providerReference`, `sentAt` or `delivered` field
+  // that is read: the approval is re-verified from storage, the recipient is
+  // resolved from the contact record, the provider is the one this deployment
+  // configured, and `sent` is written only from a provider confirmation. A
+  // client cannot mark its own message delivered.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Stage an approved draft version for sending.
+   *
+   * Only `draftVersion` is read from the body. Everything that would describe
+   * the message itself — recipient, provider, subject, body, status — is
+   * resolved server-side, and the approval must already cover this exact
+   * version for the action to be created at all.
+   */
+  const createOutboundActionHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const draftId = param(req, "draftId");
+      if (isApiError(draftId)) return { ok: false, error: draftId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.outbound.stageOutbound(workspaceId, actor.userId, draftId, {
+        draftVersion: body.draftVersion,
+      });
+      if (!result.ok) return { ok: false, error: fromOutboundError(result.error) };
+      return { ok: true, value: ok({ action: result.value }) };
+    });
+
+  /**
+   * Send one staged action.
+   *
+   * Takes no body at all. The provider, the recipient and the approval are
+   * the system's to determine, and the whole authorization chain is
+   * re-verified here rather than trusted from staging.
+   */
+  const sendOutboundActionHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+
+      const result = await deps.outbound.sendOutbound(workspaceId, actor.userId, id);
+      if (!result.ok) return { ok: false, error: fromOutboundError(result.error) };
+      return {
+        ok: true,
+        value: ok({
+          action: result.value.action,
+          delivered: result.value.delivered,
+          provider: result.value.provider,
+          history: result.value.events,
+        }),
+      };
+    });
+
+  /** Withdraw a staged action before any provider call. Terminal. */
+  const cancelOutboundActionHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.outbound.cancelOutbound(workspaceId, actor.userId, id, body.reason);
+      if (!result.ok) return { ok: false, error: fromOutboundError(result.error) };
+      return { ok: true, value: ok({ action: result.value }) };
+    });
+
+  /** One action, as stored. */
+  const getOutboundActionHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.outbound.getOutbound(id, actor.userId);
+      if (!result.ok) {
+        return Promise.resolve({ ok: false, error: fromOutboundError(result.error) });
+      }
+      return Promise.resolve({ ok: true, value: ok({ action: result.value }) });
+    });
+
+  /** A workspace's actions, newest first, optionally narrowed by status. */
+  const listOutboundActionsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+
+      const result = deps.outbound.listOutbound(workspaceId, actor.userId, {
+        status: req.query.status,
+        draftId: req.query.draftId,
+        approvalId: req.query.approvalId,
+      });
+      if (!result.ok) {
+        return Promise.resolve({ ok: false, error: fromOutboundError(result.error) });
+      }
+      return Promise.resolve({ ok: true, value: ok({ actions: result.value }) });
+    });
+
+  /**
+   * One action's audit trail: created, attempted, sent, failed, cancelled.
+   * Append-only, and a failure is recorded as durably as a success.
+   */
+  const outboundActionHistoryHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.outbound.actionHistory(id, actor.userId);
+      if (!result.ok) {
+        return Promise.resolve({ ok: false, error: fromOutboundError(result.error) });
+      }
+      return Promise.resolve({ ok: true, value: ok({ history: result.value }) });
+    });
+
+  /**
+   * Add an address to the workspace's opt-out list.
+   *
+   * Permanent and attributed: the record keeps who added it and why, because
+   * an opt-out that cannot be explained is one a workspace cannot be asked to
+   * trust. Checked before every provider call.
+   */
+  const createOutboundSuppressionHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.outbound.suppress(workspaceId, actor.userId, body.email, body.reason);
+      if (!result.ok) return { ok: false, error: fromOutboundError(result.error) };
+      return { ok: true, value: ok({ suppression: result.value }) };
+    });
+
+  const listOutboundSuppressionsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const result = deps.outbound.listSuppressions(workspaceId, actor.userId);
+      if (!result.ok) {
+        return Promise.resolve({ ok: false, error: fromOutboundError(result.error) });
+      }
+      return Promise.resolve({ ok: true, value: ok({ suppressions: result.value }) });
+    });
+
+  /**
+   * The outbound policy this deployment enforces, plus which providers it has
+   * configured. Readable before anything has been sent.
+   */
+  const getOutboundPolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+      const result = deps.outbound.policy(workspaceId, actor.userId);
+      if (!result.ok) {
+        return Promise.resolve({ ok: false, error: fromOutboundError(result.error) });
+      }
+      return Promise.resolve({
+        ok: true,
+        value: ok({ ...result.value, configuredProviders: deps.outbound.configuredProviders() }),
+      });
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -2062,6 +2283,15 @@ export function createHandlers(deps: HandlerDeps) {
     listApprovalRequestsHandler,
     approvalHistoryHandler,
     getApprovalPolicyHandler,
+    createOutboundActionHandler,
+    sendOutboundActionHandler,
+    cancelOutboundActionHandler,
+    getOutboundActionHandler,
+    listOutboundActionsHandler,
+    outboundActionHistoryHandler,
+    createOutboundSuppressionHandler,
+    listOutboundSuppressionsHandler,
+    getOutboundPolicyHandler,
   };
 }
 

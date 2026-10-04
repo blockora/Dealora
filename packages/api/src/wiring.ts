@@ -21,6 +21,15 @@ import {
   toQualificationSnapshot,
 } from "@dealora/personalization";
 import { createApprovalService, toApprovalDraftSnapshot } from "@dealora/approval";
+import {
+  ProviderRegistry,
+  SandboxEmailProvider,
+  createApprovalVerifier,
+  createContactReader,
+  createDraftReader,
+  createOutboundService,
+} from "@dealora/outbound";
+import type { OutboundProvider } from "@dealora/outbound";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -35,6 +44,17 @@ import type { IdentityService, WorkspaceBrainContext } from "./types.js";
  */
 export function createDefaultHandlers(options?: {
   researchProviders?: readonly ResearchProvider[];
+  /**
+   * The providers this deployment has configured for the outbound channel.
+   *
+   * Nothing is registered by default beyond the **sandbox** provider, which
+   * performs no network I/O at all and records what it accepted. That is
+   * deliberate: no outbound credential is configured in this repository, and a
+   * provider that pretended to deliver would make the phase's central claim
+   * unverifiable. A deployment supplies its own provider here; the send boundary
+   * does not change.
+   */
+  outboundProviders?: readonly OutboundProvider[];
 }): ReturnType<typeof createHandlers> {
   const identity: IdentityService = {
     signup,
@@ -307,6 +327,23 @@ export function createDefaultHandlers(options?: {
         return found.ok ? toApprovalDraftSnapshot(found.value) : null;
       },
     }),
+    /**
+     * The send boundary reads three things and no more: a draft's identity,
+     * version, addresses and digest; a contact's identity, address and status;
+     * and an approval's status, reviewer and version.
+     *
+     * The approval verifier reads the **persisted rows** rather than asking the
+     * Approval service, so "is this approved?" is re-derived from storage on
+     * every send instead of being confirmed by the component that wrote the
+     * approval.
+     */
+    outbound: createOutboundService(
+      store as never,
+      createApprovalVerifier(store as never),
+      createDraftReader(store as never),
+      createContactReader(store as never),
+      providerRegistry(options?.outboundProviders),
+    ),
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());
@@ -321,3 +358,21 @@ export function createDefaultHandlers(options?: {
 }
 
 export { createIndex };
+
+/**
+ * Register the configured providers for the one channel this phase integrates.
+ *
+ * The sandbox provider is the default and the only thing shipped here. An
+ * explicit list **replaces** it — including an empty one, because a deployment
+ * that deliberately configured no provider must reach the "nothing configured"
+ * state rather than silently receiving a sandbox one. That state is a real
+ * refusal, not an edge case, so it has to be reachable.
+ */
+function providerRegistry(configured?: readonly OutboundProvider[]): ProviderRegistry {
+  const registry = new ProviderRegistry();
+  const providers = configured === undefined ? [new SandboxEmailProvider()] : configured;
+  for (const provider of providers) {
+    registry.register("email", provider);
+  }
+  return registry;
+}
