@@ -796,7 +796,11 @@ describe("Phase 13 gate — meeting workflow", () => {
       classified.classification.id,
       {
         state: "booked",
-        recommendationReason: "requested_by_user",
+        // A *valid* reason from the closed vocabulary, not a nonsense value: the
+        // rules would never pick `expressed_interest` for a `positive_intent`
+        // reply, so if the server were reading this field the meeting would come
+        // back with it. It does not.
+        recommendationReason: "expressed_interest",
         accountId: "someone-elses-account",
         contactId: "someone-elses-contact",
         qualificationId: "someone-elses-qualification",

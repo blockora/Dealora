@@ -1433,7 +1433,7 @@ ${COLUMN(meetingTable, COLUMNS.outboundActionId)} REFERENCES "${outboundActionTa
 ${COLUMN(meetingTable, COLUMNS.qualificationId)} REFERENCES "${qualificationTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(meetingTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(meetingTable, COLUMNS.state)} CHECK (${COLUMN(meetingTable, COLUMNS.state)} IN ('recommended','awaiting_approval','approved','booked','held','no_show','cancelled')),
-${COLUMN(meetingTable, COLUMNS.recommendationReason)} CHECK (${COLUMN(meetingTable, COLUMNS.recommendationReason)} IN ('positive_intent','question_answered_live','pricing_answered_live','expressed_interest','requested_by_user')),
+${COLUMN(meetingTable, COLUMNS.recommendationReason)} CHECK (${COLUMN(meetingTable, COLUMNS.recommendationReason)} IN ('positive_intent','expressed_interest')),
 ${COLUMN(meetingTable, COLUMNS.channel)} CHECK (${COLUMN(meetingTable, COLUMNS.channel)} IN ('sandbox','provider')),
 ${COLUMN(meetingTable, COLUMNS.durationMinutes)} CHECK (${COLUMN(meetingTable, COLUMNS.durationMinutes)} > 0),
 ${COLUMN(meetingTable, COLUMNS.endsAt)} CHECK (${COLUMN(meetingTable, COLUMNS.endsAt)} > ${COLUMN(meetingTable, COLUMNS.startsAt)}),

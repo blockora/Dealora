@@ -5,6 +5,7 @@ import type { EntityId, Meeting, MeetingBrief, MeetingEvent } from "@dealora/db"
 import {
   FailingCalendarProvider,
   MeetingService,
+  RECOMMENDATION_BY_INTENT,
   SandboxCalendarProvider,
   ThrowingCalendarProvider,
   bookingDigest,
@@ -508,6 +509,18 @@ describe("meeting booking rules", () => {
     expect(policy.prerequisites.join(" ")).toMatch(/positive_intent/);
     expect(policy.neverDoes.join(" ")).toMatch(/never books a meeting on its own initiative/);
     expect(policy.neverDoes.join(" ")).toMatch(/never sends an invitation/);
+
+    // The policy advertises exactly the reasons the rules can produce, and not
+    // one more. An earlier draft listed three reasons no code path could emit,
+    // so a reader of the policy was told about recommendations this phase does
+    // not make; this assertion is what stops that recurring.
+    const producible = new Set(
+      Object.values(RECOMMENDATION_BY_INTENT).filter(
+        (reason): reason is NonNullable<typeof reason> => reason !== null,
+      ),
+    );
+    expect(new Set(policy.recommendationReasons)).toEqual(producible);
+    expect(policy.recommendationReasons.length).toBeGreaterThan(0);
   });
 
   it("digests the same booking identically and a different one differently", () => {

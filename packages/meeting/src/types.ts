@@ -338,19 +338,14 @@ export interface MeetingAvailabilityWindow {
 }
 
 /**
- * What a decision about a meeting produced.
+ * What a caller may send when proposing a meeting.
  *
- * A booking decision is a *person's* decision, exactly as a Phase 10 approval is.
- * The reviewer identity and the instant are taken from the session in the service
- * and re-checked in storage, so a client cannot name its own approver or backdate
- * a booking.
+ * Only the booking's own metadata. There is deliberately no `state`, no
+ * `recommendationReason`, no `accountId`, no `contactId`, no `qualificationId`,
+ * no `approvedBy` and no `externalEventId` on this shape: every one of those is
+ * server-owned, and leaving them off the input type means a handler cannot pass
+ * one by accident.
  */
-export interface MeetingDecisionInput {
-  decision: unknown;
-  /** Required for a decline, and for a cancellation. Never optional. */
-  reason?: unknown;
-}
-
 export interface RecommendMeetingInput {
   /** The Phase 12 classification that produced the positive response. */
   classificationId: unknown;
@@ -361,20 +356,10 @@ export interface RecommendMeetingInput {
   durationMinutes?: unknown;
 }
 
-export interface BookMeetingInput {
-  /** Stable across retries; derived server-side from the meeting. */
-  idempotencyKey?: unknown;
-}
-
 export interface MeetingResult {
   meeting: Meeting;
   /** Every step this booking took, oldest first. */
   events: MeetingEvent[];
-}
-
-export interface MeetingBriefResult {
-  meeting: Meeting;
-  brief: MeetingBrief;
 }
 
 /**

@@ -46,7 +46,7 @@ import type {
 export * from "./types.js";
 export * from "./rules.js";
 export * from "./validation.js";
-export { renderMeetingBrief, describeBooking } from "./brief.js";
+export { renderMeetingBrief } from "./brief.js";
 export type { MeetingBriefDraft } from "./brief.js";
 export {
   SandboxCalendarProvider,

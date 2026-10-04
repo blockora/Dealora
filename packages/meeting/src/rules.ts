@@ -31,12 +31,20 @@ export const MEETING_STATES: readonly MeetingBookingState[] = [
   "cancelled",
 ];
 
+/**
+ * Every reason a meeting can be recommended for.
+ *
+ * Closed and, deliberately, **exactly the reasons the rules can produce**. An
+ * earlier draft of this file also listed `question_answered_live`,
+ * `pricing_answered_live` and `requested_by_user` as forward-looking members; no
+ * code path could ever emit any of them, so the policy route was advertising
+ * recommendations this phase does not make. A vocabulary a reader cannot trust
+ * is worse than a short one, and ROADMAP.md §20 asks for a recommendation from a
+ * positive response — not a taxonomy of intentions for later.
+ */
 export const MEETING_RECOMMENDATION_REASONS: readonly MeetingRecommendationReason[] = [
   "positive_intent",
-  "question_answered_live",
-  "pricing_answered_live",
   "expressed_interest",
-  "requested_by_user",
 ];
 
 /**
@@ -46,16 +54,16 @@ export const MEETING_RECOMMENDATION_REASONS: readonly MeetingRecommendationReaso
  * more" is the most common form of positive intent and refusing it would be a
  * false negative; everything else — an objection, a deferral, a refusal, an
  * opt-out, `unknown` — is not something to put a calendar invite behind.
+ *
+ * `question` and `pricing` are deliberately absent: §21's flow starts from
+ * positive intent, and a prospect asking a price is not yet asking for a
+ * meeting. The map below is where a later phase would widen that.
  */
 export const MEETABLE_INTENTS: readonly ConversationIntent[] = ["positive_intent", "interested"];
 
 /**
- * Which reason a given positive intent produces.
- *
- * `pricing` and `question` are *not* in `MEETABLE_INTENTS`: §21's flow starts
- * from positive intent, and a prospect asking a price is not yet asking for a
- * meeting. They appear here only as the reason an *already positive* reply is
- * better served live, so a phase that wants to widen this has one place to look.
+ * Which reason a given intent produces — the single place "why this meeting?"
+ * is answered.
  */
 export const RECOMMENDATION_BY_INTENT: Record<string, MeetingRecommendationReason | null> = {
   positive_intent: "positive_intent",

@@ -165,21 +165,4 @@ function isDecisionMakerTitle(title: string): boolean {
   return establishing.some((marker) => normalized.includes(marker));
 }
 
-/**
- * The one-line summary a user sees before the full brief.
- *
- * Kept as a function rather than a stored column so it can never drift from the
- * fields it describes: there is no denormalized copy of "what state is this
- * meeting in" that could disagree with the meeting row itself.
- */
-export function describeBooking(input: {
-  state: string;
-  accountName: string;
-  contactName: string;
-  startsAt: string;
-  recommendationReason: string;
-}): string {
-  return `${input.state}: ${input.accountName} with ${input.contactName} at ${input.startsAt}, recommended because of ${input.recommendationReason.replace(/_/g, " ")}.`;
-}
-
 export type { ConversationClassification };

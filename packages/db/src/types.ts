@@ -1715,18 +1715,17 @@ export type MeetingBookingState =
  *
  * Closed and inspectable, for the same reason ROADMAP.md Rule 9 exists: a
  * recommendation the user cannot interrogate is an assertion, not a decision aid.
+ *
+ * Every member is one the rules can actually produce. There is no "a human asked
+ * for this" member, because the recommendation reason is derived server-side
+ * from the classification — a member no code path could emit would be a value
+ * the policy route advertises and the engine never produces.
  */
 export type MeetingRecommendationReason =
-  /** The response read as positive intent at a usable confidence. */
+  /** The response read as positive intent. */
   | "positive_intent"
-  /** The response asked a question the answer to is better given live. */
-  | "question_answered_live"
-  /** The response asked about pricing. */
-  | "pricing_answered_live"
-  /** The response expressed interest without naming which. */
-  | "expressed_interest"
-  /** A human asked for a meeting directly, independently of any classification. */
-  | "requested_by_user";
+  /** The response expressed interest without an explicit positive signal. */
+  | "expressed_interest";
 
 /**
  * How a booking reached the calendar, or failed to.
