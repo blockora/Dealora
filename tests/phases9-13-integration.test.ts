@@ -8,14 +8,17 @@ import { createIndex, setSessionIndex, signup } from "@dealora/auth";
 import { StaticResearchProvider } from "@dealora/research";
 import type { ResearchProvider } from "@dealora/research";
 import { SandboxEmailProvider } from "@dealora/outbound";
+import { SandboxCalendarProvider } from "@dealora/meeting";
 
 /**
- * Phases 9–12 integration — one document, one decision, one effect, one response.
+ * Phases 9–13 integration — one document, one decision, one effect, one response,
+ * one booking.
  *
- * Phase 12 adds the ability to *read* what came back. It must not change any of
- * what Phases 9 to 11 guarantee, and that is exactly what this file proves: the
- * same journey is walked end to end, and then the seams are probed with the
- * Phase 12 surface in play.
+ * Phase 12 added the ability to *read* what came back, and Phase 13 adds the
+ * ability to *book* what was read. Neither may change what the phases before them
+ * guarantee, and that is exactly what this file proves: the same journey is
+ * walked end to end, and then the seams are probed with the Phase 13 surface in
+ * play.
  *
  * What is asserted here, in order:
  *
@@ -28,10 +31,17 @@ import { SandboxEmailProvider } from "@dealora/outbound";
  *  5. A new draft version still does not inherit an old approval, and a response
  *     cannot make it.
  *  6. A provider failure still cannot be read as a response to a delivery.
+ *  7. A booking is a *fourth* decision, with its own approval: the Phase 10
+ *     approval that let the message go out does not also let the meeting be
+ *     booked, and booking does not re-use it.
+ *  8. Booking a meeting creates nothing else — no invitation, no draft, no
+ *     approval, no evidence.
+ *  9. An opt-out stops a booking as well as a send, through the same Phase 11
+ *     list, and the whole booking surface stays per tenant.
  *
- * The research provider is a **declared test double** and the email provider is
- * the **sandbox**, exactly as in the individual phase gates: nothing here
- * retrieves, and nothing here fabricates a live delivery.
+ * The research provider is a **declared test double**, the email provider is the
+ * **sandbox**, and the calendar is a **sandbox** too: nothing here retrieves,
+ * and nothing here fabricates a live delivery or a live event.
  */
 
 let seq = 0;
@@ -424,7 +434,7 @@ afterAll(() => {
   defaultStore.destroy();
 });
 
-describe("phases 9-12 integration — document, decision, effect, response", () => {
+describe("phases 9-13 integration — document, decision, effect, response, booking", () => {
   it("carries one evidence-backed document through one decision to one delivery and one response", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({
@@ -759,6 +769,244 @@ describe("phases 9-12 integration — document, decision, effect, response", () 
     );
     expect(crossed.code).toBe("NOT_FOUND");
     expect(JSON.stringify(crossed)).not.toContain("Failure");
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 13 — the booking seam
+  // -------------------------------------------------------------------------
+
+  it("books a meeting as a separate decision from the one that sent the message", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+      calendarProviders: [new SandboxCalendarProvider()],
+    });
+    const { token, workspaceId } = tenant("Nine To Thirteen");
+
+    const ran = await journey(
+      handlers,
+      token,
+      workspaceId,
+      unique("p913book") + "@northwind.example",
+    );
+
+    const classified = (await dataOf(
+      handlers.createInboundMessageHandler(
+        request(
+          token,
+          { workspaceId, outboundActionId: ran.sentActionId },
+          { body: "Happy to chat, book a call." },
+        ),
+      ),
+    )) as { classification: { id: string; intent: string } };
+    expect(classified.classification.intent).toBe("positive_intent");
+
+    const proposed = (await dataOf(
+      handlers.recommendMeetingHandler(
+        request(
+          token,
+          { workspaceId },
+          {
+            classificationId: classified.classification.id,
+            title: "Intro call",
+            startsAt: "2026-11-02T10:00:00.000Z",
+            endsAt: "2026-11-02T10:30:00.000Z",
+            timezone: "Europe/Berlin",
+            durationMinutes: 30,
+          },
+        ),
+      ),
+    )) as { meeting: { id: string; state: string; approvalId?: string } };
+
+    // The Phase 10 approval that let the *message* go out does not also let the
+    // *meeting* be booked. Scheduling is its own Level 2 external action.
+    expect(proposed.meeting.state).toBe("recommended");
+    const premature = await errorOf(
+      handlers.bookMeetingHandler(request(token, { workspaceId, id: proposed.meeting.id })),
+    );
+    expect(premature.code).toBe("CONFLICT");
+
+    // A fresh, separate human decision is what moves it forward.
+    await dataOf(
+      handlers.decideMeetingHandler(
+        request(token, { workspaceId, id: proposed.meeting.id }, { decision: "approve" }),
+      ),
+    );
+    const booked = (await dataOf(
+      handlers.bookMeetingHandler(request(token, { workspaceId, id: proposed.meeting.id })),
+    )) as { meeting: { state: string; externalEventId: string | null } };
+    expect(booked.meeting.state).toBe("booked");
+    expect(booked.meeting.externalEventId).toContain("sandbox-meeting-");
+  });
+
+  it("books nothing else: no invitation, no draft, no approval, no evidence", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+      calendarProviders: [new SandboxCalendarProvider()],
+    });
+    const { token, workspaceId } = tenant("Nine To Thirteen Quiet");
+
+    const ran = await journey(
+      handlers,
+      token,
+      workspaceId,
+      unique("p913quiet") + "@northwind.example",
+    );
+    const classified = (await dataOf(
+      handlers.createInboundMessageHandler(
+        request(
+          token,
+          { workspaceId, outboundActionId: ran.sentActionId },
+          { body: "Happy to chat, book a call." },
+        ),
+      ),
+    )) as { classification: { id: string } };
+    const proposed = (await dataOf(
+      handlers.recommendMeetingHandler(
+        request(
+          token,
+          { workspaceId },
+          {
+            classificationId: classified.classification.id,
+            title: "Intro call",
+            startsAt: "2026-11-02T10:00:00.000Z",
+            endsAt: "2026-11-02T10:30:00.000Z",
+            durationMinutes: 30,
+          },
+        ),
+      ),
+    )) as { meeting: { id: string } };
+
+    const before = rowCounts();
+    await dataOf(
+      handlers.decideMeetingHandler(
+        request(token, { workspaceId, id: proposed.meeting.id }, { decision: "approve" }),
+      ),
+    );
+    await dataOf(
+      handlers.bookMeetingHandler(request(token, { workspaceId, id: proposed.meeting.id })),
+    );
+    await dataOf(
+      handlers.prepareMeetingBriefHandler(request(token, { workspaceId, id: proposed.meeting.id })),
+    );
+
+    // Booking a meeting is not sending anything, and a meeting is not a fact.
+    const after = rowCounts();
+    expect(after.drafts).toBe(before.drafts);
+    expect(after.approvals).toBe(before.approvals);
+    expect(after.actions).toBe(before.actions);
+    expect(after.claims).toBe(before.claims);
+    expect(after.evidence).toBe(before.evidence);
+  });
+
+  it("stops a booking through the Phase 11 opt-out list, and keeps it per tenant", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+      calendarProviders: [new SandboxCalendarProvider()],
+    });
+    const mine = tenant("Nine To Thirteen Mine");
+    const theirs = tenant("Nine To Thirteen Theirs");
+
+    const myRan = await journey(
+      handlers,
+      mine.token,
+      mine.workspaceId,
+      unique("p913mine") + "@northwind.example",
+    );
+    const theirRan = await journey(
+      handlers,
+      theirs.token,
+      theirs.workspaceId,
+      unique("p913theirs") + "@northwind.example",
+    );
+
+    // My contact opts out. That response cannot become a meeting at all.
+    await dataOf(
+      handlers.createInboundMessageHandler(
+        request(
+          mine.token,
+          { workspaceId: mine.workspaceId, outboundActionId: myRan.sentActionId },
+          { body: "Please unsubscribe me." },
+        ),
+      ),
+    );
+    // Then, even a positive-looking response on that same silenced address is
+    // refused — the Phase 11 list the send path already checks is the one that
+    // stops the booking too.
+    const silenced = (await dataOf(
+      handlers.createInboundMessageHandler(
+        request(
+          mine.token,
+          { workspaceId: mine.workspaceId, outboundActionId: myRan.sentActionId },
+          { body: "Happy to chat, book a call." },
+        ),
+      ),
+    )) as { classification: { id: string; intent: string } };
+    expect(silenced.classification.intent).toBe("positive_intent");
+    expect(
+      (
+        await errorOf(
+          handlers.recommendMeetingHandler(
+            request(
+              mine.token,
+              { workspaceId: mine.workspaceId },
+              {
+                classificationId: silenced.classification.id,
+                title: "Intro call",
+                startsAt: "2026-11-02T10:00:00.000Z",
+                endsAt: "2026-11-02T10:30:00.000Z",
+                durationMinutes: 30,
+              },
+            ),
+          ),
+        )
+      ).code,
+    ).toBe("CONFLICT");
+
+    // Their tenant's identical reply is entirely unaffected.
+    const theirPositive = (await dataOf(
+      handlers.createInboundMessageHandler(
+        request(
+          theirs.token,
+          { workspaceId: theirs.workspaceId, outboundActionId: theirRan.sentActionId },
+          { body: "Happy to chat, book a call." },
+        ),
+      ),
+    )) as { classification: { id: string } };
+    const theirMeeting = (await dataOf(
+      handlers.recommendMeetingHandler(
+        request(
+          theirs.token,
+          { workspaceId: theirs.workspaceId },
+          {
+            classificationId: theirPositive.classification.id,
+            title: "Intro call",
+            startsAt: "2026-11-02T10:00:00.000Z",
+            endsAt: "2026-11-02T10:30:00.000Z",
+            durationMinutes: 30,
+          },
+        ),
+      ),
+    )) as { meeting: { id: string; state: string } };
+    expect(theirMeeting.meeting.state).toBe("recommended");
+
+    // And I cannot see their meeting, answer it, or list it.
+    expect(
+      (
+        await errorOf(
+          handlers.getMeetingHandler(request(mine.token, { id: theirMeeting.meeting.id })),
+        )
+      ).code,
+    ).toBe("NOT_FOUND");
+    const theirList = (await dataOf(
+      handlers.listMeetingsHandler(request(mine.token, { workspaceId: mine.workspaceId })),
+    )) as { meetings: { id: string }[] };
+    expect(theirList.meetings).toEqual([]);
   });
 });
 
