@@ -80,6 +80,8 @@ export type {
   QualificationCriterionResult,
   QualificationCriterionOutcome,
   QualificationState,
+  PersonalizedDraft,
+  DraftPersonalizationPoint,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -108,6 +110,7 @@ export {
   accountClaimTable,
   evidenceTable,
   qualificationTable,
+  personalizedDraftTable,
   createTableSql,
   slugify,
   capString,

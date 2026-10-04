@@ -31,6 +31,14 @@
  * Relations (Phase 8 — Qualification Engine, ROADMAP.md §15):
  *   Account 1 -- * Qualification
  *
+ * Relations (Phase 9 — Personalization Engine, ROADMAP.md §16):
+ *   Account 1 -- * PersonalizedDraft
+ *
+ * A draft references the qualification, contact and offer it was rendered
+ * from with `ON DELETE SET NULL`: a deleted reference must not delete a
+ * draft a user may already have reviewed, and the draft stays readable with
+ * its own rendered text intact.
+ *
  * A qualification row references the plan, goal and ICP it was measured
  * against with `ON DELETE SET NULL`: a deleted plan or goal must not delete a
  * decision a user already made, and a qualification whose goal row is gone
@@ -178,6 +186,14 @@ export const COLUMNS = {
   conflictedClaimIds: "conflicted_claim_ids",
   dimensions: "dimensions",
   evaluatedAt: "evaluated_at",
+  contactId: "contact_id",
+  qualificationId: "qualification_id",
+  rendererVersion: "renderer_version",
+  subject: "subject",
+  body: "body",
+  personalizationPoints: "personalization_points",
+  approvedClaimIds: "approved_claim_ids",
+  warnings: "warnings",
 } as const;
 
 export type ColumnName = (typeof COLUMNS)[keyof typeof COLUMNS];
@@ -285,6 +301,16 @@ export const evidenceTable = "evidence" as const;
  */
 export const qualificationTable = "qualifications" as const;
 
+/**
+ * Table: personalized outreach drafts (Phase 9).
+ *
+ * One row per generated draft. Regenerating inserts a new `version` instead of
+ * overwriting, so an approval (Phase 10) can bind to exactly one immutable
+ * draft version. There is no `status` column: a draft is a document, not an
+ * action — the lifecycle that leads to a send begins in Phase 10.
+ */
+export const personalizedDraftTable = "personalized_drafts" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -307,6 +333,7 @@ export const tables = [
   accountClaimTable,
   evidenceTable,
   qualificationTable,
+  personalizedDraftTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -412,6 +439,13 @@ export const indexes = {
     `${COLUMN(qualificationTable, COLUMNS.accountId)} NOT NULL`,
     `${COLUMN(qualificationTable, COLUMNS.version)} NOT NULL`,
     `${COLUMN(qualificationTable, COLUMNS.state)} NOT NULL`,
+  ],
+  personalizedDrafts: [
+    `${COLUMN(personalizedDraftTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(personalizedDraftTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(personalizedDraftTable, COLUMNS.accountId)} NOT NULL`,
+    `${COLUMN(personalizedDraftTable, COLUMNS.version)} NOT NULL`,
+    `${COLUMN(personalizedDraftTable, COLUMNS.rendererVersion)} NOT NULL`,
   ],
 };
 
@@ -840,6 +874,34 @@ ${COLUMN(qualificationTable, COLUMNS.icpId)} REFERENCES "${icpTable}"("${COLUMNS
 ${COLUMN(qualificationTable, COLUMNS.version)} CHECK (${COLUMN(qualificationTable, COLUMNS.version)} > 0),
 ${COLUMN(qualificationTable, COLUMNS.score)} CHECK (${COLUMN(qualificationTable, COLUMNS.score)} IS NULL OR (${COLUMN(qualificationTable, COLUMNS.score)} >= 0 AND ${COLUMN(qualificationTable, COLUMNS.score)} <= 100)),
 ${COLUMN(qualificationTable, COLUMNS.state)} CHECK (${COLUMN(qualificationTable, COLUMNS.state)} IN ('qualified','unqualified','insufficient_data','contested'))`,
+  ),
+  createTableSql(
+    personalizedDraftTable,
+    [
+      COLUMN(personalizedDraftTable, COLUMNS.id),
+      COLUMN(personalizedDraftTable, COLUMNS.workspaceId),
+      COLUMN(personalizedDraftTable, COLUMNS.accountId),
+      COLUMN(personalizedDraftTable, COLUMNS.contactId),
+      COLUMN(personalizedDraftTable, COLUMNS.ownerId),
+      COLUMN(personalizedDraftTable, COLUMNS.version),
+      COLUMN(personalizedDraftTable, COLUMNS.rendererVersion),
+      COLUMN(personalizedDraftTable, COLUMNS.contextDigest),
+      COLUMN(personalizedDraftTable, COLUMNS.qualificationId),
+      COLUMN(personalizedDraftTable, COLUMNS.offerId),
+      COLUMN(personalizedDraftTable, COLUMNS.subject),
+      COLUMN(personalizedDraftTable, COLUMNS.body),
+      COLUMN(personalizedDraftTable, COLUMNS.personalizationPoints),
+      COLUMN(personalizedDraftTable, COLUMNS.approvedClaimIds),
+      COLUMN(personalizedDraftTable, COLUMNS.warnings),
+    ],
+    `${COLUMN(personalizedDraftTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(personalizedDraftTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(personalizedDraftTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(personalizedDraftTable, COLUMNS.contactId)} REFERENCES "${contactTable}"("${COLUMNS.id}") ON DELETE SET NULL,
+${COLUMN(personalizedDraftTable, COLUMNS.ownerId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(personalizedDraftTable, COLUMNS.qualificationId)} REFERENCES "${qualificationTable}"("${COLUMNS.id}") ON DELETE SET NULL,
+${COLUMN(personalizedDraftTable, COLUMNS.offerId)} REFERENCES "${offerTable}"("${COLUMNS.id}") ON DELETE SET NULL,
+${COLUMN(personalizedDraftTable, COLUMNS.version)} CHECK (${COLUMN(personalizedDraftTable, COLUMNS.version)} > 0)`,
   ),
 ].join("\n\n");
 

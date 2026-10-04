@@ -1183,3 +1183,324 @@ export interface Qualification {
   createdAt: DateTime;
   updatedAt: DateTime;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 9 — Personalization Engine (DEALORA_BLUEPRINT.md §15, ROADMAP.md §16)
+// ---------------------------------------------------------------------------
+
+/**
+ * One evidence-backed observation a draft states, exactly as the source
+ * recorded it.
+ *
+ * A point never paraphrases. `value` is the claim's stored text quoted
+ * verbatim, and `statement` — the sentence that appears in the body — is that
+ * value plus its attribution and nothing else, so every factual statement in a
+ * draft is traceable to the {@link AccountClaim} and {@link Evidence} records
+ * it came from (ROADMAP.md §16: never fabricate personalization).
+ */
+export interface DraftPersonalizationPoint {
+  /** The Phase 6 observation bucket the claim came from. */
+  category: ResearchCategory;
+  /** Stable field key inside the category. */
+  field: string;
+  /** The claim value, quoted verbatim. Never rewritten. */
+  value: string;
+  /** The account claim this point states. A reference, never a copy. */
+  claimId: EntityId;
+  /** The recorded evidence records behind the claim. References, never copies. */
+  evidenceIds: EntityId[];
+  /** The source the point's citation names: the newest support record's. */
+  sourceName: string;
+  /** When the source says the statement was true. `null` when unknown. */
+  observedAt: DateTime | null;
+  /** The weakest confidence band among the point's support records. */
+  confidence: ResearchConfidence;
+  /** The best relevance band among the point's support records. */
+  relevance: ResearchRelevance;
+  /** The exact sentence that appears in the draft body. */
+  statement: string;
+}
+
+/**
+ * One personalized outreach draft (Phase 9).
+ *
+ * A draft is a **document, not an action**. It carries no recipient address, no
+ * channel, no provider and no send state — the draft lifecycle that leads to a
+ * send begins in Phase 10 (approval) and Phase 11 (outbound). It is an
+ * immutable, versioned record like a qualification: regenerating inserts a new
+ * `version` rather than rewriting, so an approval can bind to exactly one
+ * draft version forever.
+ *
+ * Every factual statement the body makes is one of:
+ *
+ * - a {@link DraftPersonalizationPoint}, quoted from an evidence-backed
+ *   account claim and attributed to its source;
+ * - an approved Phase 2 Business Brain claim, quoted verbatim
+ *   (`approvedClaimIds`);
+ * - the offer's own description, quoted verbatim.
+ *
+ * Anything the system could not honestly state is recorded in `warnings`
+ * rather than smoothed over.
+ */
+export interface PersonalizedDraft {
+  id: EntityId;
+  workspaceId: EntityId;
+  accountId: EntityId;
+  /** The person the draft addresses. `null` when the workspace named none. */
+  contactId: EntityId | null;
+  createdBy: EntityId;
+  /** 1-based version within the account's draft lineage. Never reused. */
+  version: number;
+  /** Which renderer produced this draft. Never overwritten. */
+  rendererVersion: string;
+  /** Digest of the exact context the renderer was given. Never the objects. */
+  contextDigest: string;
+  /** The qualification this draft was generated for. State `qualified`. */
+  qualificationId: EntityId | null;
+  /** The active offer the draft presents. */
+  offerId: EntityId | null;
+  subject: string;
+  body: string;
+  /** The evidence-backed observations the body states, in render order. */
+  personalizationPoints: DraftPersonalizationPoint[];
+  /** The approved Business Brain claims the body quotes. */
+  approvedClaimIds: EntityId[];
+  /** What the renderer could not honestly state, recorded rather than hidden. */
+  warnings: string[];
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10 — Approval Engine (DEALORA_BLUEPRINT.md §17, ROADMAP.md §17)
+// ---------------------------------------------------------------------------
+
+/**
+ * The lifecycle of an approval request.
+ *
+ * Exactly one state is a yes: `approved`. Every other state refuses a send:
+ *
+ * - `pending`            — requested, no human decision yet.
+ * - `approved`           — an explicit human decision, attributed and timestamped.
+ * - `rejected`           — an explicit human refusal, with a reason.
+ * - `changes_requested`  — the reviewer wants a different draft; terminal for
+ *                          this version, because a changed draft is a *new*
+ *                          draft version and needs its own request.
+ * - `cancelled`          — the requester withdrew it before any decision.
+ * - `expired`            — the request passed its expiry before a decision.
+ *                          A timeout never approves anything; it only closes
+ *                          the door.
+ *
+ * There is no auto-approval and no state a score, a model or a timer can move
+ * to `approved`: only {@link ApprovalRequestEvent} records written by explicit
+ * human decisions through the service reach that state.
+ */
+export type ApprovalStatus =
+  "pending" | "approved" | "rejected" | "changes_requested" | "cancelled" | "expired";
+
+/** The decision a reviewer recorded. Mirrors the terminal states above. */
+export type ApprovalDecision = "approved" | "rejected" | "changes_requested";
+
+/**
+ * Risk levels, exactly DEALORA_BLUEPRINT.md §17's vocabulary and the same
+ * strings Phase 3's `RevenueGoalApprovalPolicy.maxRiskLevel` already carries.
+ */
+export type ApprovalRiskLevel =
+  "level_0_read" | "level_1_draft" | "level_2_external_action" | "level_3_high_impact";
+
+/** The action kinds an approval can cover. Phase 10 issues exactly one. */
+export type ApprovalActionKind = "send_message";
+
+/**
+ * One explicit request for a human decision before a consequential action.
+ *
+ * The request binds to exactly one immutable draft version (`draftId` +
+ * `draftVersion`) and carries the `previewDigest` of the content the reviewer
+ * is shown, so the answer "which version was approved?" is a stored field, not
+ * a reconstruction. Identity fields are filled by the server only: the
+ * requester from the session at creation, the reviewer from the session at
+ * decision time. A client can never name an approver.
+ */
+export interface ApprovalRequest {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** Who asked for the approval. Always the authenticated caller. */
+  createdBy: EntityId;
+  actionKind: ApprovalActionKind;
+  riskLevel: ApprovalRiskLevel;
+  /** The draft the decision is about. */
+  draftId: EntityId;
+  /** The exact draft version bound to this request. Never re-bound. */
+  draftVersion: number;
+  /** One-line preview of the action, for lists. */
+  previewSubject: string;
+  /** Digest of the full previewed content, verified again at decision time. */
+  previewDigest: string;
+  status: ApprovalStatus;
+  /** The recorded decision. `null` while pending. */
+  decision: ApprovalDecision | null;
+  /** Who decided. Set by the server from the session, never from the body. */
+  decidedBy: EntityId | null;
+  decidedAt: DateTime | null;
+  /** Required for `rejected` and `changes_requested`; optional for `approved`. */
+  decisionReason: string | null;
+  /** When the request stops being decidable. `null` when it never expires. */
+  expiresAt: DateTime | null;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}
+
+/** The kinds of audit event an approval can record. */
+export type ApprovalEventKind =
+  "requested" | "approved" | "rejected" | "changes_requested" | "cancelled" | "expired";
+
+/**
+ * One append-only audit record for an approval request.
+ *
+ * Every state a request passes through leaves one of these behind, so the
+ * history of a decision — what was approved, which version, who, when, why —
+ * survives any later change. Events are never edited or deleted.
+ */
+export interface ApprovalRequestEvent {
+  id: EntityId;
+  approvalId: EntityId;
+  /** Denormalized so events can never outlive their tenant boundary. */
+  workspaceId: EntityId;
+  actorUserId: EntityId;
+  kind: ApprovalEventKind;
+  /** The decision reason, when the event records one. */
+  detail: string | null;
+  createdAt: DateTime;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11 — First Outbound Integration (ROADMAP.md §18)
+// ---------------------------------------------------------------------------
+
+/** The one channel Phase 11 integrates. Choosing exactly one is the requirement. */
+export type OutboundChannel = "email";
+
+/**
+ * The lifecycle of an outbound action.
+ *
+ * - `ready`     — created, approval verified, nothing sent yet. Cancellable.
+ * - `sending`   — the provider call is in flight. Never a resting state: the
+ *                 call is synchronous, so a record is only ever observed here
+ *                 if the process died mid-attempt.
+ * - `sent`      — the provider **confirmed** submission. Nothing else can set
+ *                 this, and it is terminal.
+ * - `failed`    — the provider refused or errored. The failure code and message
+ *                 are recorded; a failed action may be retried explicitly, and
+ *                 the retry is idempotent because the provider sees the same
+ *                 action id.
+ * - `cancelled` — the requester withdrew it before any send. Terminal.
+ *
+ * There is no `queued` and no automatic retry loop: a message leaves this
+ * system only through an explicit send of a ready (or failed) action, and every
+ * attempt is recorded as an event.
+ */
+export type OutboundActionStatus = "ready" | "sending" | "sent" | "failed" | "cancelled";
+
+/**
+ * Why a provider refused a message.
+ *
+ * A closed vocabulary, so a failure is always an inspectable outcome rather
+ * than a free-form provider message (DEALORA_BLUEPRINT.md §20). The provider's
+ * own words are kept alongside in `failureMessage`.
+ */
+export type OutboundFailureCode =
+  | "invalid_recipient"
+  | "provider_rejected"
+  | "rate_limited"
+  | "suppressed"
+  | "provider_unavailable";
+
+/**
+ * One controlled external communication (Phase 11).
+ *
+ * An action is the system's memory of one send: which approved draft version,
+ * which approval record covers it, which contact receives it, which provider
+ * was used, and what came back. The content is referenced from the immutable
+ * draft (`draftId`, `draftVersion`, `draftDigest`) rather than copied, so there
+ * is exactly one text of record and the action stays small.
+ *
+ * `recipientEmail` is resolved server-side from the contact record at creation
+ * and validated. Provider identity, references, statuses and timestamps are
+ * all written by the server from provider responses — never accepted from a
+ * client.
+ */
+export interface OutboundAction {
+  id: EntityId;
+  workspaceId: EntityId;
+  createdBy: EntityId;
+  channel: OutboundChannel;
+  /** The approved draft version this action sends. */
+  draftId: EntityId;
+  draftVersion: number;
+  /** Digest of the exact draft content the action refers to. */
+  draftDigest: string;
+  /** The approval that authorized this send. */
+  approvalId: EntityId;
+  /** The person who receives the message. */
+  contactId: EntityId;
+  /** Resolved server-side from the contact record and validated. */
+  recipientEmail: string;
+  /** The provider that handled (or will handle) the send. */
+  provider: string | null;
+  status: OutboundActionStatus;
+  /** How many times the provider was called for this action. */
+  attemptCount: number;
+  /** The provider's own reference. `null` until a provider supplies one. */
+  providerReference: string | null;
+  failureCode: OutboundFailureCode | null;
+  failureMessage: string | null;
+  /** When the most recent provider attempt started. */
+  attemptedAt: DateTime | null;
+  /** When the provider confirmed submission. Only set with `sent`. */
+  sentAt: DateTime | null;
+  /** When the action reached a terminal state. */
+  completedAt: DateTime | null;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}
+
+/** The kinds of audit event an outbound action can record. */
+export type OutboundEventKind = "created" | "send_attempted" | "sent" | "failed" | "cancelled";
+
+/**
+ * One append-only audit record for an outbound action.
+ *
+ * What was attempted, what came back, who cancelled — every step an action
+ * takes is recorded here by the server, so the send is explainable without
+ * trusting the action's current status alone.
+ */
+export interface OutboundEvent {
+  id: EntityId;
+  actionId: EntityId;
+  /** Denormalized so events can never outlive their tenant boundary. */
+  workspaceId: EntityId;
+  actorUserId: EntityId;
+  kind: OutboundEventKind;
+  detail: string | null;
+  createdAt: DateTime;
+}
+
+/**
+ * One address a workspace has opted out of contacting.
+ *
+ * ROADMAP.md §18 requires opt-out protection in the first integration. A
+ * suppressed address is checked **before** every provider call, and a
+ * suppressed recipient is never sent to. Suppression is permanent and
+ * attributed: the record keeps who recorded it and why.
+ */
+export interface OutboundSuppression {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** The suppressed address, lower-cased. */
+  email: string;
+  /** Why the address was suppressed, in the workspace's words. */
+  reason: string;
+  createdBy: EntityId;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}

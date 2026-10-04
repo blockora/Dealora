@@ -28,6 +28,7 @@ import type {
   EvidenceStatus,
   Qualification,
   QualificationState,
+  PersonalizedDraft,
   User,
   Workspace,
   WorkspaceMember,
@@ -106,7 +107,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 8;
+export const LATEST_SCHEMA_VERSION = 9;
 
 export interface DbState {
   schemaVersion?: number;
@@ -130,6 +131,7 @@ export interface DbState {
   accountClaims?: AccountClaim[];
   evidence?: Evidence[];
   qualifications?: Qualification[];
+  personalizedDrafts?: PersonalizedDraft[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -158,6 +160,7 @@ export function emptyState(): CompleteDbState {
     accountClaims: [],
     evidence: [],
     qualifications: [],
+    personalizedDrafts: [],
   };
 }
 
@@ -181,6 +184,11 @@ export function emptyState(): CompleteDbState {
  * additive: a Phase 7 document gains one empty table and keeps every account,
  * claim and evidence record it already had, so an account that was qualified
  * before the upgrade can be qualified again afterwards.
+ *
+ * Step 9 (Phase 9 — Personalization Engine): add `personalized_drafts`.
+ * Additive like every step before it: a Phase 8 document gains one empty table
+ * and keeps every evaluation it already had, so an account that was qualified
+ * before the upgrade can still be drafted for afterwards.
  */
 export function migrateState(input: DbState): CompleteDbState {
   const base = emptyState();
@@ -257,6 +265,16 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.qualifications;
   }
 
+  // Phase 9 adds personalized drafts. Additive: nothing before it is touched,
+  // so a document written by Phase 8 loads with an empty draft table and every
+  // qualification it already had, so an account that was qualified before the
+  // upgrade can still be drafted for afterwards.
+  if (version >= 9) {
+    state.personalizedDrafts = Array.isArray(input.personalizedDrafts)
+      ? input.personalizedDrafts
+      : base.personalizedDrafts;
+  }
+
   return state;
 }
 
@@ -296,6 +314,7 @@ type RowTable =
   | "accountClaims"
   | "evidence"
   | "qualifications"
+  | "personalizedDrafts"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -2250,6 +2269,148 @@ export class Store {
     };
   }
 
+  // -------------------------------------------------------------------------
+  // Phase 9 — Personalization Engine
+  // -------------------------------------------------------------------------
+
+  /**
+   * The next 1-based version within an account's draft lineage.
+   *
+   * Counted from stored rows rather than from a counter, so a restored backup
+   * cannot reissue a version an approval may already be bound to.
+   */
+  nextDraftVersion(accountId: EntityId): Result<number, StorageError> {
+    const versions = this.rows("personalizedDrafts")
+      .filter((d) => d.accountId === accountId)
+      .map((d) => d.version);
+    return { ok: true, value: versions.length === 0 ? 1 : Math.max(...versions) + 1 };
+  }
+
+  /**
+   * Record one personalized draft.
+   *
+   * Every reference the draft carries must live in the same workspace, so a
+   * draft can never point at another tenant's account, contact, qualification
+   * or offer — which would let one workspace's outreach quote another's
+   * evidence. The version is computed here rather than accepted, so two
+   * concurrent renders cannot claim the same slot in the account's history.
+   */
+  createDraft(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    accountId: EntityId;
+    draft: Omit<
+      PersonalizedDraft,
+      "id" | "workspaceId" | "accountId" | "createdBy" | "version" | "createdAt" | "updatedAt"
+    >;
+  }): Result<PersonalizedDraft, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+    const account = this.findById("accounts", input.accountId);
+    if (!account || account.workspaceId !== input.workspaceId) {
+      return {
+        ok: false,
+        error: toError("INVALID", "account does not exist in this workspace"),
+      };
+    }
+    if (input.draft.contactId !== null) {
+      const contact = this.findById("contacts", input.draft.contactId);
+      if (!contact || contact.workspaceId !== input.workspaceId) {
+        return { ok: false, error: toError("INVALID", "contact does not exist in this workspace") };
+      }
+      if (contact.accountId !== account.id) {
+        return {
+          ok: false,
+          error: toError("INVALID", "contact does not belong to this account"),
+        };
+      }
+    }
+    if (input.draft.qualificationId !== null) {
+      const qualification = this.findById("qualifications", input.draft.qualificationId);
+      if (!qualification || qualification.workspaceId !== input.workspaceId) {
+        return {
+          ok: false,
+          error: toError("INVALID", "qualification does not exist in this workspace"),
+        };
+      }
+    }
+    if (input.draft.offerId !== null) {
+      const offer = this.findById("offers", input.draft.offerId);
+      if (!offer || offer.workspaceId !== input.workspaceId) {
+        return { ok: false, error: toError("INVALID", "offer does not exist in this workspace") };
+      }
+    }
+
+    const next = this.nextDraftVersion(account.id);
+    if (!next.ok) return next;
+    const stamp = toDateTime(now());
+    const draft: PersonalizedDraft = {
+      ...input.draft,
+      id: newId(),
+      workspaceId: input.workspaceId,
+      accountId: account.id,
+      createdBy: input.createdBy,
+      version: next.value,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    this.mutate("personalizedDrafts", (rows) => rows.push(draft));
+    return { ok: true, value: draft };
+  }
+
+  getDraft(id: EntityId, userId: EntityId): Result<PersonalizedDraft, StorageError> {
+    const draft = this.findById("personalizedDrafts", id);
+    if (!draft) return { ok: false, error: toError("NOT_FOUND", "draft not found") };
+    const auth = this.requireWorkspace(draft.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: draft };
+  }
+
+  /**
+   * A workspace's drafts, newest first, optionally narrowed to one account.
+   *
+   * Nothing is filtered out by default: every version of every draft stays
+   * listable, because an approval may be bound to any of them and a record that
+   * disappears from a listing is a record a reviewer cannot re-check.
+   */
+  listDrafts(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: { accountId?: EntityId },
+  ): Result<PersonalizedDraft[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("personalizedDrafts").filter((d) => d.workspaceId === workspaceId);
+    const filtered = filter?.accountId
+      ? scoped.filter((d) => d.accountId === filter.accountId)
+      : scoped;
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) =>
+        a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : b.version - a.version,
+      ),
+    };
+  }
+
+  /**
+   * The workspace's Phase 2 claims whose status is `approved`.
+   *
+   * A dedicated read rather than a `listClaims({ status })` filter, because this
+   * is a *quotable* set with a safety meaning: Phase 9's renderer may quote
+   * these verbatim in an external draft and nothing else. An `unverified` claim
+   * is context and a `restricted` claim must never leave the workspace
+   * (DEALORA_BLUEPRINT.md §9), so a caller that needs one of those must ask
+   * `listClaims` for it explicitly.
+   */
+  listApprovedClaims(workspaceId: EntityId, userId: EntityId): Result<Claim[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("claims").filter(
+      (c) => c.workspaceId === workspaceId && c.status === "approved",
+    );
+    return { ok: true, value: scoped };
+  }
+
   /** Cleanup helper so tests and local runs do not leave files behind. */
   destroy(): void {
     try {
@@ -2295,6 +2456,7 @@ export const db = {
   getBrandVoice: store.getBrandVoice.bind(store),
   createClaim: store.createClaim.bind(store),
   listClaims: store.listClaims.bind(store),
+  listApprovedClaims: store.listApprovedClaims.bind(store),
   getClaim: store.getClaim.bind(store),
   updateClaim: store.updateClaim.bind(store),
   approveClaim: store.approveClaim.bind(store),
@@ -2353,6 +2515,12 @@ export const db = {
   createQualification: store.createQualification.bind(store),
   getQualification: store.getQualification.bind(store),
   listQualifications: store.listQualifications.bind(store),
+
+  nextDraftVersion: store.nextDraftVersion.bind(store),
+  createDraft: store.createDraft.bind(store),
+  getDraft: store.getDraft.bind(store),
+  listDrafts: store.listDrafts.bind(store),
+
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),
   workspaceOwner: store.workspaceOwner.bind(store),

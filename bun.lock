@@ -34,6 +34,7 @@
         "@dealora/db": "workspace:*",
         "@dealora/evidence": "workspace:*",
         "@dealora/goal": "workspace:*",
+        "@dealora/personalization": "workspace:*",
         "@dealora/plan": "workspace:*",
         "@dealora/qualification": "workspace:*",
         "@dealora/research": "workspace:*",
@@ -80,6 +81,15 @@
       "name": "@dealora/goal",
       "version": "0.1.0",
       "dependencies": {
+        "@dealora/core": "workspace:*",
+        "@dealora/db": "workspace:*",
+      },
+    },
+    "packages/personalization": {
+      "name": "@dealora/personalization",
+      "version": "0.1.0",
+      "dependencies": {
+        "@dealora/account": "workspace:*",
         "@dealora/core": "workspace:*",
         "@dealora/db": "workspace:*",
       },
@@ -133,6 +143,8 @@
     "@dealora/evidence": ["@dealora/evidence@workspace:packages/evidence"],
 
     "@dealora/goal": ["@dealora/goal@workspace:packages/goal"],
+
+    "@dealora/personalization": ["@dealora/personalization@workspace:packages/personalization"],
 
     "@dealora/plan": ["@dealora/plan@workspace:packages/plan"],
 

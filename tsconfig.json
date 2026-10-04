@@ -12,6 +12,7 @@
     { "path": "packages/research" },
     { "path": "packages/evidence" },
     { "path": "packages/qualification" },
+    { "path": "packages/personalization" },
     { "path": "packages/api" }
   ]
 }
