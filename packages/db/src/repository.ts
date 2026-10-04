@@ -33,6 +33,11 @@ import type {
   ApprovalRequestEvent,
   ApprovalDecision,
   ApprovalStatus,
+  OutboundAction,
+  OutboundActionStatus,
+  OutboundEvent,
+  OutboundFailureCode,
+  OutboundSuppression,
   User,
   Workspace,
   WorkspaceMember,
@@ -112,7 +117,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 10;
+export const LATEST_SCHEMA_VERSION = 11;
 
 export interface DbState {
   schemaVersion?: number;
@@ -139,6 +144,9 @@ export interface DbState {
   personalizedDrafts?: PersonalizedDraft[];
   approvalRequests?: ApprovalRequest[];
   approvalRequestEvents?: ApprovalRequestEvent[];
+  outboundActions?: OutboundAction[];
+  outboundEvents?: OutboundEvent[];
+  outboundSuppressions?: OutboundSuppression[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -170,6 +178,9 @@ export function emptyState(): CompleteDbState {
     personalizedDrafts: [],
     approvalRequests: [],
     approvalRequestEvents: [],
+    outboundActions: [],
+    outboundEvents: [],
+    outboundSuppressions: [],
   };
 }
 
@@ -204,6 +215,13 @@ export function emptyState(): CompleteDbState {
  * document gains two empty tables and keeps every draft it already had, so a
  * draft rendered before the upgrade can still be put up for approval
  * afterwards. Nothing before it is touched.
+ *
+ * Step 11 (Phase 11 — First Outbound Integration): add `outbound_actions`,
+ * `outbound_events` and `outbound_suppressions`. Additive like every step
+ * before it: a Phase 10 document gains three empty tables and keeps every
+ * approval it already had, so a draft approved before the upgrade can still be
+ * sent afterwards. No approval is rewritten and none is invalidated by the
+ * upgrade, because the upgrade adds no way to reach `sent`.
  */
 export function migrateState(input: DbState): CompleteDbState {
   const base = emptyState();
@@ -302,6 +320,21 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.approvalRequestEvents;
   }
 
+  // Phase 11 adds outbound actions, their audit trail and the opt-out list.
+  // Additive: nothing before it is touched, so a document written by Phase 10
+  // loads with three empty tables and every approval it already had.
+  if (version >= 11) {
+    state.outboundActions = Array.isArray(input.outboundActions)
+      ? input.outboundActions
+      : base.outboundActions;
+    state.outboundEvents = Array.isArray(input.outboundEvents)
+      ? input.outboundEvents
+      : base.outboundEvents;
+    state.outboundSuppressions = Array.isArray(input.outboundSuppressions)
+      ? input.outboundSuppressions
+      : base.outboundSuppressions;
+  }
+
   return state;
 }
 
@@ -344,6 +377,9 @@ type RowTable =
   | "personalizedDrafts"
   | "approvalRequests"
   | "approvalRequestEvents"
+  | "outboundActions"
+  | "outboundEvents"
+  | "outboundSuppressions"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -2682,6 +2718,457 @@ export class Store {
     return { ok: true, value: [...events].sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)) };
   }
 
+  // -------------------------------------------------------------------------
+  // Phase 11 — First Outbound Integration
+  // -------------------------------------------------------------------------
+
+  /**
+   * Stage one controlled external communication.
+   *
+   * An action is created only once every precondition already holds: the caller
+   * is a member of the workspace, the referenced draft version exists **in this
+   * workspace**, the approval record exists **in this workspace and is bound to
+   * that same draft version**, and the contact exists here too. The approval's
+   * `status` is deliberately *not* checked here — deciding whether an approval
+   * currently authorizes a send is the service's question, re-asked
+   * independently at send time, and duplicating the rule here would give one
+   * answer in two places.
+   *
+   * Everything the provider will later own — `provider`, `status`,
+   * `attemptCount`, `providerReference`, `failure*`, `attemptedAt`, `sentAt` —
+   * is written as `null`/`ready` here. There is no input that can create a
+   * `sent` action, so a send can only ever come from `recordOutboundAttempt`.
+   */
+  createOutboundAction(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    action: Omit<
+      OutboundAction,
+      | "id"
+      | "workspaceId"
+      | "createdBy"
+      | "provider"
+      | "status"
+      | "attemptCount"
+      | "providerReference"
+      | "failureCode"
+      | "failureMessage"
+      | "attemptedAt"
+      | "sentAt"
+      | "completedAt"
+      | "createdAt"
+      | "updatedAt"
+    >;
+  }): Result<OutboundAction, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+
+    const draft = this.findById("personalizedDrafts", input.action.draftId);
+    if (!draft || draft.workspaceId !== input.workspaceId) {
+      return {
+        ok: false,
+        error: toError("INVALID", "draft does not exist in this workspace"),
+      };
+    }
+    if (draft.version !== input.action.draftVersion) {
+      return {
+        ok: false,
+        error: toError("INVALID", "that draft version does not exist"),
+      };
+    }
+
+    // The approval must belong to this workspace **and** cover exactly the
+    // version being sent. An approval for another version authorizes nothing.
+    const approval = this.findById("approvalRequests", input.action.approvalId);
+    if (!approval || approval.workspaceId !== input.workspaceId) {
+      return {
+        ok: false,
+        error: toError("INVALID", "approval request does not exist in this workspace"),
+      };
+    }
+    if (
+      approval.draftId !== input.action.draftId ||
+      approval.draftVersion !== input.action.draftVersion
+    ) {
+      return {
+        ok: false,
+        error: toError("INVALID", "this approval does not cover that draft version"),
+      };
+    }
+
+    const contact = this.findById("contacts", input.action.contactId);
+    if (!contact || contact.workspaceId !== input.workspaceId) {
+      return {
+        ok: false,
+        error: toError("INVALID", "contact does not exist in this workspace"),
+      };
+    }
+
+    const stamp = toDateTime(now());
+    const action: OutboundAction = {
+      ...input.action,
+      id: newId(),
+      workspaceId: input.workspaceId,
+      createdBy: input.createdBy,
+      provider: null,
+      status: "ready",
+      attemptCount: 0,
+      providerReference: null,
+      failureCode: null,
+      failureMessage: null,
+      attemptedAt: null,
+      sentAt: null,
+      completedAt: null,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    this.mutate("outboundActions", (rows) => rows.push(action));
+    return { ok: true, value: action };
+  }
+
+  /**
+   * Record one provider attempt.
+   *
+   * Append-only in the sense that matters: `attemptCount` only ever increases
+   * and `attemptedAt` only ever moves forward, so "how many times did this try,
+   * and when" is a stored fact rather than a reconstruction. `sentAt` is written
+   * **only** on a confirmed submission; a failure never carries one, and the
+   * caller cannot pass one on the failure path at all.
+   *
+   * Only `ready` and `failed` may be attempted, which is what stops a second
+   * provider call for an action already confirmed `sent`.
+   */
+  recordOutboundAttempt(input: {
+    id: EntityId;
+    userId: EntityId;
+    provider: string;
+    attemptedAt: DateTime;
+  }): Result<OutboundAction, StorageError> {
+    const action = this.requireOutboundAction(input.id, input.userId);
+    if (!action.ok) return action;
+    const current = action.value;
+    if (current.status !== "ready" && current.status !== "failed") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this action is already ${current.status}`),
+      };
+    }
+    return this.writeOutboundAction(current.id, (row) => ({
+      ...row,
+      provider: input.provider,
+      status: "sending",
+      attemptCount: row.attemptCount + 1,
+      attemptedAt: input.attemptedAt,
+      updatedAt: input.attemptedAt,
+    }));
+  }
+
+  /**
+   * Record the provider's confirmation.
+   *
+   * This is the only path to `sent`. The provider reference and the instant are
+   * the provider's and the server's, taken from its response — a client cannot
+   * supply either one, and there is no input here that could mark an attempt
+   * sent without a confirmation.
+   */
+  confirmOutboundSent(input: {
+    id: EntityId;
+    userId: EntityId;
+    provider: string;
+    providerReference: string | null;
+    sentAt: DateTime;
+  }): Result<OutboundAction, StorageError> {
+    const action = this.requireOutboundAction(input.id, input.userId);
+    if (!action.ok) return action;
+    const current = action.value;
+    if (current.status !== "sending") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this action is ${current.status}, not in flight`),
+      };
+    }
+    return this.writeOutboundAction(current.id, (row) => ({
+      ...row,
+      provider: input.provider,
+      status: "sent",
+      providerReference: input.providerReference,
+      failureCode: null,
+      failureMessage: null,
+      sentAt: input.sentAt,
+      completedAt: input.sentAt,
+      updatedAt: input.sentAt,
+    }));
+  }
+
+  /**
+   * Record a failed send.
+   *
+   * Two honest cases reach this method, and both must be representable:
+   *
+   * - **After an attempt** (`sending`): the provider refused or errored. The
+   *   provider name and the `attemptCount` recorded by `recordOutboundAttempt`
+   *   are kept, because a provider was genuinely called.
+   * - **Before any attempt** (`ready` or `failed`): a pre-flight refusal, such as
+   *   an opt-out suppression found by the send path. `attemptCount` and
+   *   `attemptedAt` are deliberately left untouched, so the record continues to
+   *   say truthfully that no provider was ever called on this occasion — and the
+   *   attempt budget is not spent on a send that never left the system.
+   *
+   * A pre-flight refusal on an already-`failed` action **updates** the code and
+   * message rather than leaving the previous one: `failureCode` answers "why is
+   * this action not sent", and the newest reason is the true one. The earlier
+   * provider failure is not lost — it is in the append-only event trail, which is
+   * what that trail exists for.
+   *
+   * In every case a failure is stored with its closed-vocabulary code and the
+   * message as given, and **never** with a `sentAt`: the schema constrains
+   * `sent_at` to a `sent` action, so a failed send cannot be mistaken for a
+   * delivery even if a caller passes the wrong timestamp.
+   */
+  recordOutboundFailure(input: {
+    id: EntityId;
+    userId: EntityId;
+    provider: string;
+    failureCode: OutboundFailureCode;
+    failureMessage: string;
+    failedAt: DateTime;
+  }): Result<OutboundAction, StorageError> {
+    const action = this.requireOutboundAction(input.id, input.userId);
+    if (!action.ok) return action;
+    const current = action.value;
+    const inFlight = current.status === "sending";
+    if (!inFlight && current.status !== "ready" && current.status !== "failed") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this action is ${current.status}, not in flight or retryable`),
+      };
+    }
+    return this.writeOutboundAction(current.id, (row) => ({
+      ...row,
+      // A pre-flight refusal names no provider, because none handled the message
+      // on this occasion; an in-flight failure keeps the provider that did.
+      ...(inFlight ? { provider: input.provider } : {}),
+      status: "failed",
+      failureCode: input.failureCode,
+      failureMessage: input.failureMessage,
+      sentAt: null,
+      completedAt: input.failedAt,
+      updatedAt: input.failedAt,
+    }));
+  }
+
+  /** Withdraw a staged action before any provider call. Terminal. */
+  cancelOutboundAction(
+    id: EntityId,
+    userId: EntityId,
+    reason: string | null,
+    cancelledAt: DateTime,
+  ): Result<OutboundAction, StorageError> {
+    const action = this.requireOutboundAction(id, userId);
+    if (!action.ok) return action;
+    const current = action.value;
+    if (current.status !== "ready" && current.status !== "failed") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this action is already ${current.status}`),
+      };
+    }
+    return this.writeOutboundAction(current.id, (row) => ({
+      ...row,
+      status: "cancelled",
+      completedAt: cancelledAt,
+      updatedAt: cancelledAt,
+      ...(reason === null ? {} : { failureMessage: reason }),
+    }));
+  }
+
+  /** Record one step an action took. Append-only; never edited or deleted. */
+  createOutboundEvent(input: {
+    workspaceId: EntityId;
+    actorUserId: EntityId;
+    event: Omit<OutboundEvent, "id" | "workspaceId" | "actorUserId" | "createdAt">;
+  }): Result<OutboundEvent, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.actorUserId);
+    if (!auth.ok) return auth;
+    const action = this.findById("outboundActions", input.event.actionId);
+    if (!action || action.workspaceId !== input.workspaceId) {
+      return {
+        ok: false,
+        error: toError("INVALID", "outbound action does not exist in this workspace"),
+      };
+    }
+    const event: OutboundEvent = {
+      ...input.event,
+      id: newId(),
+      workspaceId: input.workspaceId,
+      actorUserId: input.actorUserId,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("outboundEvents", (rows) => rows.push(event));
+    return { ok: true, value: event };
+  }
+
+  getOutboundAction(id: EntityId, userId: EntityId): Result<OutboundAction, StorageError> {
+    return this.requireOutboundAction(id, userId);
+  }
+
+  /** A workspace's outbound actions, newest first. */
+  listOutboundActions(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: {
+      draftId?: EntityId;
+      approvalId?: EntityId;
+      contactId?: EntityId;
+      status?: OutboundActionStatus;
+    },
+  ): Result<OutboundAction[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    let scoped = this.rows("outboundActions").filter((a) => a.workspaceId === workspaceId);
+    if (filter?.draftId) scoped = scoped.filter((a) => a.draftId === filter.draftId);
+    if (filter?.approvalId) scoped = scoped.filter((a) => a.approvalId === filter.approvalId);
+    if (filter?.contactId) scoped = scoped.filter((a) => a.contactId === filter.contactId);
+    if (filter?.status) scoped = scoped.filter((a) => a.status === filter.status);
+    return {
+      ok: true,
+      value: [...scoped].sort((a, b) =>
+        a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0,
+      ),
+    };
+  }
+
+  /**
+   * Actions for one approval.
+   *
+   * This is the idempotency check a send depends on: a second send of the same
+   * approval is refused by finding the action that already carries it.
+   */
+  findOutboundActionByApproval(
+    approvalId: EntityId,
+    userId: EntityId,
+  ): Result<OutboundAction | null, StorageError> {
+    const approval = this.findById("approvalRequests", approvalId);
+    if (!approval) return { ok: false, error: toError("NOT_FOUND", "approval request not found") };
+    const auth = this.requireWorkspace(approval.workspaceId, userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("outboundActions").find((a) => a.approvalId === approvalId);
+    return { ok: true, value: found ?? null };
+  }
+
+  /** One action's audit trail, oldest first. */
+  listOutboundEvents(actionId: EntityId, userId: EntityId): Result<OutboundEvent[], StorageError> {
+    const action = this.findById("outboundActions", actionId);
+    if (!action) return { ok: false, error: toError("NOT_FOUND", "outbound action not found") };
+    const auth = this.requireWorkspace(action.workspaceId, userId);
+    if (!auth.ok) return auth;
+    const events = this.rows("outboundEvents").filter((e) => e.actionId === actionId);
+    return { ok: true, value: [...events].sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)) };
+  }
+
+  /**
+   * Add an address to the workspace's opt-out list.
+   *
+   * Idempotent by address: adding the same address twice returns the existing
+   * record rather than a duplicate, because a suppression list that can grow
+   * two rows for one address is a list nobody can audit.
+   */
+  createOutboundSuppression(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    suppression: { email: string; reason: string };
+  }): Result<OutboundSuppression, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+    const email = input.suppression.email.toLowerCase();
+    const existing = this.rows("outboundSuppressions").find(
+      (s) => s.workspaceId === input.workspaceId && s.email === email,
+    );
+    if (existing) return { ok: true, value: existing };
+
+    const stamp = toDateTime(now());
+    const suppression: OutboundSuppression = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      email,
+      reason: input.suppression.reason,
+      createdBy: input.createdBy,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    this.mutate("outboundSuppressions", (rows) => rows.push(suppression));
+    return { ok: true, value: suppression };
+  }
+
+  /**
+   * Is this address suppressed in this workspace?
+   *
+   * Matched case-insensitively on the lower-cased address, because an opt-out
+   * is a statement about a person, not about the casing someone typed it in.
+   */
+  isSuppressed(
+    workspaceId: EntityId,
+    userId: EntityId,
+    email: string,
+  ): Result<boolean, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const needle = email.toLowerCase();
+    return {
+      ok: true,
+      value: this.rows("outboundSuppressions").some(
+        (s) => s.workspaceId === workspaceId && s.email === needle,
+      ),
+    };
+  }
+
+  listOutboundSuppressions(
+    workspaceId: EntityId,
+    userId: EntityId,
+  ): Result<OutboundSuppression[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("outboundSuppressions").filter((s) => s.workspaceId === workspaceId);
+    return {
+      ok: true,
+      value: [...scoped].sort((a, b) =>
+        a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0,
+      ),
+    };
+  }
+
+  /** Resolve one action for reading or writing, authorized against its tenant. */
+  private requireOutboundAction(
+    id: EntityId,
+    userId: EntityId,
+  ): Result<OutboundAction, StorageError> {
+    const action = this.findById("outboundActions", id);
+    if (!action) return { ok: false, error: toError("NOT_FOUND", "outbound action not found") };
+    const auth = this.requireWorkspace(action.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: action };
+  }
+
+  /** Replace one action row through the store's single mutation path. */
+  private writeOutboundAction(
+    id: EntityId,
+    write: (row: OutboundAction) => OutboundAction,
+  ): Result<OutboundAction, StorageError> {
+    let written: OutboundAction | null = null;
+    this.mutate("outboundActions", (rows) => {
+      const typed = rows as OutboundAction[];
+      const index = typed.findIndex((row) => row.id === id);
+      if (index === -1) return;
+      const next = write(typed[index] as OutboundAction);
+      typed[index] = next;
+      written = next;
+    });
+    if (written === null) {
+      return { ok: false, error: toError("NOT_FOUND", "outbound action not found") };
+    }
+    return { ok: true, value: written };
+  }
+
   /** Cleanup helper so tests and local runs do not leave files behind. */
   destroy(): void {
     try {
@@ -2799,6 +3286,19 @@ export const db = {
   getApprovalRequest: store.getApprovalRequest.bind(store),
   listApprovalRequests: store.listApprovalRequests.bind(store),
   listApprovalRequestEvents: store.listApprovalRequestEvents.bind(store),
+  createOutboundAction: store.createOutboundAction.bind(store),
+  recordOutboundAttempt: store.recordOutboundAttempt.bind(store),
+  confirmOutboundSent: store.confirmOutboundSent.bind(store),
+  recordOutboundFailure: store.recordOutboundFailure.bind(store),
+  cancelOutboundAction: store.cancelOutboundAction.bind(store),
+  createOutboundEvent: store.createOutboundEvent.bind(store),
+  getOutboundAction: store.getOutboundAction.bind(store),
+  listOutboundActions: store.listOutboundActions.bind(store),
+  findOutboundActionByApproval: store.findOutboundActionByApproval.bind(store),
+  listOutboundEvents: store.listOutboundEvents.bind(store),
+  createOutboundSuppression: store.createOutboundSuppression.bind(store),
+  isSuppressed: store.isSuppressed.bind(store),
+  listOutboundSuppressions: store.listOutboundSuppressions.bind(store),
 
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),

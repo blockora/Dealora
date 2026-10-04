@@ -35,9 +35,9 @@ import type { ApprovalRepository, Clock } from "@dealora/approval";
  *  - content that moves under a pending request cannot be approved;
  *  - another tenant's approval is unreachable and never confirmed to exist.
  *
- * The last test proves there is still no outbound surface: no send route, no
- * channel and no provider, because sending is Phase 11 and an engine that could
- * reach one would skip this phase entirely.
+ * The last test proves that stays true after Phase 11 landed: no approval route
+ * can send or reach a provider, and recording an approval creates no outbound
+ * action at all — an approval is a permission, never a trigger.
  */
 
 let seq = 0;
@@ -988,7 +988,7 @@ describe("Phase 10 gate — approval engine", () => {
     expect(empty.approvals).toHaveLength(0);
   });
 
-  it("cannot be made to send: no outbound route, no provider, no channel", async () => {
+  it("cannot be made to send: approving is not sending", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({ researchProviders: [provider()] });
     const { token, userId, workspaceId } = tenant("No Send", unique("p10s") + "@example.com");
@@ -1005,19 +1005,39 @@ describe("Phase 10 gate — approval engine", () => {
       ),
     );
 
-    // An approval is stored and recorded, and there is still no way to act on
-    // it. Phase 11 is where a provider is introduced, behind its own interface
-    // and its own independent verification of these records.
-    const names = Object.keys(handlers).map((name) => name.toLowerCase());
-    for (const forbidden of ["send", "dispatch", "deliver", "provider", "channel"]) {
-      expect(names.some((name) => name.includes(forbidden))).toBe(false);
+    // The approval is stored and recorded. No approval route can send, dispatch,
+    // deliver or reach a provider: Phase 11 added those as separate routes
+    // behind their own verification, and none of them is an approval route.
+    const approvalRoutes = [
+      "createApprovalRequestHandler",
+      "decideApprovalRequestHandler",
+      "cancelApprovalRequestHandler",
+      "getApprovalRequestHandler",
+      "previewApprovalRequestHandler",
+      "listApprovalRequestsHandler",
+      "approvalHistoryHandler",
+      "getApprovalPolicyHandler",
+    ];
+    for (const route of approvalRoutes) {
+      const name = route.toLowerCase();
+      for (const forbidden of ["send", "dispatch", "deliver", "provider", "channel"]) {
+        expect(name.includes(forbidden)).toBe(false);
+      }
     }
 
-    // Nothing was sent, because there is no route that could send.
+    // And the substantive claim: recording a human approval creates **no**
+    // outbound action. An approval is a permission, not a trigger — something
+    // else has to decide to act on it, which is exactly the separation that
+    // makes the approval reviewable.
     const listed = defaultStore.listApprovalRequests(workspaceId, userId);
     expect(isOk(listed)).toBe(true);
     if (!isOk(listed)) return;
     expect(listed.value).toHaveLength(1);
     expect(listed.value[0]?.status).toBe("approved");
+
+    const actions = defaultStore.listOutboundActions(workspaceId, userId);
+    expect(isOk(actions)).toBe(true);
+    if (!isOk(actions)) return;
+    expect(actions.value).toHaveLength(0);
   });
 });

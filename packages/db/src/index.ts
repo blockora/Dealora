@@ -89,6 +89,13 @@ export type {
   ApprovalRequest,
   ApprovalEventKind,
   ApprovalRequestEvent,
+  OutboundChannel,
+  OutboundActionStatus,
+  OutboundFailureCode,
+  OutboundAction,
+  OutboundEventKind,
+  OutboundEvent,
+  OutboundSuppression,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -120,6 +127,9 @@ export {
   personalizedDraftTable,
   approvalRequestTable,
   approvalRequestEventTable,
+  outboundActionTable,
+  outboundEventTable,
+  outboundSuppressionTable,
   createTableSql,
   slugify,
   capString,

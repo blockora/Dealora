@@ -27,10 +27,10 @@ import { PERSONALIZATION_RENDERER_VERSION } from "@dealora/personalization";
  * the evidence it may quote, the claims it must refuse, the determinism of the
  * renderer and the refusals.
  *
- * A draft is a document. The last test proves there is no outbound surface at
- * all: no send route, no channel, no provider, and no way for a client to
- * inject approval state, because approval is Phase 10 and a draft that could
- * reach a provider would skip it entirely.
+ * A draft is a document. The last test proves that stays true after Phase 10
+ * and Phase 11 landed: a draft request cannot reach a provider, cannot carry
+ * approval state, and produces no outbound action — generating content and
+ * authorizing content remain two different things.
  */
 
 let seq = 0;
@@ -852,18 +852,36 @@ describe("Phase 9 gate — personalization engine", () => {
     expect(injected.draft.subject).not.toContain("Approved");
     expect(injected.draft.body).not.toBe("Send this exact text.");
 
-    // No handler in the transport surface can send, dispatch or deliver.
-    const names = Object.keys(handlers).map((name) => name.toLowerCase());
-    for (const forbidden of ["send", "dispatch", "deliver", "provider"]) {
-      expect(names.some((name) => name.includes(forbidden))).toBe(false);
+    // The renderer reaches nothing that can leave the system. Its own routes
+    // cannot send, dispatch, deliver or talk to a provider — the outbound
+    // routes Phase 11 added are separate handlers, and none of them is
+    // reachable from a draft request.
+    const personalizationRoutes = [
+      "createPersonalizedDraftHandler",
+      "getPersonalizedDraftHandler",
+      "listPersonalizedDraftsHandler",
+      "getPersonalizedDraftEvidenceHandler",
+      "getPersonalizationRendererHandler",
+    ];
+    for (const route of personalizationRoutes) {
+      const name = route.toLowerCase();
+      for (const forbidden of ["send", "dispatch", "deliver", "provider", "channel"]) {
+        expect(name.includes(forbidden)).toBe(false);
+      }
     }
 
-    // The workspace's drafts exist and nothing else does: there is no send
-    // record, because there is no route that could create one.
+    // And the strongest statement available: asking for a draft with every
+    // send-shaped field set produced a draft and **no outbound action at all**.
+    // Generating content is not authorizing content.
     const me = (await dataOf(handlers.meHandler(request(token, {})))) as { user: { id: string } };
     const drafts = defaultStore.listDrafts(workspaceId, me.user.id);
     expect(isOk(drafts)).toBe(true);
     if (!isOk(drafts)) return;
     expect(drafts.value).toHaveLength(1);
+
+    const actions = defaultStore.listOutboundActions(workspaceId, me.user.id);
+    expect(isOk(actions)).toBe(true);
+    if (!isOk(actions)) return;
+    expect(actions.value).toHaveLength(0);
   });
 });

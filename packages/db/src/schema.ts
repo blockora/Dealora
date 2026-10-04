@@ -210,6 +210,19 @@ export const COLUMNS = {
   expiresAt: "expires_at",
   approvalId: "approval_id",
   detail: "detail",
+
+  // Phase 11 — First Outbound Integration
+  channel: "channel",
+  draftDigest: "draft_digest",
+  recipientEmail: "recipient_email",
+  attemptCount: "attempt_count",
+  providerReference: "provider_reference",
+  attemptedAt: "attempted_at",
+  sentAt: "sent_at",
+  actionId: "action_id",
+  // `email` and `reason` are already declared above and are reused here: the
+  // suppression list's address and reason are the same concepts Phase 1's user
+  // email and Phase 3's decision reason already named.
 } as const;
 
 export type ColumnName = (typeof COLUMNS)[keyof typeof COLUMNS];
@@ -356,6 +369,48 @@ export const approvalRequestTable = "approval_requests" as const;
  */
 export const approvalRequestEventTable = "approval_request_events" as const;
 
+/**
+ * Table: outbound actions (Phase 11).
+ *
+ * One row per controlled external communication. An action is not the message:
+ * it is the system's memory of one send attempt, so it **references** the
+ * immutable draft version (`draft_id` + `draft_version` + `draft_digest`) and
+ * the approval that authorized it, rather than copying the text. There is
+ * therefore exactly one text of record, and an action cannot claim content the
+ * reviewer never saw.
+ *
+ * `approval_id` is a hard foreign key: an action cannot exist without pointing
+ * at a persisted approval record. Combined with the service's independent
+ * re-verification at send time, that is what stops a message from leaving the
+ * system on anything but a human decision.
+ *
+ * Every provider-owned column (`provider`, `provider_reference`, `status`,
+ * `attempt_count`, `failure_*`, `attempted_at`, `sent_at`) is written by the
+ * server from the provider's response only. `status` is CHECK-constrained, and
+ * `sent` is reachable only from a recorded provider confirmation.
+ */
+export const outboundActionTable = "outbound_actions" as const;
+
+/**
+ * Table: the append-only outbound audit trail (Phase 11).
+ *
+ * Every step an action takes — created, attempted, sent, failed, cancelled —
+ * leaves one row here, written by the server. A failure is as durable as a
+ * success: "it says sent but nothing arrived" is exactly the question this
+ * table exists to answer.
+ */
+export const outboundEventTable = "outbound_events" as const;
+
+/**
+ * Table: opt-out suppression list (Phase 11).
+ *
+ * One row per address a workspace has opted out of contacting. Checked before
+ * every provider call, never after. Suppression is permanent and attributed —
+ * `created_by` records who added it and `reason` records why — because an
+ * opt-out that cannot be explained is one a workspace cannot be asked to trust.
+ */
+export const outboundSuppressionTable = "outbound_suppressions" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -381,6 +436,9 @@ export const tables = [
   personalizedDraftTable,
   approvalRequestTable,
   approvalRequestEventTable,
+  outboundActionTable,
+  outboundEventTable,
+  outboundSuppressionTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -505,6 +563,24 @@ export const indexes = {
     `${COLUMN(approvalRequestEventTable, COLUMNS.id)} PRIMARY KEY`,
     `${COLUMN(approvalRequestEventTable, COLUMNS.approvalId)} NOT NULL`,
     `${COLUMN(approvalRequestEventTable, COLUMNS.workspaceId)} NOT NULL`,
+  ],
+  outboundActions: [
+    `${COLUMN(outboundActionTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(outboundActionTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(outboundActionTable, COLUMNS.draftId)} NOT NULL`,
+    `${COLUMN(outboundActionTable, COLUMNS.approvalId)} NOT NULL`,
+    `${COLUMN(outboundActionTable, COLUMNS.contactId)} NOT NULL`,
+    `${COLUMN(outboundActionTable, COLUMNS.status)} NOT NULL`,
+  ],
+  outboundEvents: [
+    `${COLUMN(outboundEventTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(outboundEventTable, COLUMNS.actionId)} NOT NULL`,
+    `${COLUMN(outboundEventTable, COLUMNS.workspaceId)} NOT NULL`,
+  ],
+  outboundSuppressions: [
+    `${COLUMN(outboundSuppressionTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(outboundSuppressionTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(outboundSuppressionTable, COLUMNS.email)} NOT NULL`,
   ],
 };
 
@@ -1006,6 +1082,72 @@ ${COLUMN(approvalRequestEventTable, COLUMNS.approvalId)} REFERENCES "${approvalR
 ${COLUMN(approvalRequestEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(approvalRequestEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(approvalRequestEventTable, COLUMNS.kind)} CHECK (${COLUMN(approvalRequestEventTable, COLUMNS.kind)} IN ('requested','approved','rejected','changes_requested','cancelled','expired'))`,
+  ),
+  createTableSql(
+    outboundActionTable,
+    [
+      COLUMN(outboundActionTable, COLUMNS.id),
+      COLUMN(outboundActionTable, COLUMNS.workspaceId),
+      COLUMN(outboundActionTable, COLUMNS.createdBy),
+      COLUMN(outboundActionTable, COLUMNS.channel),
+      COLUMN(outboundActionTable, COLUMNS.draftId),
+      COLUMN(outboundActionTable, COLUMNS.draftVersion),
+      COLUMN(outboundActionTable, COLUMNS.draftDigest),
+      COLUMN(outboundActionTable, COLUMNS.approvalId),
+      COLUMN(outboundActionTable, COLUMNS.contactId),
+      COLUMN(outboundActionTable, COLUMNS.recipientEmail),
+      COLUMN(outboundActionTable, COLUMNS.provider),
+      COLUMN(outboundActionTable, COLUMNS.status),
+      COLUMN(outboundActionTable, COLUMNS.attemptCount),
+      COLUMN(outboundActionTable, COLUMNS.providerReference),
+      COLUMN(outboundActionTable, COLUMNS.failureCode),
+      COLUMN(outboundActionTable, COLUMNS.failureMessage),
+      COLUMN(outboundActionTable, COLUMNS.attemptedAt),
+      COLUMN(outboundActionTable, COLUMNS.sentAt),
+      COLUMN(outboundActionTable, COLUMNS.completedAt),
+    ],
+    `${COLUMN(outboundActionTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(outboundActionTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(outboundActionTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(outboundActionTable, COLUMNS.draftId)} REFERENCES "${personalizedDraftTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(outboundActionTable, COLUMNS.approvalId)} REFERENCES "${approvalRequestTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(outboundActionTable, COLUMNS.contactId)} REFERENCES "${contactTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(outboundActionTable, COLUMNS.draftVersion)} CHECK (${COLUMN(outboundActionTable, COLUMNS.draftVersion)} > 0),
+${COLUMN(outboundActionTable, COLUMNS.channel)} CHECK (${COLUMN(outboundActionTable, COLUMNS.channel)} IN ('email')),
+${COLUMN(outboundActionTable, COLUMNS.status)} CHECK (${COLUMN(outboundActionTable, COLUMNS.status)} IN ('ready','sending','sent','failed','cancelled')),
+${COLUMN(outboundActionTable, COLUMNS.attemptCount)} CHECK (${COLUMN(outboundActionTable, COLUMNS.attemptCount)} >= 0),
+${COLUMN(outboundActionTable, COLUMNS.failureCode)} CHECK (${COLUMN(outboundActionTable, COLUMNS.failureCode)} IS NULL OR ${COLUMN(outboundActionTable, COLUMNS.failureCode)} IN ('invalid_recipient','provider_rejected','rate_limited','suppressed','provider_unavailable')),
+${COLUMN(outboundActionTable, COLUMNS.sentAt)} CHECK (${COLUMN(outboundActionTable, COLUMNS.sentAt)} IS NULL OR ${COLUMN(outboundActionTable, COLUMNS.status)} = 'sent')`,
+  ),
+  createTableSql(
+    outboundEventTable,
+    [
+      COLUMN(outboundEventTable, COLUMNS.id),
+      COLUMN(outboundEventTable, COLUMNS.actionId),
+      COLUMN(outboundEventTable, COLUMNS.workspaceId),
+      COLUMN(outboundEventTable, COLUMNS.actorUserId),
+      COLUMN(outboundEventTable, COLUMNS.kind),
+      COLUMN(outboundEventTable, COLUMNS.detail),
+    ],
+    `${COLUMN(outboundEventTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(outboundEventTable, COLUMNS.actionId)} REFERENCES "${outboundActionTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(outboundEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(outboundEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(outboundEventTable, COLUMNS.kind)} CHECK (${COLUMN(outboundEventTable, COLUMNS.kind)} IN ('created','send_attempted','sent','failed','cancelled'))`,
+  ),
+  createTableSql(
+    outboundSuppressionTable,
+    [
+      COLUMN(outboundSuppressionTable, COLUMNS.id),
+      COLUMN(outboundSuppressionTable, COLUMNS.workspaceId),
+      COLUMN(outboundSuppressionTable, COLUMNS.email),
+      COLUMN(outboundSuppressionTable, COLUMNS.reason),
+      COLUMN(outboundSuppressionTable, COLUMNS.createdBy),
+    ],
+    `${COLUMN(outboundSuppressionTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(outboundSuppressionTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(outboundSuppressionTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(outboundSuppressionTable, COLUMNS.email)} CHECK (${COLUMN(outboundSuppressionTable, COLUMNS.email)} = lower(${COLUMN(outboundSuppressionTable, COLUMNS.email)}))`,
   ),
 ].join("\n\n");
 
