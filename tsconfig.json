@@ -14,6 +14,7 @@
     { "path": "packages/qualification" },
     { "path": "packages/personalization" },
     { "path": "packages/approval" },
+    { "path": "packages/outbound" },
     { "path": "packages/api" }
   ]
 }
