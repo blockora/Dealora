@@ -24,7 +24,8 @@ The repository has completed **Phase 0 — Repository & Engineering Foundation**
 **Phase 7 — Evidence System**, **Phase 8 — Qualification Engine**,
 **Phase 9 — Personalization Engine**, **Phase 10 — Approval Engine**,
 **Phase 11 — First Outbound Integration**, **Phase 12 — Conversation
-Engine**, and **Phase 13 — Meeting Workflow** (see [`ROADMAP.md`](./ROADMAP.md)).
+Engine**, **Phase 13 — Meeting Workflow**, and **Phase 14 — Next Best Action**
+(see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
 with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
@@ -244,10 +245,51 @@ event*. The brief is the other half of the honesty story — it references claim
 and evidence by id rather than copying them, and writes every `§22` section it
 has no record for into `gaps` instead of filling it in. Nothing in this phase
 sends an invitation, schedules anything on a timer, or turns a meeting into a
-fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–13
-together by `tests/phases9-13-integration.test.ts`.
+fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–14
+together by `tests/phases9-14-integration.test.ts`.
 
-Next is **Phase 14 — Next Best Action**.
+Phase 14 adds the Next Best Action Engine: it answers *what should happen next?*
+for one account and for a whole workspace, reading stored rows and applying a
+fixed rule set. All seven of `ROADMAP.md` §21's required fields — action, reason,
+supporting state, evidence, confidence, expected outcome and approval requirement
+— are **fields** on every recommendation rather than prose assembled at read
+time, so an answer stays checkable after the rules move on.
+
+Two decisions shape it. First, the live answer is **recomputed** on every read
+and the stored row is only the *history of advice*: a stored answer goes stale
+the moment an approval is declined, and a stale "send this now" is the most
+dangerous wrong answer this system could give. Second, confidence is ADR 0009's
+weakest **band** — `low | medium | high` — and never a percentage. The `93%`
+printed in `DEALORA_BLUEPRINT.md` §25 is a display illustration; there is no
+calibration data in this repository from which a number could mean anything, and
+a fabricated one would look *more* trustworthy than a band while meaning less.
+
+The safety properties are structural rather than procedural. Eighteen revenue
+states are declared once as `[state, action]` pairs and every published
+vocabulary is **derived** from that one table, so a state no branch can produce
+is impossible to advertise. `suppressed` is the **first** branch, so an address
+that asked to stop can never come back with a recommendation to contact it, and a
+cancelled meeting is never re-proposed over the top of a person's decision.
+`approval_required` is CHECK-constrained to agree with the §17 risk level and
+re-checked in the store, so "does a person have to act first?" is a property of
+the row rather than something a client may assert. `level_3_high_impact` is
+deliberately absent: nothing here recommends a financial, contractual or
+irreversible action.
+
+The negative space is the point. **A recommendation is advice, never an action.**
+There is no sender, no approver, no calendar, no scheduler, no queue and no
+network I/O of any kind in this phase, and the strongest thing a caller can do
+with a "send this now" recommendation is read it and then call Phase 11, which
+re-derives its own approval, digest and suppression check first. The gate proves
+it by snapshotting every row count: recording a Level 2 recommendation adds
+exactly one advice row and touches no draft, approval, outbound action, meeting,
+claim or evidence record. Nothing here writes to the Phase 7 evidence graph
+either — a "next step" is DEALORA's own inference about the workspace's records,
+not an attested fact about an account — and `evidenceIds` / `claimIds` are
+reference lists, never copies. Its gate is covered by
+`tests/phase14-gate.test.ts`.
+
+Next is **Phase 15 — Revenue Graph**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -275,13 +317,14 @@ packages/       Shared TypeScript packages (built with project references)
   outbound/      One email channel behind a provider interface, opt-outs, delivery state (Phase 11)
   conversation/  Deterministic classification of inbound responses into an intent and a next action (Phase 12)
   meeting/       Booking state machine, calendar adapter boundary, preparation brief (Phase 13)
+  nextaction/    Deterministic next-best-action engine over the whole revenue loop (Phase 14)
   api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 12+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests (Phase 1-13 gates)
+tests/          Cross-package integration tests (Phase 1-14 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
@@ -300,8 +343,9 @@ Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)), the Account
 ([0009](./docs/adr/0009-qualification-engine.md)), the Approval Engine
 ([0010](./docs/adr/0010-approval-engine.md)), the First Outbound Integration
 ([0011](./docs/adr/0011-first-outbound-integration.md)), and the Conversation
-Engine ([0012](./docs/adr/0012-conversation-engine.md)), and the Meeting Workflow
-([0013](./docs/adr/0013-meeting-workflow.md)).
+Engine ([0012](./docs/adr/0012-conversation-engine.md)), the Meeting Workflow
+([0013](./docs/adr/0013-meeting-workflow.md)), and the Next Best Action Engine
+([0014](./docs/adr/0014-next-best-action-engine.md)).
 
 ## Getting started
 

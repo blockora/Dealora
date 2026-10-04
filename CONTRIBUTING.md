@@ -69,14 +69,17 @@ Phase 1 needs no credential: passwords are hashed with scrypt and a per-user
 salt, sessions are opaque random tokens, and the test suite runs without any
 secret. Add new keys to this table in the same commit that introduces them.
 
-Phases 1-13 add no further keys and require no LLM provider key: the Business
+Phases 1-14 add no further keys and require no LLM provider key: the Business
 Brain, the Revenue Goal Engine, the Revenue Plan Compiler, the Account &
 Prospect Input layer, the Research Engine, the Evidence System, the
 Qualification Engine, the Personalization Engine, the Approval Engine, the
-Outbound Engine, the Conversation Engine and the Meeting Workflow are
-deterministic data layers. The Meeting Workflow adds no key either: it books
-through a **sandbox** calendar adapter that performs no network I/O, and reuses
-the Phase 11 suppression list for its opt-out checks. `ROADMAP.md` §30 places
+Outbound Engine, the Conversation Engine, the Meeting Workflow and the Next Best
+Action Engine are deterministic data layers. The Meeting Workflow adds no key
+either: it books through a **sandbox** calendar adapter that performs no network
+I/O, and reuses the Phase 11 suppression list for its opt-out checks. The Next
+Best Action Engine adds no key and no provider of any kind: it reads stored rows
+and applies a fixed rule set, with no network I/O, so there is nothing to
+configure. `ROADMAP.md` §30 places
 live calendar and CRM integrations in Phase 23, so registering a real adapter is
 an explicit deployment decision and its keys must be documented here in the same
 commit that introduces them. The Research Engine ships
