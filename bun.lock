@@ -28,6 +28,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@dealora/account": "workspace:*",
+        "@dealora/approval": "workspace:*",
         "@dealora/auth": "workspace:*",
         "@dealora/brain": "workspace:*",
         "@dealora/core": "workspace:*",
@@ -38,6 +39,15 @@
         "@dealora/plan": "workspace:*",
         "@dealora/qualification": "workspace:*",
         "@dealora/research": "workspace:*",
+      },
+    },
+    "packages/approval": {
+      "name": "@dealora/approval",
+      "version": "0.1.0",
+      "dependencies": {
+        "@dealora/core": "workspace:*",
+        "@dealora/db": "workspace:*",
+        "@dealora/personalization": "workspace:*",
       },
     },
     "packages/auth": {
@@ -131,6 +141,8 @@
     "@dealora/account": ["@dealora/account@workspace:packages/account"],
 
     "@dealora/api": ["@dealora/api@workspace:packages/api"],
+
+    "@dealora/approval": ["@dealora/approval@workspace:packages/approval"],
 
     "@dealora/auth": ["@dealora/auth@workspace:packages/auth"],
 

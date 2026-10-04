@@ -50,6 +50,10 @@ export default defineConfig({
         replacement: new URL("./packages/personalization/src/index.ts", import.meta.url).pathname,
       },
       {
+        find: "@dealora/approval",
+        replacement: new URL("./packages/approval/src/index.ts", import.meta.url).pathname,
+      },
+      {
         find: "@dealora/api",
         replacement: new URL("./packages/api/src/index.ts", import.meta.url).pathname,
       },

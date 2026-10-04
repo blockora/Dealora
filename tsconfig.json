@@ -13,6 +13,7 @@
     { "path": "packages/evidence" },
     { "path": "packages/qualification" },
     { "path": "packages/personalization" },
+    { "path": "packages/approval" },
     { "path": "packages/api" }
   ]
 }
