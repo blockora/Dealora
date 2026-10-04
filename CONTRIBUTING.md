@@ -69,11 +69,11 @@ Phase 1 needs no credential: passwords are hashed with scrypt and a per-user
 salt, sessions are opaque random tokens, and the test suite runs without any
 secret. Add new keys to this table in the same commit that introduces them.
 
-Phases 1-11 add no further keys and require no LLM provider key: the Business
+Phases 1-12 add no further keys and require no LLM provider key: the Business
 Brain, the Revenue Goal Engine, the Revenue Plan Compiler, the Account &
 Prospect Input layer, the Research Engine, the Evidence System, the
-Qualification Engine, the Personalization Engine, the Approval Engine and the
-Outbound Engine are deterministic data layers. The Research Engine ships
+Qualification Engine, the Personalization Engine, the Approval Engine, the
+Outbound Engine and the Conversation Engine are deterministic data layers. The Research Engine ships
 with one permitted provider — the workspace's own account record — so no
 external source credential is configured or read; registering an authorized API
 or a permitted public source is an explicit deployment decision and its key must
@@ -83,7 +83,9 @@ The Qualification Engine adds no key either: it scores from the Business Brain
 ICP, a Revenue Goal window and the evidence already stored, and calls no model
 provider. The Personalization Engine renders deterministically from stored
 records and calls nothing. The Approval Engine adds no key: a decision is
-recorded from the session and the server's clock.
+recorded from the session and the server's clock. The Conversation Engine adds no
+key either: it classifies stored text with declared rules, calls nothing, and
+writes to the suppression list that already exists.
 
 The Outbound Engine is where a credential would first appear, and it is
 deliberately not there yet. It ships **one** provider, `sandbox_email`, which

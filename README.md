@@ -22,8 +22,9 @@ The repository has completed **Phase 0 — Repository & Engineering Foundation**
 **Phase 3 — Revenue Goal Engine**, **Phase 4 — Revenue Plan Compiler**,
 **Phase 5 — Account & Prospect Input**, **Phase 6 — Research Engine**,
 **Phase 7 — Evidence System**, **Phase 8 — Qualification Engine**,
-**Phase 9 — Personalization Engine**, **Phase 10 — Approval Engine**, and
-**Phase 11 — First Outbound Integration** (see [`ROADMAP.md`](./ROADMAP.md)).
+**Phase 9 — Personalization Engine**, **Phase 10 — Approval Engine**,
+**Phase 11 — First Outbound Integration**, and **Phase 12 — Conversation
+Engine** (see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
 with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
@@ -181,7 +182,35 @@ recorded as open requirements rather than limitations in
 Its gate is covered by `tests/phase11-gate.test.ts`, and the three phases together
 by `tests/phases9-11-integration.test.ts`.
 
-Next is **Phase 12 — Conversation Engine**.
+Phase 12 adds the Conversation Engine: a response that was actually received is
+recorded **verbatim** with its provenance and read by a deterministic
+classifier into one of the ten states `DEALORA_BLUEPRINT.md` §18 names — plus a
+confidence, a **recommended** next action, and an explicit "does a person have to
+look at this" flag. The rules, not a model, decide: no model, no clock, no
+randomness, a rule version stored on every record, and a `reasons` list naming
+the phrases that decided it, so a workspace can always answer "why did DEALORA
+read it that way" without re-running anything. Safety outranks everything else — an
+opt-out and a refusal both beat a question asked in the same breath, and `not
+interested` can never be read as interest — and `unknown` with no guess is a real
+answer when nothing matched. An opt-out is honoured **immediately** by writing to
+the same Phase 11 suppression list the send path already checks, so there is no
+second mechanism that could disagree with it about who is blocked. Everything else
+waits for a human.
+
+The negative space is the design. The strongest possible recommendation is
+`prepare_reply_for_approval`: this phase cannot send, cannot approve, cannot
+schedule, and **cannot turn a reply into evidence**. A prospect's own words are an
+interested party's claim, so nothing here writes to `accountClaims` or `evidence`,
+and Phase 7 stays the only route from something a source said to something
+DEALORA treats as a fact. A response can only be recorded against an outbound
+action that actually went `sent`, and the contact and account it is filed under
+are resolved server-side from that action. No provider-side inbound retrieval,
+webhook or poller ships here, and an objection is classified and escalated rather
+than answered — no objection library, no response pattern and no guarantee is
+invented. Its gate is covered by `tests/phase12-gate.test.ts`, and Phases 9–12
+together by `tests/phases9-12-integration.test.ts`.
+
+Next is **Phase 13 — Meeting Workflow**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -207,13 +236,14 @@ packages/       Shared TypeScript packages (built with project references)
   personalization/ Evidence-backed draft rendering, warnings, determinism (Phase 9)
   approval/      Human approval of one exact draft version, audit trail (Phase 10)
   outbound/      One email channel behind a provider interface, opt-outs, delivery state (Phase 11)
+  conversation/  Deterministic classification of inbound responses into an intent and a next action (Phase 12)
   api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 12+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests (Phase 1-11 gates)
+tests/          Cross-package integration tests (Phase 1-12 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
@@ -230,8 +260,9 @@ Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)), the Account
 ([0007](./docs/adr/0007-research-engine.md)), the Evidence System
 ([0008](./docs/adr/0008-evidence-system.md)), the Qualification Engine
 ([0009](./docs/adr/0009-qualification-engine.md)), the Approval Engine
-([0010](./docs/adr/0010-approval-engine.md)), and the First Outbound Integration
-([0011](./docs/adr/0011-first-outbound-integration.md)).
+([0010](./docs/adr/0010-approval-engine.md)), the First Outbound Integration
+([0011](./docs/adr/0011-first-outbound-integration.md)), and the Conversation
+Engine ([0012](./docs/adr/0012-conversation-engine.md)).
 
 ## Getting started
 
@@ -271,14 +302,16 @@ convention and the currently supported keys are documented in
 
 The only key is `DB_DIR` — the directory the local store writes
 `dealora.json` into (defaults to `packages/db/src/data`, which is
-git-ignored). Phases 1-11 need no credential: passwords are hashed with
+git-ignored). Phases 1-12 need no credential: passwords are hashed with
 scrypt, goal parsing, plan compilation, account deduplication, research
-normalization, evidence conversion, qualification scoring, draft rendering and
-approval decisions are deterministic and take no model provider, and no secret is
+normalization, evidence conversion, qualification scoring, draft rendering,
+approval decisions and response classification are deterministic and take no
+model provider, and no secret is
 ever hardcoded or read at module scope. Phase 11 ships a **sandbox** outbound
 provider that performs no network I/O; registering a real provider is an explicit
 deployment decision whose keys must be documented here in the same commit that
-introduces them.
+introduces them. Phase 12 adds no key either: it classifies stored text with
+declared rules and writes to the Phase 11 suppression list that already exists.
 
 ## License
 
