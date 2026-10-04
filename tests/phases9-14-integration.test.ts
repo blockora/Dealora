@@ -434,7 +434,7 @@ afterAll(() => {
   defaultStore.destroy();
 });
 
-describe("phases 9-13 integration — document, decision, effect, response, booking", () => {
+describe("phases 9-14 integration — document, decision, effect, response, booking, next step", () => {
   it("carries one evidence-backed document through one decision to one delivery and one response", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({
@@ -1007,6 +1007,106 @@ describe("phases 9-13 integration — document, decision, effect, response, book
       handlers.listMeetingsHandler(request(mine.token, { workspaceId: mine.workspaceId })),
     )) as { meetings: { id: string }[] };
     expect(theirList.meetings).toEqual([]);
+  });
+
+  it("reads the whole loop back as one next step, per tenant", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+    });
+    const mine = tenant("Next Step Mine");
+    const theirs = tenant("Next Step Theirs");
+
+    // The loop runs to a genuine delivery and a genuine positive response.
+    const sent = await journey(
+      handlers,
+      mine.token,
+      mine.workspaceId,
+      unique("p912next") + "@northwind.example",
+    );
+    const positive = (await dataOf(
+      handlers.createInboundMessageHandler(
+        request(
+          mine.token,
+          { workspaceId: mine.workspaceId, outboundActionId: sent.sentActionId },
+          { body: "Happy to chat, book a call." },
+        ),
+      ),
+    )) as { classification: { id: string; intent: string } };
+    expect(positive.classification.intent).toBe("positive_intent");
+
+    // Everything that actually happened is now one recommendation away.
+    const recommendation = (await dataOf(
+      handlers.recommendNextActionHandler(
+        request(mine.token, { workspaceId: mine.workspaceId }, { accountId: sent.accountId }),
+      ),
+    )) as {
+      action: string;
+      supportingState: string;
+      reason: string;
+      confidenceReasons: string[];
+      confidence: string;
+      expectedOutcome: string;
+      approvalRequired: boolean;
+      riskLevel: string;
+      evidenceIds: string[];
+      ruleVersion: string;
+    };
+
+    // §21's seven required fields, all present on the live answer.
+    expect(recommendation.action).toBe("propose_meeting");
+    expect(recommendation.supportingState).toBe("positive_response_without_meeting");
+    expect(recommendation.reason).toContain("positive_intent");
+    expect(recommendation.confidenceReasons.length).toBeGreaterThan(0);
+    expect(["low", "medium", "high"]).toContain(recommendation.confidence);
+    expect(recommendation.expectedOutcome).toBe("meeting_proposed");
+    expect(recommendation.approvalRequired).toBe(false);
+    expect(recommendation.riskLevel).toBe("level_1_draft");
+    expect(recommendation.ruleVersion).toBe("next-action-1.0.0");
+    // It cites **no** evidence, and that is deliberate: this recommendation rests
+    // on a conversation DEALORA took part in, not on the account's fit profile.
+    // Claiming the evidence graph supports a statement about a reply would imply
+    // the records back something they never saw — the failure Phase 7 exists to
+    // prevent. A recommendation with nothing to cite cites nothing.
+    expect(recommendation.evidenceIds).toEqual([]);
+
+    // It agrees with what every earlier phase actually did: no more sends, no new
+    // draft, no new approval.
+    const before = rowCounts();
+    await dataOf(
+      handlers.recordNextActionHandler(
+        request(mine.token, { workspaceId: mine.workspaceId }, { accountId: sent.accountId }),
+      ),
+    );
+    expect(rowCounts()).toEqual(before);
+
+    // And it is per tenant: their board never mentions my account.
+    const theirBoard = (await dataOf(
+      handlers.recommendWorkspaceActionsHandler(
+        request(theirs.token, { workspaceId: theirs.workspaceId }),
+      ),
+    )) as { recommendations: { accountId: string }[] };
+    expect(theirBoard.recommendations).toEqual([]);
+
+    // Calling into a workspace I do not belong to is refused at the workspace
+    // guard, before the account is ever looked up.
+    const crossed = await errorOf(
+      handlers.recommendNextActionHandler(
+        request(mine.token, { workspaceId: theirs.workspaceId }, { accountId: sent.accountId }),
+      ),
+    );
+    expect(crossed.code).toBe("UNAUTHORIZED");
+
+    // And an account that is not mine, named inside my own workspace, is reported
+    // as absent rather than forbidden — so a foreign id cannot be discovered by
+    // watching which error comes back.
+    const foreign = await errorOf(
+      handlers.recommendNextActionHandler(
+        request(mine.token, { workspaceId: mine.workspaceId }, { accountId: "acct-not-mine" }),
+      ),
+    );
+    expect(foreign.code).toBe("NOT_FOUND");
   });
 });
 
