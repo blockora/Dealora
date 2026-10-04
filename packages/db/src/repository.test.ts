@@ -2667,3 +2667,507 @@ describe("approval requests and outbound actions", () => {
     expect(denied.error.code).toBe("UNAUTHORIZED");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 12 — Conversation
+//
+// Phase 12's storage tests exist because the phase adds a second way for
+// something a workspace did not author to enter the system. The invariants
+// asserted here are the ones that keeps that safe: a response can only answer a
+// message that actually went out, a caller cannot file it against anyone else,
+// one message is read once, and the two safety rules the schema also constrains
+// are enforced in the store rather than trusted from the caller.
+// ---------------------------------------------------------------------------
+
+describe("inbound messages and conversation classifications", () => {
+  /**
+   * A whole tenant whose one outbound action has been driven all the way to
+   * `sent`.
+   *
+   * Built from real account, contact, draft and approval rows rather than from
+   * a stubbed action, because the store refuses an action that does not point at
+   * rows that exist — and because a Phase 12 test that passed against a
+   * fabricated action would not be testing the rule at all.
+   */
+  function sent(name = "Acme", email = "owner@example.com", shared?: Store) {
+    const store = shared ?? seed();
+    const owner = makeOwner(store, email);
+    const workspaceId = makeWorkspace(store, owner.id, name);
+    const account = store.createAccount({
+      workspaceId,
+      createdBy: owner.id,
+      account: {
+        name: "Northwind",
+        website: null,
+        domain: "northwind.example",
+        industry: "SaaS",
+        companySize: "50-200",
+        geography: "Germany",
+        description: null,
+        source: "manual",
+        sourceReference: null,
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(account)) throw new Error("seed account failed");
+    const contact = store.createContact({
+      workspaceId,
+      createdBy: owner.id,
+      contact: {
+        accountId: account.value.id,
+        firstName: "Ada",
+        lastName: "Lovelace",
+        fullName: "Ada Lovelace",
+        jobTitle: "VP Support",
+        email: "ada@northwind.example",
+        phone: null,
+        profileUrl: null,
+        source: "manual",
+        sourceReference: null,
+        status: "active",
+      },
+    });
+    if (!isOk(contact)) throw new Error("seed contact failed");
+    const draft = store.createDraft({
+      workspaceId,
+      createdBy: owner.id,
+      accountId: account.value.id,
+      draft: {
+        contactId: contact.value.id,
+        rendererVersion: "deterministic-1.0.0",
+        contextDigest: "fnv1a-seed",
+        qualificationId: null,
+        offerId: null,
+        subject: "Support Automation for Northwind",
+        body: "Hi Ada,\n\nAbout Support Automation.",
+        personalizationPoints: [],
+        approvedClaimIds: [],
+        warnings: [],
+      },
+    });
+    if (!isOk(draft)) throw new Error("seed draft failed");
+    const approval = store.createApprovalRequest({
+      workspaceId,
+      createdBy: owner.id,
+      approval: {
+        actionKind: "send_message",
+        riskLevel: "level_2_external_action",
+        draftId: draft.value.id,
+        draftVersion: draft.value.version,
+        previewSubject: draft.value.subject,
+        previewDigest: "fnv1a-preview",
+        expiresAt: null,
+      },
+    });
+    if (!isOk(approval)) throw new Error("seed approval failed");
+
+    const created = store.createOutboundAction({
+      workspaceId,
+      createdBy: owner.id,
+      action: {
+        channel: "email",
+        draftId: draft.value.id,
+        draftVersion: draft.value.version,
+        draftDigest: "fnv1a-draft",
+        approvalId: approval.value.id,
+        contactId: contact.value.id,
+        recipientEmail: "ada@northwind.example",
+      },
+    });
+    if (!isOk(created)) throw new Error("seed action failed");
+    const attempted = store.recordOutboundAttempt({
+      id: created.value.id,
+      userId: owner.id,
+      provider: "sandbox-email",
+      attemptedAt: "2026-10-05T09:00:00.000Z",
+    });
+    if (!isOk(attempted)) throw new Error("seed attempt failed");
+    const confirmed = store.confirmOutboundSent({
+      id: created.value.id,
+      userId: owner.id,
+      provider: "sandbox-email",
+      providerReference: "provider-1",
+      sentAt: "2026-10-05T09:00:01.000Z",
+    });
+    if (!isOk(confirmed)) throw new Error("seed confirmation failed");
+    return {
+      store,
+      ownerId: owner.id,
+      workspaceId,
+      accountId: account.value.id,
+      contactId: contact.value.id,
+      actionId: confirmed.value.id,
+    };
+  }
+
+  function messageFor(
+    fixture: ReturnType<typeof sent>,
+    body = "Please unsubscribe me.",
+    receivedAt = "2026-10-05T09:30:00.000Z",
+  ) {
+    return fixture.store.createInboundMessage({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      message: {
+        outboundActionId: fixture.actionId,
+        source: "manual",
+        fromAddress: "ada@northwind.example",
+        subject: "Re: support automation",
+        body,
+        providerMessageId: null,
+        receivedAt,
+      },
+    });
+  }
+
+  function classificationFor(
+    fixture: ReturnType<typeof sent>,
+    inboundMessageId: string,
+    overrides: Partial<{
+      intent: "unsubscribe" | "pricing" | "question" | "unknown";
+      recommendedNextAction: "stop_contacting" | "prepare_reply_for_approval" | "record_and_hold";
+      humanInterventionRequired: boolean;
+      suppressed: boolean;
+    }> = {},
+  ) {
+    return fixture.store.createConversationClassification({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      classification: {
+        inboundMessageId,
+        outboundActionId: fixture.actionId,
+        classifierVersion: "deterministic-1.0.0",
+        intent: overrides.intent ?? "unsubscribe",
+        confidence: "high",
+        reasons: ["matched unsubscribe"],
+        signals: ["opt_out"],
+        recommendedNextAction:
+          overrides.recommendedNextAction ??
+          (overrides.intent === "unsubscribe" ? "stop_contacting" : "prepare_reply_for_approval"),
+        humanInterventionRequired: overrides.humanInterventionRequired ?? false,
+        suppressed: overrides.suppressed ?? false,
+      },
+    });
+  }
+
+  it("stores a response verbatim and resolves the contact and account itself", () => {
+    const fixture = sent();
+    const created = messageFor(fixture, "This sounds good.");
+    expect(isOk(created)).toBe(true);
+    if (!isOk(created)) return;
+    // The text is exactly what arrived, and neither the contact nor the account
+    // is a field the caller supplied: both came from the action.
+    expect(created.value.body).toBe("This sounds good.");
+    expect(created.value.contactId).toBe(fixture.contactId);
+    expect(created.value.accountId).toBe(fixture.accountId);
+    expect(created.value.source).toBe("manual");
+    expect(created.value.receivedAt).toBe("2026-10-05T09:30:00.000Z");
+
+    const reread = fixture.store.getInboundMessage(created.value.id, fixture.ownerId);
+    expect(isOk(reread)).toBe(true);
+    if (!isOk(reread)) return;
+    expect(reread.value.body).toBe("This sounds good.");
+  });
+
+  it("refuses a response against a message that was never sent", () => {
+    const fixture = sent();
+    // A second, real action that is deliberately left in `ready`: the store
+    // refuses an action per approval, so this needs its own approval to exist at
+    // all, which is exactly the point — an unsent action is a genuine record.
+    const draft = fixture.store.createDraft({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      accountId: fixture.accountId,
+      draft: {
+        contactId: fixture.contactId,
+        rendererVersion: "deterministic-1.0.0",
+        contextDigest: "fnv1a-seed-2",
+        qualificationId: null,
+        offerId: null,
+        subject: "A second note",
+        body: "Hi Ada,\n\nOne more note.",
+        personalizationPoints: [],
+        approvedClaimIds: [],
+        warnings: [],
+      },
+    });
+    if (!isOk(draft)) throw new Error("seed second draft failed");
+    const approval = fixture.store.createApprovalRequest({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      approval: {
+        actionKind: "send_message",
+        riskLevel: "level_2_external_action",
+        draftId: draft.value.id,
+        draftVersion: draft.value.version,
+        previewSubject: draft.value.subject,
+        previewDigest: "fnv1a-preview-2",
+        expiresAt: null,
+      },
+    });
+    if (!isOk(approval)) throw new Error("seed second approval failed");
+    const unsent = fixture.store.createOutboundAction({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      action: {
+        channel: "email",
+        draftId: draft.value.id,
+        draftVersion: draft.value.version,
+        draftDigest: "fnv1a-draft-2",
+        approvalId: approval.value.id,
+        contactId: fixture.contactId,
+        recipientEmail: "ada@northwind.example",
+      },
+    });
+    if (!isOk(unsent)) throw new Error("seed unsent action failed");
+
+    const refused = fixture.store.createInboundMessage({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      message: {
+        outboundActionId: unsent.value.id,
+        source: "manual",
+        fromAddress: null,
+        subject: null,
+        body: "Sounds good!",
+        providerMessageId: null,
+        receivedAt: "2026-10-05T09:30:00.000Z",
+      },
+    });
+    expect(isErr(refused)).toBe(true);
+    if (!isErr(refused)) return;
+    // A message DEALORA never sent cannot have been answered.
+    expect(refused.error.code).toBe("CONFLICT");
+    expect(fixture.store.db.inboundMessages).toHaveLength(0);
+  });
+
+  it("refuses a response to another tenant's action and writes nothing", () => {
+    // Two tenants in one document, which is what a shared store actually looks
+    // like: the tenant boundary is a workspace id, not a separate file.
+    const store = seed();
+    const mine = sent("Mine", "mine@example.com", store);
+    const theirs = sent("Theirs", "theirs@example.com", store);
+
+    // My workspace asks to answer *their* action: for my workspace that action
+    // does not exist, and nothing is written.
+    const crossed = store.createInboundMessage({
+      workspaceId: mine.workspaceId,
+      createdBy: mine.ownerId,
+      message: {
+        outboundActionId: theirs.actionId,
+        source: "manual",
+        fromAddress: null,
+        subject: null,
+        body: "Hello",
+        providerMessageId: null,
+        receivedAt: "2026-10-05T09:30:00.000Z",
+      },
+    });
+    expect(isErr(crossed)).toBe(true);
+    if (!isErr(crossed)) return;
+    expect(crossed.error.code).toBe("NOT_FOUND");
+    expect(store.db.inboundMessages).toHaveLength(0);
+
+    // And once theirs exists, my tenant still cannot read it — reported as not
+    // found, because an unauthorized answer would confirm the id is real.
+    const theirsMessage = messageFor(theirs, "Hello");
+    expect(isOk(theirsMessage)).toBe(true);
+    if (!isOk(theirsMessage)) return;
+    const denied = store.getInboundMessage(theirsMessage.value.id, mine.ownerId);
+    expect(isErr(denied)).toBe(true);
+    if (!isErr(denied)) return;
+    expect(denied.error.code).toBe("NOT_FOUND");
+    expect(JSON.stringify(denied.error)).not.toContain("Northwind");
+  });
+
+  it("classifies one message once, and refuses a second answer for it", () => {
+    const fixture = sent();
+    const created = messageFor(fixture);
+    if (!isOk(created)) throw new Error("seed message failed");
+
+    const first = classificationFor(fixture, created.value.id);
+    expect(isOk(first)).toBe(true);
+
+    const second = classificationFor(fixture, created.value.id, {
+      intent: "question",
+      recommendedNextAction: "prepare_reply_for_approval",
+      humanInterventionRequired: true,
+    });
+    expect(isErr(second)).toBe(true);
+    if (!isErr(second)) return;
+    // Two answers for one response is how an audit trail stops meaning anything.
+    expect(second.error.code).toBe("CONFLICT");
+    expect(fixture.store.db.conversationClassifications).toHaveLength(1);
+
+    const found = fixture.store.findConversationClassificationByMessage(
+      created.value.id,
+      fixture.ownerId,
+    );
+    expect(isOk(found)).toBe(true);
+    if (!isOk(found)) return;
+    expect(found.value?.intent).toBe("unsubscribe");
+  });
+
+  it("enforces the two safety invariants rather than trusting the caller", () => {
+    const fixture = sent();
+    const created = messageFor(fixture);
+    if (!isOk(created)) throw new Error("seed message failed");
+
+    // Only an opt-out may suppress an address.
+    const fakeSuppression = classificationFor(fixture, created.value.id, {
+      intent: "question",
+      recommendedNextAction: "prepare_reply_for_approval",
+      humanInterventionRequired: true,
+      suppressed: true,
+    });
+    expect(isErr(fakeSuppression)).toBe(true);
+    if (!isErr(fakeSuppression)) return;
+    expect(fakeSuppression.error.code).toBe("INVALID");
+
+    // And only an opt-out may proceed without a human.
+    const unsupervised = classificationFor(fixture, created.value.id, {
+      intent: "question",
+      recommendedNextAction: "prepare_reply_for_approval",
+      humanInterventionRequired: false,
+    });
+    expect(isErr(unsupervised)).toBe(true);
+    if (!isErr(unsupervised)) return;
+    expect(unsupervised.error.code).toBe("INVALID");
+
+    // The honest opt-out is accepted.
+    const honest = classificationFor(fixture, created.value.id, {
+      suppressed: true,
+    });
+    expect(isOk(honest)).toBe(true);
+  });
+
+  it("writes an append-only trail and refuses an event for a foreign classification", () => {
+    const fixture = sent();
+    const created = messageFor(fixture);
+    if (!isOk(created)) throw new Error("seed message failed");
+    const classified = classificationFor(fixture, created.value.id);
+    if (!isOk(classified)) throw new Error("seed classification failed");
+
+    for (const kind of ["classified", "suppressed", "escalated", "held"] as const) {
+      const event = fixture.store.createConversationEvent({
+        workspaceId: fixture.workspaceId,
+        actorUserId: fixture.ownerId,
+        event: {
+          classificationId: classified.value.id,
+          inboundMessageId: created.value.id,
+          kind,
+          detail: "a detail",
+        },
+      });
+      expect(isOk(event)).toBe(true);
+    }
+    const history = fixture.store.listConversationEvents(classified.value.id, fixture.ownerId);
+    expect(isOk(history)).toBe(true);
+    if (!isOk(history)) return;
+    expect(history.value.map((entry) => entry.kind)).toEqual([
+      "classified",
+      "suppressed",
+      "escalated",
+      "held",
+    ]);
+    // A trail that could be read from outside the tenant would be a leak.
+    const other = sent("Other", "other@example.com", fixture.store);
+    const denied = other.store.listConversationEvents(classified.value.id, other.ownerId);
+    expect(isErr(denied)).toBe(true);
+    if (!isErr(denied)) return;
+    expect(denied.error.code).toBe("NOT_FOUND");
+  });
+
+  it("lists a workspace's responses and classifications, newest first", () => {
+    const fixture = sent();
+    const replies: [string, string][] = [
+      ["First reply.", "2026-10-05T09:30:00.000Z"],
+      ["Second reply.", "2026-10-05T11:30:00.000Z"],
+    ];
+    for (const [body, receivedAt] of replies) {
+      const created = messageFor(fixture, body, receivedAt);
+      if (!isOk(created)) throw new Error("seed message failed");
+      const classified = classificationFor(fixture, created.value.id, {
+        intent: "question",
+        recommendedNextAction: "prepare_reply_for_approval",
+        humanInterventionRequired: true,
+      });
+      if (!isOk(classified)) throw new Error("seed classification failed");
+    }
+    const messages = fixture.store.listInboundMessages(fixture.workspaceId, fixture.ownerId);
+    expect(isOk(messages)).toBe(true);
+    if (!isOk(messages)) return;
+    expect(messages.value).toHaveLength(2);
+    expect(messages.value[0]?.body).toBe("Second reply.");
+
+    const classified = fixture.store.listConversationClassifications(
+      fixture.workspaceId,
+      fixture.ownerId,
+    );
+    expect(isOk(classified)).toBe(true);
+    if (!isOk(classified)) return;
+    expect(classified.value).toHaveLength(2);
+
+    const narrowed = fixture.store.listConversationClassifications(
+      fixture.workspaceId,
+      fixture.ownerId,
+      { intent: "question" },
+    );
+    expect(isOk(narrowed)).toBe(true);
+    if (!isOk(narrowed)) return;
+    expect(narrowed.value).toHaveLength(2);
+
+    // Another tenant in the same document sees none of it.
+    const other = sent("Other", "other@example.com", fixture.store);
+    const elsewhere = other.store.listInboundMessages(other.workspaceId, other.ownerId);
+    expect(isOk(elsewhere)).toBe(true);
+    if (!isOk(elsewhere)) return;
+    expect(elsewhere.value).toEqual([]);
+  });
+
+  it("refuses a non-member every read and write", () => {
+    const fixture = sent();
+    const created = messageFor(fixture);
+    if (!isOk(created)) throw new Error("seed message failed");
+    const classified = classificationFor(fixture, created.value.id);
+    if (!isOk(classified)) throw new Error("seed classification failed");
+
+    const stranger = "a-stranger-with-no-membership";
+    expect(isErr(fixture.store.listInboundMessages(fixture.workspaceId, stranger))).toBe(true);
+    expect(isErr(fixture.store.getInboundMessage(created.value.id, stranger))).toBe(true);
+    expect(isErr(fixture.store.getConversationClassification(classified.value.id, stranger))).toBe(
+      true,
+    );
+    expect(
+      isErr(fixture.store.listConversationClassifications(fixture.workspaceId, stranger)),
+    ).toBe(true);
+  });
+
+  it("migrates a Phase 11 document forward without touching a single outbound row", () => {
+    const fixture = sent();
+    const document = JSON.parse(JSON.stringify(fixture.store.db)) as typeof fixture.store.db;
+    // Pretend the document was written by Phase 11: no conversation tables.
+    const phase11 = {
+      ...document,
+      schemaVersion: 11,
+      inboundMessages: undefined,
+      conversationClassifications: undefined,
+      conversationEvents: undefined,
+    };
+
+    const migrated = migrateState(phase11 as unknown as Parameters<typeof migrateState>[0]);
+    expect(migrated.schemaVersion).toBe(12);
+    expect(migrated.inboundMessages).toEqual([]);
+    expect(migrated.conversationClassifications).toEqual([]);
+    expect(migrated.conversationEvents).toEqual([]);
+    // Every earlier table is carried over byte for byte.
+    expect(migrated.outboundActions).toEqual(document.outboundActions);
+    expect(migrated.outboundEvents).toEqual(document.outboundEvents);
+    expect(migrated.outboundSuppressions).toEqual(document.outboundSuppressions);
+    expect(migrated.approvalRequests).toEqual(document.approvalRequests);
+    expect(migrated.personalizedDrafts).toEqual(document.personalizedDrafts);
+    expect(migrated.evidence).toEqual(document.evidence);
+    expect(migrated.accountClaims).toEqual(document.accountClaims);
+  });
+});

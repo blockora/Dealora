@@ -38,6 +38,11 @@ import type {
   OutboundEvent,
   OutboundFailureCode,
   OutboundSuppression,
+  InboundMessage,
+  InboundSource,
+  ConversationClassification,
+  ConversationEvent,
+  ConversationEventKind,
   User,
   Workspace,
   WorkspaceMember,
@@ -117,7 +122,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 11;
+export const LATEST_SCHEMA_VERSION = 12;
 
 export interface DbState {
   schemaVersion?: number;
@@ -147,6 +152,9 @@ export interface DbState {
   outboundActions?: OutboundAction[];
   outboundEvents?: OutboundEvent[];
   outboundSuppressions?: OutboundSuppression[];
+  inboundMessages?: InboundMessage[];
+  conversationClassifications?: ConversationClassification[];
+  conversationEvents?: ConversationEvent[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -181,6 +189,9 @@ export function emptyState(): CompleteDbState {
     outboundActions: [],
     outboundEvents: [],
     outboundSuppressions: [],
+    inboundMessages: [],
+    conversationClassifications: [],
+    conversationEvents: [],
   };
 }
 
@@ -222,6 +233,15 @@ export function emptyState(): CompleteDbState {
  * approval it already had, so a draft approved before the upgrade can still be
  * sent afterwards. No approval is rewritten and none is invalidated by the
  * upgrade, because the upgrade adds no way to reach `sent`.
+ *
+ * Step 12 (Phase 12 — Conversation Engine): add `inbound_messages`,
+ * `conversation_classifications` and `conversation_events`. Additive like every
+ * step before it: a Phase 11 document gains three empty tables and keeps every
+ * outbound action it already had, so a message sent before the upgrade can
+ * still have its response recorded and classified afterwards. No outbound row is
+ * rewritten, and the upgrade adds no way to send: Phase 12 reads responses and
+ * recommends what to do about them, and every effect still runs through the
+ * Phase 10 approval and Phase 11 send path that already existed.
  */
 export function migrateState(input: DbState): CompleteDbState {
   const base = emptyState();
@@ -335,6 +355,25 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.outboundSuppressions;
   }
 
+  // Phase 12 adds inbound messages, their classifications and the audit trail.
+  // Additive like every step before it: a Phase 11 document gains three empty
+  // tables and keeps every outbound action it already had, so a message sent
+  // before the upgrade can still have its response recorded afterwards. Nothing
+  // before it is touched, and in particular no outbound row is rewritten or
+  // re-stated: Phase 12 adds the ability to read a response, not the ability to
+  // act on one.
+  if (version >= 12) {
+    state.inboundMessages = Array.isArray(input.inboundMessages)
+      ? input.inboundMessages
+      : base.inboundMessages;
+    state.conversationClassifications = Array.isArray(input.conversationClassifications)
+      ? input.conversationClassifications
+      : base.conversationClassifications;
+    state.conversationEvents = Array.isArray(input.conversationEvents)
+      ? input.conversationEvents
+      : base.conversationEvents;
+  }
+
   return state;
 }
 
@@ -380,6 +419,9 @@ type RowTable =
   | "outboundActions"
   | "outboundEvents"
   | "outboundSuppressions"
+  | "inboundMessages"
+  | "conversationClassifications"
+  | "conversationEvents"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -3200,6 +3242,356 @@ export class Store {
       // best-effort
     }
   }
+
+  // -------------------------------------------------------------------------
+  // Conversation (Phase 12)
+  //
+  // Inbound responses and their classifications. Nothing in this section can
+  // send a message, create an approval, or write to the Phase 7 evidence graph:
+  // it records what arrived, what it read as, and what DEALORA recommends doing
+  // about it. Every effect still runs through the Phase 10 approval and Phase 11
+  // send path that already existed.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Record one inbound response, verbatim.
+   *
+   * Three preconditions are enforced here rather than in the service, because
+   * they are properties of the data and must hold for any caller:
+   *
+   * - the outbound action exists **in this workspace**;
+   * - that action actually went out — a response to a message that was never
+   *   sent is not a response, and accepting one would let a workspace
+   *   manufacture a conversation with a prospect it never contacted;
+   * - the action is terminal (`sent`), so a response cannot be filed against a
+   *   send still in flight.
+   *
+   * `contactId` and `accountId` are **not** accepted from the caller at all.
+   * They are resolved here from the action, so a message can never be filed
+   * against the wrong person.
+   */
+  createInboundMessage(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    message: {
+      outboundActionId: EntityId;
+      source: InboundSource;
+      fromAddress: string | null;
+      subject: string | null;
+      body: string;
+      providerMessageId: string | null;
+      receivedAt: DateTime;
+    };
+  }): Result<InboundMessage, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+
+    const action = this.findById("outboundActions", input.message.outboundActionId);
+    if (!action || action.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("NOT_FOUND", "outbound action not found") };
+    }
+    if (action.status !== "sent") {
+      return {
+        ok: false,
+        error: toError(
+          "CONFLICT",
+          `this action is ${action.status}, so no response can be recorded against it`,
+        ),
+      };
+    }
+
+    const contact = this.findById("contacts", action.contactId);
+    if (!contact || contact.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("NOT_FOUND", "contact not found") };
+    }
+
+    const stamp = toDateTime(now());
+    const message: InboundMessage = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      recordedBy: input.createdBy,
+      outboundActionId: action.id,
+      contactId: contact.id,
+      accountId: contact.accountId,
+      source: input.message.source,
+      fromAddress: input.message.fromAddress,
+      subject: input.message.subject,
+      body: input.message.body,
+      providerMessageId: input.message.providerMessageId,
+      receivedAt: input.message.receivedAt,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    this.mutate("inboundMessages", (rows) => rows.push(message));
+    return { ok: true, value: message };
+  }
+
+  /**
+   * Resolve one inbound message for reading, authorized against its tenant.
+   *
+   * A message the caller may not read is reported as **not found**, never as
+   * unauthorized: an unauthorized answer would confirm that the id refers to
+   * something real in someone else's workspace, which is exactly the existence
+   * leak the tenant boundary exists to prevent. This is the same rule the
+   * Qualification and Approval engines apply, and the caller cannot tell the
+   * two cases apart.
+   */
+  private requireInboundMessage(
+    id: EntityId,
+    userId: EntityId,
+  ): Result<InboundMessage, StorageError> {
+    const message = this.findById("inboundMessages", id);
+    if (!message) return { ok: false, error: toError("NOT_FOUND", "inbound message not found") };
+    const auth = this.requireWorkspace(message.workspaceId, userId);
+    if (!auth.ok) return { ok: false, error: toError("NOT_FOUND", "inbound message not found") };
+    return { ok: true, value: message };
+  }
+
+  getInboundMessage(id: EntityId, userId: EntityId): Result<InboundMessage, StorageError> {
+    return this.requireInboundMessage(id, userId);
+  }
+
+  /** A workspace's responses, newest first, optionally narrowed. */
+  listInboundMessages(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: { outboundActionId?: EntityId; contactId?: EntityId },
+  ): Result<InboundMessage[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const filtered = this.rows("inboundMessages").filter(
+      (m) =>
+        m.workspaceId === workspaceId &&
+        (filter?.outboundActionId === undefined ||
+          m.outboundActionId === filter.outboundActionId) &&
+        (filter?.contactId === undefined || m.contactId === filter.contactId),
+    );
+    // Newest first. The tiebreaker is the stored array position rather than the
+    // id, exactly as `listRevenueGoalEvents` does it: ids are random, so
+    // breaking equal timestamps by id would order two copies of the same
+    // document differently for no reason a reader could reconstruct.
+    return {
+      ok: true,
+      value: filtered
+        .map((row, index) => ({ row, index }))
+        .sort((a, b) => {
+          if (a.row.receivedAt !== b.row.receivedAt) {
+            return a.row.receivedAt < b.row.receivedAt ? 1 : -1;
+          }
+          return a.index - b.index;
+        })
+        .map((entry) => entry.row),
+    };
+  }
+
+  /**
+   * The classification already made for one message, if any.
+   *
+   * This is the idempotency check: one message is read once. Re-classifying the
+   * same text could otherwise let a second, different answer be attached to one
+   * response, which is precisely how an audit trail stops meaning anything.
+   */
+  findConversationClassificationByMessage(
+    inboundMessageId: EntityId,
+    userId: EntityId,
+  ): Result<ConversationClassification | null, StorageError> {
+    const message = this.requireInboundMessage(inboundMessageId, userId);
+    if (!message.ok) return message;
+    const found =
+      this.rows("conversationClassifications").find(
+        (c) => c.inboundMessageId === inboundMessageId,
+      ) ?? null;
+    return { ok: true, value: found };
+  }
+
+  /**
+   * Persist one classification.
+   *
+   * The caller supplies the *result*, never the safety decision: the intent,
+   * confidence, recommended action and `humanInterventionRequired` are all
+   * written by the domain's classifier. Storage re-checks the two invariants the
+   * schema cannot express on its own — that a suppression was only ever recorded
+   * for an opt-out, and that anything other than an opt-out demands a human —
+   * so a bug in the classifier cannot quietly authorise contact.
+   */
+  createConversationClassification(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    classification: {
+      inboundMessageId: EntityId;
+      outboundActionId: EntityId;
+      classifierVersion: string;
+      intent: ConversationClassification["intent"];
+      confidence: ConversationClassification["confidence"];
+      reasons: string[];
+      signals: ConversationClassification["signals"];
+      recommendedNextAction: ConversationClassification["recommendedNextAction"];
+      humanInterventionRequired: boolean;
+      suppressed: boolean;
+    };
+  }): Result<ConversationClassification, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+
+    const message = this.findById("inboundMessages", input.classification.inboundMessageId);
+    if (!message || message.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("NOT_FOUND", "inbound message not found") };
+    }
+    const existing = this.rows("conversationClassifications").find(
+      (c) => c.inboundMessageId === input.classification.inboundMessageId,
+    );
+    if (existing) {
+      return {
+        ok: false,
+        error: toError("CONFLICT", "this response has already been classified"),
+      };
+    }
+    if (input.classification.suppressed && input.classification.intent !== "unsubscribe") {
+      return {
+        ok: false,
+        error: toError("INVALID", "only an opt-out may suppress an address"),
+      };
+    }
+    if (
+      !input.classification.humanInterventionRequired &&
+      input.classification.intent !== "unsubscribe"
+    ) {
+      return {
+        ok: false,
+        error: toError("INVALID", "only an opt-out may proceed without human review"),
+      };
+    }
+
+    const classification: ConversationClassification = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      inboundMessageId: input.classification.inboundMessageId,
+      outboundActionId: input.classification.outboundActionId,
+      classifierVersion: input.classification.classifierVersion,
+      intent: input.classification.intent,
+      confidence: input.classification.confidence,
+      reasons: input.classification.reasons,
+      signals: input.classification.signals,
+      recommendedNextAction: input.classification.recommendedNextAction,
+      humanInterventionRequired: input.classification.humanInterventionRequired,
+      suppressed: input.classification.suppressed,
+      createdBy: input.createdBy,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("conversationClassifications", (rows) => rows.push(classification));
+    return { ok: true, value: classification };
+  }
+
+  /** Resolve one classification for reading, authorized against its tenant. */
+  private requireConversationClassification(
+    id: EntityId,
+    userId: EntityId,
+  ): Result<ConversationClassification, StorageError> {
+    const classification = this.findById("conversationClassifications", id);
+    if (!classification) {
+      return { ok: false, error: toError("NOT_FOUND", "conversation classification not found") };
+    }
+    const auth = this.requireWorkspace(classification.workspaceId, userId);
+    // Reported as not found rather than unauthorized, so a foreign id is
+    // indistinguishable from one that was never issued.
+    if (!auth.ok) {
+      return { ok: false, error: toError("NOT_FOUND", "conversation classification not found") };
+    }
+    return { ok: true, value: classification };
+  }
+
+  getConversationClassification(
+    id: EntityId,
+    userId: EntityId,
+  ): Result<ConversationClassification, StorageError> {
+    return this.requireConversationClassification(id, userId);
+  }
+
+  /** A workspace's classifications, newest first, optionally narrowed. */
+  listConversationClassifications(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: {
+      intent?: ConversationClassification["intent"];
+      outboundActionId?: EntityId;
+    },
+  ): Result<ConversationClassification[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const filtered = this.rows("conversationClassifications").filter(
+      (c) =>
+        c.workspaceId === workspaceId &&
+        (filter?.intent === undefined || c.intent === filter.intent) &&
+        (filter?.outboundActionId === undefined || c.outboundActionId === filter.outboundActionId),
+    );
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) =>
+        a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0,
+      ),
+    };
+  }
+
+  /** One append-only audit row for a classification. */
+  createConversationEvent(input: {
+    workspaceId: EntityId;
+    actorUserId: EntityId;
+    event: {
+      classificationId: EntityId;
+      inboundMessageId: EntityId;
+      kind: ConversationEventKind;
+      detail: string | null;
+    };
+  }): Result<ConversationEvent, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.actorUserId);
+    if (!auth.ok) return auth;
+    const classification = this.findById(
+      "conversationClassifications",
+      input.event.classificationId,
+    );
+    if (!classification || classification.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("NOT_FOUND", "conversation classification not found") };
+    }
+    const event: ConversationEvent = {
+      id: newId(),
+      classificationId: input.event.classificationId,
+      inboundMessageId: input.event.inboundMessageId,
+      workspaceId: input.workspaceId,
+      actorUserId: input.actorUserId,
+      kind: input.event.kind,
+      detail: input.event.detail,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("conversationEvents", (rows) => rows.push(event));
+    return { ok: true, value: event };
+  }
+
+  /** One classification's audit trail, oldest first. */
+  listConversationEvents(
+    classificationId: EntityId,
+    userId: EntityId,
+  ): Result<ConversationEvent[], StorageError> {
+    const classification = this.requireConversationClassification(classificationId, userId);
+    if (!classification.ok) return classification;
+    const events = this.rows("conversationEvents").filter(
+      (e) => e.classificationId === classificationId,
+    );
+    // Chronological, with insertion order breaking millisecond ties — ids are
+    // random, so an id tiebreaker would scramble equal-timestamp events.
+    return {
+      ok: true,
+      value: events
+        .map((row, index) => ({ row, index }))
+        .sort((a, b) =>
+          a.row.createdAt !== b.row.createdAt
+            ? a.row.createdAt < b.row.createdAt
+              ? -1
+              : 1
+            : a.index - b.index,
+        )
+        .map((entry) => entry.row),
+    };
+  }
 }
 
 /** Default single-process store for local runs. */
@@ -3322,6 +3714,17 @@ export const db = {
   createOutboundSuppression: store.createOutboundSuppression.bind(store),
   isSuppressed: store.isSuppressed.bind(store),
   listOutboundSuppressions: store.listOutboundSuppressions.bind(store),
+
+  createInboundMessage: store.createInboundMessage.bind(store),
+  getInboundMessage: store.getInboundMessage.bind(store),
+  listInboundMessages: store.listInboundMessages.bind(store),
+  createConversationClassification: store.createConversationClassification.bind(store),
+  getConversationClassification: store.getConversationClassification.bind(store),
+  listConversationClassifications: store.listConversationClassifications.bind(store),
+  findConversationClassificationByMessage:
+    store.findConversationClassificationByMessage.bind(store),
+  createConversationEvent: store.createConversationEvent.bind(store),
+  listConversationEvents: store.listConversationEvents.bind(store),
 
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),

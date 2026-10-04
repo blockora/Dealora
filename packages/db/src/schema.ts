@@ -223,6 +223,27 @@ export const COLUMNS = {
   // `email` and `reason` are already declared above and are reused here: the
   // suppression list's address and reason are the same concepts Phase 1's user
   // email and Phase 3's decision reason already named.
+
+  // Phase 12 — Conversation Engine
+  outboundActionId: "outbound_action_id",
+  fromAddress: "from_address",
+  providerMessageId: "provider_message_id",
+  receivedAt: "received_at",
+  inboundMessageId: "inbound_message_id",
+  classifierVersion: "classifier_version",
+  intent: "intent",
+  reasons: "reasons",
+  signals: "signals",
+  recommendedNextAction: "recommended_next_action",
+  humanInterventionRequired: "human_intervention_required",
+  suppressed: "suppressed",
+  classificationId: "classification_id",
+  // `source`, `subject`, `body`, `contactId`, `accountId`, `confidence`,
+  // `createdBy`, `kind`, `detail` and `version` are already declared above and
+  // are reused: they are the same concepts Phase 5's contact provenance,
+  // Phase 9's draft text, Phase 8's confidence band and Phase 10's audit row
+  // already named, and inventing parallel columns for them would make two
+  // vocabularies for one idea.
 } as const;
 
 export type ColumnName = (typeof COLUMNS)[keyof typeof COLUMNS];
@@ -411,6 +432,51 @@ export const outboundEventTable = "outbound_events" as const;
  */
 export const outboundSuppressionTable = "outbound_suppressions" as const;
 
+/**
+ * Table: inbound messages (Phase 12).
+ *
+ * One row per response a workspace received, stored verbatim.
+ *
+ * This table is deliberately **not** part of the Phase 7 evidence graph. Nothing
+ * here carries a confidence, a freshness or a claim status, and nothing here can
+ * become evidence without going through the Phase 7 conversion a human
+ * performs: a prospect's own words are an interested party's claim, not an
+ * attested fact about their company. Storing them apart is what keeps that
+ * distinction from eroding.
+ *
+ * `outbound_action_id` is a hard foreign key, so a response to something
+ * DEALORA never sent cannot exist, and `contact_id`/`account_id` are resolved
+ * server-side from that action rather than accepted from a caller — a message
+ * cannot be filed against the wrong person.
+ */
+export const inboundMessageTable = "inbound_messages" as const;
+
+/**
+ * Table: conversation classifications (Phase 12).
+ *
+ * One immutable, versioned classification per inbound message, with the phrases
+ * that decided it and the safety signals that fired stored alongside. `intent`,
+ * `confidence` and `recommended_next_action` are CHECK-constrained to the closed
+ * vocabularies `DEALORA_BLUEPRINT.md` §18 and `ROADMAP.md` §19 name, so a
+ * classification can never carry a state the system does not define.
+ *
+ * `human_intervention_required` is constrained to be true for everything except
+ * an opt-out, which is the single outcome that must be honoured without waiting
+ * for a person.
+ */
+export const conversationClassificationTable = "conversation_classifications" as const;
+
+/**
+ * Table: the append-only conversation audit trail (Phase 12).
+ *
+ * Every step a classification takes — recorded, classified, suppressed,
+ * escalated, held — leaves one row written by the server. A suppression in
+ * particular must be explainable: a workspace that stops contacting someone
+ * because of one message needs to be able to show which message and which rule
+ * caused it.
+ */
+export const conversationEventTable = "conversation_events" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -439,6 +505,9 @@ export const tables = [
   outboundActionTable,
   outboundEventTable,
   outboundSuppressionTable,
+  inboundMessageTable,
+  conversationClassificationTable,
+  conversationEventTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -581,6 +650,23 @@ export const indexes = {
     `${COLUMN(outboundSuppressionTable, COLUMNS.id)} PRIMARY KEY`,
     `${COLUMN(outboundSuppressionTable, COLUMNS.workspaceId)} NOT NULL`,
     `${COLUMN(outboundSuppressionTable, COLUMNS.email)} NOT NULL`,
+  ],
+  inboundMessages: [
+    `${COLUMN(inboundMessageTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(inboundMessageTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(inboundMessageTable, COLUMNS.outboundActionId)} NOT NULL`,
+    `${COLUMN(inboundMessageTable, COLUMNS.body)} NOT NULL`,
+  ],
+  conversationClassifications: [
+    `${COLUMN(conversationClassificationTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(conversationClassificationTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(conversationClassificationTable, COLUMNS.inboundMessageId)} NOT NULL`,
+    `${COLUMN(conversationClassificationTable, COLUMNS.intent)} NOT NULL`,
+  ],
+  conversationEvents: [
+    `${COLUMN(conversationEventTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(conversationEventTable, COLUMNS.classificationId)} NOT NULL`,
+    `${COLUMN(conversationEventTable, COLUMNS.workspaceId)} NOT NULL`,
   ],
 };
 
@@ -1148,6 +1234,77 @@ ${COLUMN(outboundEventTable, COLUMNS.kind)} CHECK (${COLUMN(outboundEventTable, 
 ${COLUMN(outboundSuppressionTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(outboundSuppressionTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(outboundSuppressionTable, COLUMNS.email)} CHECK (${COLUMN(outboundSuppressionTable, COLUMNS.email)} = lower(${COLUMN(outboundSuppressionTable, COLUMNS.email)}))`,
+  ),
+  createTableSql(
+    inboundMessageTable,
+    [
+      COLUMN(inboundMessageTable, COLUMNS.id),
+      COLUMN(inboundMessageTable, COLUMNS.workspaceId),
+      COLUMN(inboundMessageTable, COLUMNS.createdBy),
+      COLUMN(inboundMessageTable, COLUMNS.outboundActionId),
+      COLUMN(inboundMessageTable, COLUMNS.contactId),
+      COLUMN(inboundMessageTable, COLUMNS.accountId),
+      COLUMN(inboundMessageTable, COLUMNS.source),
+      COLUMN(inboundMessageTable, COLUMNS.fromAddress),
+      COLUMN(inboundMessageTable, COLUMNS.subject),
+      COLUMN(inboundMessageTable, COLUMNS.body),
+      COLUMN(inboundMessageTable, COLUMNS.providerMessageId),
+      COLUMN(inboundMessageTable, COLUMNS.receivedAt),
+    ],
+    `${COLUMN(inboundMessageTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(inboundMessageTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(inboundMessageTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(inboundMessageTable, COLUMNS.outboundActionId)} REFERENCES "${outboundActionTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(inboundMessageTable, COLUMNS.contactId)} REFERENCES "${contactTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(inboundMessageTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(inboundMessageTable, COLUMNS.source)} CHECK (${COLUMN(inboundMessageTable, COLUMNS.source)} IN ('manual','provider_ingest')),
+${COLUMN(inboundMessageTable, COLUMNS.body)} CHECK (length(${COLUMN(inboundMessageTable, COLUMNS.body)}) > 0)`,
+  ),
+  createTableSql(
+    conversationClassificationTable,
+    [
+      COLUMN(conversationClassificationTable, COLUMNS.id),
+      COLUMN(conversationClassificationTable, COLUMNS.workspaceId),
+      COLUMN(conversationClassificationTable, COLUMNS.inboundMessageId),
+      COLUMN(conversationClassificationTable, COLUMNS.outboundActionId),
+      COLUMN(conversationClassificationTable, COLUMNS.classifierVersion),
+      COLUMN(conversationClassificationTable, COLUMNS.intent),
+      COLUMN(conversationClassificationTable, COLUMNS.confidence),
+      COLUMN(conversationClassificationTable, COLUMNS.reasons),
+      COLUMN(conversationClassificationTable, COLUMNS.signals),
+      COLUMN(conversationClassificationTable, COLUMNS.recommendedNextAction),
+      COLUMN(conversationClassificationTable, COLUMNS.humanInterventionRequired),
+      COLUMN(conversationClassificationTable, COLUMNS.suppressed),
+      COLUMN(conversationClassificationTable, COLUMNS.createdBy),
+    ],
+    `${COLUMN(conversationClassificationTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(conversationClassificationTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(conversationClassificationTable, COLUMNS.inboundMessageId)} REFERENCES "${inboundMessageTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(conversationClassificationTable, COLUMNS.outboundActionId)} REFERENCES "${outboundActionTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(conversationClassificationTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(conversationClassificationTable, COLUMNS.intent)} CHECK (${COLUMN(conversationClassificationTable, COLUMNS.intent)} IN ('interested','question','pricing','objection','not_now','wrong_person','unsubscribe','positive_intent','negative_intent','unknown')),
+${COLUMN(conversationClassificationTable, COLUMNS.confidence)} CHECK (${COLUMN(conversationClassificationTable, COLUMNS.confidence)} IN ('low','medium','high')),
+${COLUMN(conversationClassificationTable, COLUMNS.recommendedNextAction)} CHECK (${COLUMN(conversationClassificationTable, COLUMNS.recommendedNextAction)} IN ('stop_contacting','prepare_reply_for_approval','request_human_review','record_and_hold')),
+${COLUMN(conversationClassificationTable, COLUMNS.humanInterventionRequired)} CHECK (${COLUMN(conversationClassificationTable, COLUMNS.humanInterventionRequired)} = true OR ${COLUMN(conversationClassificationTable, COLUMNS.intent)} = 'unsubscribe'),
+${COLUMN(conversationClassificationTable, COLUMNS.suppressed)} CHECK (${COLUMN(conversationClassificationTable, COLUMNS.suppressed)} = false OR ${COLUMN(conversationClassificationTable, COLUMNS.intent)} = 'unsubscribe')`,
+  ),
+  createTableSql(
+    conversationEventTable,
+    [
+      COLUMN(conversationEventTable, COLUMNS.id),
+      COLUMN(conversationEventTable, COLUMNS.classificationId),
+      COLUMN(conversationEventTable, COLUMNS.inboundMessageId),
+      COLUMN(conversationEventTable, COLUMNS.workspaceId),
+      COLUMN(conversationEventTable, COLUMNS.actorUserId),
+      COLUMN(conversationEventTable, COLUMNS.kind),
+      COLUMN(conversationEventTable, COLUMNS.detail),
+    ],
+    `${COLUMN(conversationEventTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(conversationEventTable, COLUMNS.classificationId)} REFERENCES "${conversationClassificationTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(conversationEventTable, COLUMNS.inboundMessageId)} REFERENCES "${inboundMessageTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(conversationEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(conversationEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(conversationEventTable, COLUMNS.kind)} CHECK (${COLUMN(conversationEventTable, COLUMNS.kind)} IN ('recorded','classified','suppressed','escalated','held'))`,
   ),
 ].join("\n\n");
 

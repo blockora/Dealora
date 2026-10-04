@@ -96,6 +96,15 @@ export type {
   OutboundEventKind,
   OutboundEvent,
   OutboundSuppression,
+  InboundSource,
+  ConversationIntent,
+  ConversationDisposition,
+  ConversationSignalKind,
+  ConversationConfidence,
+  ConversationEventKind,
+  InboundMessage,
+  ConversationClassification,
+  ConversationEvent,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -130,6 +139,9 @@ export {
   outboundActionTable,
   outboundEventTable,
   outboundSuppressionTable,
+  inboundMessageTable,
+  conversationClassificationTable,
+  conversationEventTable,
   createTableSql,
   slugify,
   capString,

@@ -1504,3 +1504,173 @@ export interface OutboundSuppression {
   createdAt: DateTime;
   updatedAt: DateTime;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 12 — Conversation Engine
+// ---------------------------------------------------------------------------
+
+/**
+ * How an inbound message reached DEALORA.
+ *
+ * Provenance, not decoration: "who supplied this text" decides how much the
+ * classification may be trusted, so the vocabulary is closed.
+ *
+ * Phase 12 ships exactly one way in — `manual`, a workspace user recording what
+ * they received. `provider_ingest` is part of the vocabulary because a
+ * deployment may later wire an adapter that fetches replies across the Phase 11
+ * provider boundary, but **no such adapter exists here** and nothing in this
+ * repository can set it. It is recorded as a known ingress shape rather than
+ * silently invented; see `docs/adr/0012-conversation-engine.md`.
+ */
+export type InboundSource = "manual" | "provider_ingest";
+
+/**
+ * What an inbound response turned out to be.
+ *
+ * Exactly the ten states `DEALORA_BLUEPRINT.md` §18 and `ROADMAP.md` §19 name,
+ * spelled in the closed snake_case the rest of the domain uses. The list is
+ * closed so that "unknown" is a real, reportable outcome rather than a dumping
+ * ground for anything the rules failed to recognise.
+ */
+export type ConversationIntent =
+  | "interested"
+  | "question"
+  | "pricing"
+  | "objection"
+  | "not_now"
+  | "wrong_person"
+  | "unsubscribe"
+  | "positive_intent"
+  | "negative_intent"
+  | "unknown";
+
+/**
+ * What DEALORA recommends doing about a classified response.
+ *
+ * A recommendation and nothing more. None of these values executes anything:
+ * the phase has no scheduler, no sender and no approver, so a recommendation can
+ * never become an effect on its own.
+ */
+export type ConversationDisposition =
+  "stop_contacting" | "prepare_reply_for_approval" | "request_human_review" | "record_and_hold";
+
+/**
+ * Why a response was treated the way it was.
+ *
+ * `ROADMAP.md` §19 makes unsubscribe, negative intent, a sensitive issue,
+ * uncertainty and an unusual request the safety triggers. They are a closed set
+ * so that a safety decision is inspectable rather than a mood.
+ */
+export type ConversationSignalKind =
+  | "opt_out"
+  | "negative_sentiment"
+  | "sensitive_topic"
+  | "uncertainty"
+  | "unusual_request"
+  | "interest"
+  | "positive_sentiment"
+  | "question_signal"
+  | "pricing_signal"
+  | "objection_signal"
+  | "deferral"
+  | "routing";
+
+/** How strongly the rules support a classification. */
+export type ConversationConfidence = "low" | "medium" | "high";
+
+/** The steps a classification's audit trail records. */
+export type ConversationEventKind = "recorded" | "classified" | "suppressed" | "escalated" | "held";
+
+/**
+ * One inbound response, recorded verbatim (Phase 12).
+ *
+ * This is **not** evidence and never becomes evidence here. Phase 7 exists so
+ * that a fact about an account carries a source, a confidence and a lifecycle,
+ * and nothing in this phase may shortcut it: a prospect's own words are a claim
+ * by an interested party, not an attested fact about their company. The message
+ * is therefore stored here, attributed and timestamped, and converting it into
+ * a claim is a separate, human-driven Phase 7 decision that this package does
+ * not perform.
+ *
+ * It is also not a copy of an outbound message. It answers one specific
+ * `outboundActionId`, so a response to something DEALORA never sent cannot be
+ * recorded, and the contact and account are resolved server-side from that
+ * action rather than accepted from a caller.
+ */
+export interface InboundMessage {
+  id: EntityId;
+  workspaceId: EntityId;
+  recordedBy: EntityId;
+  /** The sent outbound action this message answers. */
+  outboundActionId: EntityId;
+  /** Resolved server-side from the outbound action, never from the caller. */
+  contactId: EntityId;
+  /** Resolved server-side from the contact, never from the caller. */
+  accountId: EntityId;
+  source: InboundSource;
+  /** The address the message says it came from, when a source supplied one. */
+  fromAddress: string | null;
+  subject: string | null;
+  /** The response text, stored exactly as received. */
+  body: string;
+  /** A provider's own reference for this message, when one was supplied. */
+  providerMessageId: string | null;
+  /** When the response was received, as recorded. Never inferred. */
+  receivedAt: DateTime;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}
+
+/**
+ * One classification of one inbound response (Phase 12).
+ *
+ * Immutable and versioned, like every other decision record in DEALORA: the
+ * `classifierVersion` is stored so a later reader can tell which rules produced
+ * the intent, and the record is never rewritten when the rules move on.
+ *
+ * `reasons` names the phrases that decided the intent and `signals` names the
+ * safety triggers that fired, so a user can always answer "why did DEALORA read
+ * it that way" without re-running anything.
+ */
+export interface ConversationClassification {
+  id: EntityId;
+  workspaceId: EntityId;
+  inboundMessageId: EntityId;
+  outboundActionId: EntityId;
+  classifierVersion: string;
+  intent: ConversationIntent;
+  confidence: ConversationConfidence;
+  reasons: string[];
+  signals: ConversationSignalKind[];
+  recommendedNextAction: ConversationDisposition;
+  /**
+   * Whether a person must look at this before anything happens.
+   *
+   * True for every outcome that could lead to contact. An opt-out is the single
+   * exception, because honouring it is the one action that must not wait for a
+   * human.
+   */
+  humanInterventionRequired: boolean;
+  /** True when this classification put the address on the suppression list. */
+  suppressed: boolean;
+  createdBy: EntityId;
+  createdAt: DateTime;
+}
+
+/**
+ * One append-only audit record for a classification (Phase 12).
+ *
+ * `ROADMAP.md` Rule 13: every consequential action needs an audit trail. These
+ * rows are written by the server and never edited, so "we stopped contacting
+ * them" is a claim the workspace can check rather than take on trust.
+ */
+export interface ConversationEvent {
+  id: EntityId;
+  classificationId: EntityId;
+  inboundMessageId: EntityId;
+  workspaceId: EntityId;
+  actorUserId: EntityId;
+  kind: ConversationEventKind;
+  detail: string | null;
+  createdAt: DateTime;
+}
