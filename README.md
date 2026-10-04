@@ -23,8 +23,8 @@ The repository has completed **Phase 0 — Repository & Engineering Foundation**
 **Phase 5 — Account & Prospect Input**, **Phase 6 — Research Engine**,
 **Phase 7 — Evidence System**, **Phase 8 — Qualification Engine**,
 **Phase 9 — Personalization Engine**, **Phase 10 — Approval Engine**,
-**Phase 11 — First Outbound Integration**, and **Phase 12 — Conversation
-Engine** (see [`ROADMAP.md`](./ROADMAP.md)).
+**Phase 11 — First Outbound Integration**, **Phase 12 — Conversation
+Engine**, and **Phase 13 — Meeting Workflow** (see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
 with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
@@ -210,7 +210,44 @@ than answered — no objection library, no response pattern and no guarantee is
 invented. Its gate is covered by `tests/phase12-gate.test.ts`, and Phases 9–12
 together by `tests/phases9-12-integration.test.ts`.
 
-Next is **Phase 13 — Meeting Workflow**.
+Phase 13 adds the Meeting Workflow: a response the classifier read as positive
+becomes a meeting record with a **measurable state** — `recommended`,
+`awaiting_approval`, `approved`, `booked`, `held`, `no_show` or `cancelled` — and
+`DEALORA_BLUEPRINT.md` §22's preparation brief is assembled from records the
+workspace already has. The important word is *measurable*. A proposal nobody
+approved says so, and it says so in the row: nothing here reports a meeting that
+did not happen.
+
+The phase's safety property is structural rather than procedural.
+`DEALORA_BLUEPRINT.md` §17 classifies *schedule event* as a **Level 2 external
+action**, so the transitions that would let the system book on its own initiative
+— `recommended → booked`, `awaiting_approval → booked` — do not exist in the
+state machine at all. A person approving a booking walks `awaiting_approval` on
+the way, and the audit trail records the request and the answer separately. The
+approval is bound to a digest of the exact booking the reviewer was shown and is
+re-derived at decision time, so "I authorized *this*" stays checkable, and a
+cancelled meeting is terminal — a replayed request cannot resurrect it.
+
+A meeting must also point at something real: a Phase 12 classification read as
+`positive_intent` or `interested`, and a Phase 8 qualification in the state
+`qualified`. Both are re-derived in storage rather than trusted from a caller, and
+one response yields at most one meeting. The opt-out list is consulted **three
+times** — at proposal, at approval, and again at booking — because an unsubscribe
+can arrive in the gap, and reusing the Phase 11 list is what makes it stop a
+booking as reliably as it stops a send.
+
+`ROADMAP.md` §30 places calendar and CRM integrations in Phase 23, "only after the
+core revenue loop works", so the shipped calendar adapter is a **sandbox that
+performs no network I/O** and `booked` is written from exactly one place: on a
+provider confirmation. Every booking claim here means *the provider recorded an
+event*. The brief is the other half of the honesty story — it references claims
+and evidence by id rather than copying them, and writes every `§22` section it
+has no record for into `gaps` instead of filling it in. Nothing in this phase
+sends an invitation, schedules anything on a timer, or turns a meeting into a
+fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–13
+together by `tests/phases9-13-integration.test.ts`.
+
+Next is **Phase 14 — Next Best Action**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -237,13 +274,14 @@ packages/       Shared TypeScript packages (built with project references)
   approval/      Human approval of one exact draft version, audit trail (Phase 10)
   outbound/      One email channel behind a provider interface, opt-outs, delivery state (Phase 11)
   conversation/  Deterministic classification of inbound responses into an intent and a next action (Phase 12)
+  meeting/       Booking state machine, calendar adapter boundary, preparation brief (Phase 13)
   api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 12+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests (Phase 1-12 gates)
+tests/          Cross-package integration tests (Phase 1-13 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
@@ -262,7 +300,8 @@ Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)), the Account
 ([0009](./docs/adr/0009-qualification-engine.md)), the Approval Engine
 ([0010](./docs/adr/0010-approval-engine.md)), the First Outbound Integration
 ([0011](./docs/adr/0011-first-outbound-integration.md)), and the Conversation
-Engine ([0012](./docs/adr/0012-conversation-engine.md)).
+Engine ([0012](./docs/adr/0012-conversation-engine.md)), and the Meeting Workflow
+([0013](./docs/adr/0013-meeting-workflow.md)).
 
 ## Getting started
 
@@ -302,7 +341,7 @@ convention and the currently supported keys are documented in
 
 The only key is `DB_DIR` — the directory the local store writes
 `dealora.json` into (defaults to `packages/db/src/data`, which is
-git-ignored). Phases 1-12 need no credential: passwords are hashed with
+git-ignored). Phases 1-13 need no credential: passwords are hashed with
 scrypt, goal parsing, plan compilation, account deduplication, research
 normalization, evidence conversion, qualification scoring, draft rendering,
 approval decisions and response classification are deterministic and take no
@@ -312,6 +351,9 @@ provider that performs no network I/O; registering a real provider is an explici
 deployment decision whose keys must be documented here in the same commit that
 introduces them. Phase 12 adds no key either: it classifies stored text with
 declared rules and writes to the Phase 11 suppression list that already exists.
+Phase 13 adds no key as well: it books through a sandbox calendar adapter that
+performs no network I/O and reuses the Phase 11 suppression list for its opt-out
+checks.
 
 ## License
 
