@@ -1,0 +1,19 @@
+{
+  "name": "@dealora/meeting",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DEALORA Meeting Workflow: a positive response becomes an approved, measurable booking state and a preparation brief.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./types": "./dist/types.js"
+  },
+  "dependencies": {
+    "@dealora/core": "workspace:*",
+    "@dealora/db": "workspace:*"
+  },
+  "devDependencies": {}
+}

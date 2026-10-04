@@ -36,6 +36,7 @@
         "@dealora/db": "workspace:*",
         "@dealora/evidence": "workspace:*",
         "@dealora/goal": "workspace:*",
+        "@dealora/meeting": "workspace:*",
         "@dealora/outbound": "workspace:*",
         "@dealora/personalization": "workspace:*",
         "@dealora/plan": "workspace:*",
@@ -99,6 +100,14 @@
     },
     "packages/goal": {
       "name": "@dealora/goal",
+      "version": "0.1.0",
+      "dependencies": {
+        "@dealora/core": "workspace:*",
+        "@dealora/db": "workspace:*",
+      },
+    },
+    "packages/meeting": {
+      "name": "@dealora/meeting",
       "version": "0.1.0",
       "dependencies": {
         "@dealora/core": "workspace:*",
@@ -175,6 +184,8 @@
     "@dealora/evidence": ["@dealora/evidence@workspace:packages/evidence"],
 
     "@dealora/goal": ["@dealora/goal@workspace:packages/goal"],
+
+    "@dealora/meeting": ["@dealora/meeting@workspace:packages/meeting"],
 
     "@dealora/outbound": ["@dealora/outbound@workspace:packages/outbound"],
 
