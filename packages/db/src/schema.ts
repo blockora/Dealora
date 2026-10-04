@@ -194,6 +194,22 @@ export const COLUMNS = {
   personalizationPoints: "personalization_points",
   approvedClaimIds: "approved_claim_ids",
   warnings: "warnings",
+
+  // Phase 10 — Approval Engine
+  createdBy: "created_by",
+  draftId: "draft_id",
+  actionKind: "action_kind",
+  riskLevel: "risk_level",
+  draftVersion: "draft_version",
+  previewSubject: "preview_subject",
+  previewDigest: "preview_digest",
+  decision: "decision",
+  decidedBy: "decided_by",
+  decidedAt: "decided_at",
+  decisionReason: "decision_reason",
+  expiresAt: "expires_at",
+  approvalId: "approval_id",
+  detail: "detail",
 } as const;
 
 export type ColumnName = (typeof COLUMNS)[keyof typeof COLUMNS];
@@ -311,6 +327,35 @@ export const qualificationTable = "qualifications" as const;
  */
 export const personalizedDraftTable = "personalized_drafts" as const;
 
+/**
+ * Table: approval requests (Phase 10).
+ *
+ * One row per request for a human decision about one exact draft version. The
+ * request binds to `draft_id` + `draft_version` together, so "which version was
+ * approved?" is a stored pair rather than a reconstruction: a draft that is
+ * regenerated produces a new version, and the old approval keeps pointing at
+ * the text the reviewer actually read.
+ *
+ * `preview_digest` fingerprints the exact content the reviewer was shown and is
+ * verified again at decision time, so an approval can never be recorded against
+ * content that moved underneath the decision.
+ *
+ * Identity columns (`created_by`, `decided_by`, `decided_at`) are written by the
+ * server from the session only. There is no column a client can supply to name
+ * its own approver.
+ */
+export const approvalRequestTable = "approval_requests" as const;
+
+/**
+ * Table: the append-only approval audit trail (Phase 10).
+ *
+ * Every state a request passes through leaves one row here, so the history of a
+ * decision — what was approved, which version, who, when and why — survives any
+ * later change. Rows are never edited or deleted, which is the whole point: a
+ * trail that can be rewritten is not a trail.
+ */
+export const approvalRequestEventTable = "approval_request_events" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -334,6 +379,8 @@ export const tables = [
   evidenceTable,
   qualificationTable,
   personalizedDraftTable,
+  approvalRequestTable,
+  approvalRequestEventTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -446,6 +493,18 @@ export const indexes = {
     `${COLUMN(personalizedDraftTable, COLUMNS.accountId)} NOT NULL`,
     `${COLUMN(personalizedDraftTable, COLUMNS.version)} NOT NULL`,
     `${COLUMN(personalizedDraftTable, COLUMNS.rendererVersion)} NOT NULL`,
+  ],
+  approvalRequests: [
+    `${COLUMN(approvalRequestTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(approvalRequestTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(approvalRequestTable, COLUMNS.draftId)} NOT NULL`,
+    `${COLUMN(approvalRequestTable, COLUMNS.draftVersion)} NOT NULL`,
+    `${COLUMN(approvalRequestTable, COLUMNS.status)} NOT NULL`,
+  ],
+  approvalRequestEvents: [
+    `${COLUMN(approvalRequestEventTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(approvalRequestEventTable, COLUMNS.approvalId)} NOT NULL`,
+    `${COLUMN(approvalRequestEventTable, COLUMNS.workspaceId)} NOT NULL`,
   ],
 };
 
@@ -902,6 +961,51 @@ ${COLUMN(personalizedDraftTable, COLUMNS.ownerId)} REFERENCES "${userTable}"("${
 ${COLUMN(personalizedDraftTable, COLUMNS.qualificationId)} REFERENCES "${qualificationTable}"("${COLUMNS.id}") ON DELETE SET NULL,
 ${COLUMN(personalizedDraftTable, COLUMNS.offerId)} REFERENCES "${offerTable}"("${COLUMNS.id}") ON DELETE SET NULL,
 ${COLUMN(personalizedDraftTable, COLUMNS.version)} CHECK (${COLUMN(personalizedDraftTable, COLUMNS.version)} > 0)`,
+  ),
+  createTableSql(
+    approvalRequestTable,
+    [
+      COLUMN(approvalRequestTable, COLUMNS.id),
+      COLUMN(approvalRequestTable, COLUMNS.workspaceId),
+      COLUMN(approvalRequestTable, COLUMNS.userId),
+      COLUMN(approvalRequestTable, COLUMNS.actionKind),
+      COLUMN(approvalRequestTable, COLUMNS.riskLevel),
+      COLUMN(approvalRequestTable, COLUMNS.draftId),
+      COLUMN(approvalRequestTable, COLUMNS.draftVersion),
+      COLUMN(approvalRequestTable, COLUMNS.previewSubject),
+      COLUMN(approvalRequestTable, COLUMNS.previewDigest),
+      COLUMN(approvalRequestTable, COLUMNS.status),
+      COLUMN(approvalRequestTable, COLUMNS.decision),
+      COLUMN(approvalRequestTable, COLUMNS.decidedBy),
+      COLUMN(approvalRequestTable, COLUMNS.decidedAt),
+      COLUMN(approvalRequestTable, COLUMNS.decisionReason),
+      COLUMN(approvalRequestTable, COLUMNS.expiresAt),
+    ],
+    `${COLUMN(approvalRequestTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(approvalRequestTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(approvalRequestTable, COLUMNS.userId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(approvalRequestTable, COLUMNS.id)} REFERENCES "${personalizedDraftTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(approvalRequestTable, COLUMNS.draftVersion)} CHECK (${COLUMN(approvalRequestTable, COLUMNS.draftVersion)} > 0),
+${COLUMN(approvalRequestTable, COLUMNS.actionKind)} CHECK (${COLUMN(approvalRequestTable, COLUMNS.actionKind)} IN ('send_message')),
+${COLUMN(approvalRequestTable, COLUMNS.riskLevel)} CHECK (${COLUMN(approvalRequestTable, COLUMNS.riskLevel)} IN ('level_0_read','level_1_draft','level_2_external_action','level_3_high_impact')),
+${COLUMN(approvalRequestTable, COLUMNS.status)} CHECK (${COLUMN(approvalRequestTable, COLUMNS.status)} IN ('pending','approved','rejected','changes_requested','cancelled','expired')),
+${COLUMN(approvalRequestTable, COLUMNS.decision)} CHECK (${COLUMN(approvalRequestTable, COLUMNS.decision)} IS NULL OR ${COLUMN(approvalRequestTable, COLUMNS.decision)} IN ('approved','rejected','changes_requested'))`,
+  ),
+  createTableSql(
+    approvalRequestEventTable,
+    [
+      COLUMN(approvalRequestEventTable, COLUMNS.id),
+      COLUMN(approvalRequestEventTable, COLUMNS.approvalId),
+      COLUMN(approvalRequestEventTable, COLUMNS.workspaceId),
+      COLUMN(approvalRequestEventTable, COLUMNS.actorUserId),
+      COLUMN(approvalRequestEventTable, COLUMNS.kind),
+      COLUMN(approvalRequestEventTable, COLUMNS.detail),
+    ],
+    `${COLUMN(approvalRequestEventTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(approvalRequestEventTable, COLUMNS.approvalId)} REFERENCES "${approvalRequestTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(approvalRequestEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(approvalRequestEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(approvalRequestEventTable, COLUMNS.kind)} CHECK (${COLUMN(approvalRequestEventTable, COLUMNS.kind)} IN ('requested','approved','rejected','changes_requested','cancelled','expired'))`,
   ),
 ].join("\n\n");
 

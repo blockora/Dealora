@@ -82,6 +82,13 @@ export type {
   QualificationState,
   PersonalizedDraft,
   DraftPersonalizationPoint,
+  ApprovalStatus,
+  ApprovalDecision,
+  ApprovalRiskLevel,
+  ApprovalActionKind,
+  ApprovalRequest,
+  ApprovalEventKind,
+  ApprovalRequestEvent,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -111,6 +118,8 @@ export {
   evidenceTable,
   qualificationTable,
   personalizedDraftTable,
+  approvalRequestTable,
+  approvalRequestEventTable,
   createTableSql,
   slugify,
   capString,

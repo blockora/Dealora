@@ -29,11 +29,16 @@ import type {
   Qualification,
   QualificationState,
   PersonalizedDraft,
+  ApprovalRequest,
+  ApprovalRequestEvent,
+  ApprovalDecision,
+  ApprovalStatus,
   User,
   Workspace,
   WorkspaceMember,
 } from "./types.js";
 import { toDateTime } from "./types.js";
+import type { DateTime } from "./types.js";
 import { slugify, capString, businessProfilesTable } from "./schema.js";
 import type { Result } from "@dealora/core";
 
@@ -107,7 +112,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 9;
+export const LATEST_SCHEMA_VERSION = 10;
 
 export interface DbState {
   schemaVersion?: number;
@@ -132,6 +137,8 @@ export interface DbState {
   evidence?: Evidence[];
   qualifications?: Qualification[];
   personalizedDrafts?: PersonalizedDraft[];
+  approvalRequests?: ApprovalRequest[];
+  approvalRequestEvents?: ApprovalRequestEvent[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -161,6 +168,8 @@ export function emptyState(): CompleteDbState {
     evidence: [],
     qualifications: [],
     personalizedDrafts: [],
+    approvalRequests: [],
+    approvalRequestEvents: [],
   };
 }
 
@@ -189,6 +198,12 @@ export function emptyState(): CompleteDbState {
  * Additive like every step before it: a Phase 8 document gains one empty table
  * and keeps every evaluation it already had, so an account that was qualified
  * before the upgrade can still be drafted for afterwards.
+ *
+ * Step 10 (Phase 10 — Approval Engine): add `approval_requests` and
+ * `approval_request_events`. Additive like every step before it: a Phase 9
+ * document gains two empty tables and keeps every draft it already had, so a
+ * draft rendered before the upgrade can still be put up for approval
+ * afterwards. Nothing before it is touched.
  */
 export function migrateState(input: DbState): CompleteDbState {
   const base = emptyState();
@@ -275,6 +290,18 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.personalizedDrafts;
   }
 
+  // Phase 10 adds the approval request and its audit trail. Additive: nothing
+  // before it is touched, so a document written by Phase 9 loads with two empty
+  // tables and every draft it already had.
+  if (version >= 10) {
+    state.approvalRequests = Array.isArray(input.approvalRequests)
+      ? input.approvalRequests
+      : base.approvalRequests;
+    state.approvalRequestEvents = Array.isArray(input.approvalRequestEvents)
+      ? input.approvalRequestEvents
+      : base.approvalRequestEvents;
+  }
+
   return state;
 }
 
@@ -315,6 +342,8 @@ type RowTable =
   | "evidence"
   | "qualifications"
   | "personalizedDrafts"
+  | "approvalRequests"
+  | "approvalRequestEvents"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -2411,6 +2440,248 @@ export class Store {
     return { ok: true, value: scoped };
   }
 
+  // -------------------------------------------------------------------------
+  // Phase 10 — Approval Engine
+  // -------------------------------------------------------------------------
+
+  /**
+   * Record one request for a human decision.
+   *
+   * Every field except the decision itself is resolved server-side by the
+   * caller: `createdBy` is the authenticated user, and the request binds to a
+   * draft that must live in this same workspace at the named version. The
+   * decision columns are written as `null`/`pending` here and are only ever
+   * moved by `decideApproval`, so there is no storage path that can create an
+   * already-approved request.
+   */
+  createApprovalRequest(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    approval: Omit<
+      ApprovalRequest,
+      | "id"
+      | "workspaceId"
+      | "createdBy"
+      | "status"
+      | "decision"
+      | "decidedBy"
+      | "decidedAt"
+      | "decisionReason"
+      | "createdAt"
+      | "updatedAt"
+    >;
+  }): Result<ApprovalRequest, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+    // The draft must exist here: an approval for another tenant's draft, or for
+    // a draft id that does not exist, would authorize nothing and mislead
+    // everyone who read it.
+    const draft = this.findById("personalizedDrafts", input.approval.draftId);
+    if (!draft || draft.workspaceId !== input.workspaceId) {
+      return {
+        ok: false,
+        error: toError("INVALID", "draft does not exist in this workspace"),
+      };
+    }
+    // The version must be one the draft lineage actually has: binding to a
+    // version that was never rendered is how an approval ends up authorizing
+    // text nobody read.
+    const hasVersion = this.rows("personalizedDrafts").some(
+      (row) => row.id === input.approval.draftId && row.version === input.approval.draftVersion,
+    );
+    if (!hasVersion) {
+      return {
+        ok: false,
+        error: toError("INVALID", "that draft version does not exist"),
+      };
+    }
+    const stamp = toDateTime(now());
+    const request: ApprovalRequest = {
+      ...input.approval,
+      id: newId(),
+      workspaceId: input.workspaceId,
+      createdBy: input.createdBy,
+      status: "pending",
+      decision: null,
+      decidedBy: null,
+      decidedAt: null,
+      decisionReason: null,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    this.mutate("approvalRequests", (rows) => rows.push(request));
+    return { ok: true, value: request };
+  }
+
+  /**
+   * Record one state a request passed through.
+   *
+   * Append-only: there is no update or delete, so the history of a decision
+   * survives whatever happens to the request row afterwards.
+   */
+  createApprovalRequestEvent(input: {
+    workspaceId: EntityId;
+    actorUserId: EntityId;
+    event: Omit<ApprovalRequestEvent, "id" | "workspaceId" | "actorUserId" | "createdAt">;
+  }): Result<ApprovalRequestEvent, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.actorUserId);
+    if (!auth.ok) return auth;
+    const approval = this.findById("approvalRequests", input.event.approvalId);
+    if (!approval || approval.workspaceId !== input.workspaceId) {
+      return {
+        ok: false,
+        error: toError("INVALID", "approval request does not exist in this workspace"),
+      };
+    }
+    const event: ApprovalRequestEvent = {
+      ...input.event,
+      id: newId(),
+      workspaceId: input.workspaceId,
+      actorUserId: input.actorUserId,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("approvalRequestEvents", (rows) => rows.push(event));
+    return { ok: true, value: event };
+  }
+
+  /**
+   * Move a request to a decided state.
+   *
+   * Only ever reached from `decideApproval`/`cancelApproval` in the domain, and
+   * always with the reviewer taken from the authenticated identity. `pending` is
+   * the only legal starting state: a second decision on an already-decided
+   * request is refused rather than overwriting the first, because a decision
+   * that can be rewritten is not a decision.
+   */
+  decideApproval(input: {
+    id: EntityId;
+    userId: EntityId;
+    decision: ApprovalDecision;
+    reason: string | null;
+    decidedAt: DateTime;
+  }): Result<ApprovalRequest, StorageError> {
+    const request = this.findById("approvalRequests", input.id);
+    if (!request) return { ok: false, error: toError("NOT_FOUND", "approval request not found") };
+    const auth = this.requireWorkspace(request.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    if (request.status !== "pending") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this request is already ${request.status}`),
+      };
+    }
+    const decided: ApprovalRequest = {
+      ...request,
+      status: input.decision,
+      decision: input.decision,
+      decidedBy: input.userId,
+      decidedAt: input.decidedAt,
+      decisionReason: input.reason,
+      updatedAt: input.decidedAt,
+    };
+    this.mutate("approvalRequests", (rows) => {
+      const typed = rows as ApprovalRequest[];
+      const index = typed.findIndex((row) => row.id === input.id);
+      if (index === -1) return;
+      typed[index] = decided;
+    });
+    return { ok: true, value: decided };
+  }
+
+  /**
+   * Close a pending request without a decision: cancelled by the requester, or
+   * expired by its own deadline.
+   *
+   * A timeout closes the door and never opens one — `expired` is not a decision
+   * and cannot authorize anything, which is why it shares this method with
+   * `cancelled` and neither path can produce `approved`.
+   */
+  closeApproval(input: {
+    id: EntityId;
+    userId: EntityId;
+    status: Extract<ApprovalStatus, "cancelled" | "expired">;
+    reason: string | null;
+    decidedAt: DateTime;
+  }): Result<ApprovalRequest, StorageError> {
+    const request = this.findById("approvalRequests", input.id);
+    if (!request) return { ok: false, error: toError("NOT_FOUND", "approval request not found") };
+    const auth = this.requireWorkspace(request.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    if (request.status !== "pending") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this request is already ${request.status}`),
+      };
+    }
+    const closed: ApprovalRequest = {
+      ...request,
+      status: input.status,
+      decision: null,
+      decidedBy: null,
+      decidedAt: input.decidedAt,
+      decisionReason: input.reason,
+      updatedAt: input.decidedAt,
+    };
+    this.mutate("approvalRequests", (rows) => {
+      const typed = rows as ApprovalRequest[];
+      const index = typed.findIndex((row) => row.id === input.id);
+      if (index === -1) return;
+      typed[index] = closed;
+    });
+    return { ok: true, value: closed };
+  }
+
+  getApprovalRequest(id: EntityId, userId: EntityId): Result<ApprovalRequest, StorageError> {
+    const request = this.findById("approvalRequests", id);
+    if (!request) return { ok: false, error: toError("NOT_FOUND", "approval request not found") };
+    const auth = this.requireWorkspace(request.workspaceId, userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: request };
+  }
+
+  /**
+   * A workspace's approval requests, newest first.
+   *
+   * Nothing is filtered out by default. A rejected or expired request stays
+   * listable because it is the record of a human saying no, and that record is
+   * exactly what a later reader needs to see.
+   */
+  listApprovalRequests(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: {
+      draftId?: EntityId;
+      status?: ApprovalStatus;
+      decidedBy?: EntityId;
+    },
+  ): Result<ApprovalRequest[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    let scoped = this.rows("approvalRequests").filter((r) => r.workspaceId === workspaceId);
+    if (filter?.draftId) scoped = scoped.filter((r) => r.draftId === filter.draftId);
+    if (filter?.status) scoped = scoped.filter((r) => r.status === filter.status);
+    if (filter?.decidedBy) scoped = scoped.filter((r) => r.decidedBy === filter.decidedBy);
+    return {
+      ok: true,
+      value: [...scoped].sort((a, b) =>
+        a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0,
+      ),
+    };
+  }
+
+  /** One request's audit trail, oldest first. Never empty for a real request. */
+  listApprovalRequestEvents(
+    approvalId: EntityId,
+    userId: EntityId,
+  ): Result<ApprovalRequestEvent[], StorageError> {
+    const request = this.findById("approvalRequests", approvalId);
+    if (!request) return { ok: false, error: toError("NOT_FOUND", "approval request not found") };
+    const auth = this.requireWorkspace(request.workspaceId, userId);
+    if (!auth.ok) return auth;
+    const events = this.rows("approvalRequestEvents").filter((e) => e.approvalId === approvalId);
+    return { ok: true, value: [...events].sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)) };
+  }
+
   /** Cleanup helper so tests and local runs do not leave files behind. */
   destroy(): void {
     try {
@@ -2520,6 +2791,14 @@ export const db = {
   createDraft: store.createDraft.bind(store),
   getDraft: store.getDraft.bind(store),
   listDrafts: store.listDrafts.bind(store),
+
+  createApprovalRequest: store.createApprovalRequest.bind(store),
+  createApprovalRequestEvent: store.createApprovalRequestEvent.bind(store),
+  decideApproval: store.decideApproval.bind(store),
+  closeApproval: store.closeApproval.bind(store),
+  getApprovalRequest: store.getApprovalRequest.bind(store),
+  listApprovalRequests: store.listApprovalRequests.bind(store),
+  listApprovalRequestEvents: store.listApprovalRequestEvents.bind(store),
 
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),
