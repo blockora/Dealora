@@ -27,6 +27,7 @@ import type { ApprovalError, ApprovalService } from "@dealora/approval";
 import type { OutboundError, OutboundService } from "@dealora/outbound";
 import type { ConversationError, ConversationService } from "@dealora/conversation";
 import type { MeetingError, MeetingService } from "@dealora/meeting";
+import type { NextActionError, NextActionService } from "@dealora/nextaction";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -404,6 +405,36 @@ function fromMeetingError(error: MeetingError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `NextActionError` into the safe API error envelope.
+ *
+ * Written as an exhaustive switch, with no cast, so the `ApiErrorCode` annotation
+ * is a real guarantee: TypeScript accepts the function only while every member of
+ * the domain's error union has a case, which is what stops a new domain code from
+ * reaching the wire as something the transport contract does not define.
+ *
+ * `UNAVAILABLE` is an internal condition — storage refusing a write because the
+ * recommendation contradicted itself — and is never surfaced verbatim.
+ */
+function fromNextActionError(error: NextActionError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+        return "VALIDATION_ERROR";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = [...error.details];
+  return mapped;
+}
+
 export interface HandlerDeps {
   identity: IdentityService;
   brain: BusinessBrainService;
@@ -420,6 +451,7 @@ export interface HandlerDeps {
   outbound: OutboundService;
   conversation: ConversationService;
   meeting: MeetingService;
+  nextaction: NextActionService;
   resolveSession: SessionResolver;
 }
 
@@ -2541,6 +2573,128 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok(result.value) };
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 14 — Next Best Action Engine
+  //
+  // These handlers answer ROADMAP.md §21's one question — "what should happen
+  // next?" — for a single account and for a whole workspace. They are the only
+  // thing Phase 14 can do through the API.
+  //
+  // **None of them acts on the answer.** There is no route here that sends,
+  // approves, books or schedules anything. A recommendation is a record with its
+  // reasons attached; acting on it means calling Phase 10, 11 or 13, each of
+  // which re-derives its own approval, digest and suppression check first.
+  //
+  // The only field a caller ever sends is an account id. There is deliberately no
+  // `action`, `reason`, `confidence`, `riskLevel`, `approvalRequired` or
+  // `expectedOutcome` anywhere in these handlers: all six are server-derived, and
+  // a body that carries them is ignored rather than trusted.
+  // -------------------------------------------------------------------------
+
+  /**
+   * The next recommended action for one account, computed live.
+   *
+   * Nothing is persisted. This is the route that answers "what should happen
+   * right now?", and it re-decides from current rows on every call so a stale
+   * suggestion can never be shown.
+   */
+  const recommendNextActionHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.nextaction.recommendNextAction(workspaceId, actor.userId, {
+        accountId: body.accountId,
+      });
+      if (!result.ok) return { ok: false, error: fromNextActionError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * The next recommended action for every account in a workspace.
+   *
+   * §25's "constantly answer what should happen next" is really about this shape:
+   * a workspace asking about its whole pipeline rather than one account at a
+   * time. A workspace with more accounts than the published cap is **refused**
+   * rather than silently truncated.
+   */
+  const recommendWorkspaceActionsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.nextaction.recommendForWorkspace(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromNextActionError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * Record the current recommendation for one account.
+   *
+   * Recording is explicit rather than a side effect of reading, so "DEALORA
+   * advised this, on this evidence, at this rule version" is something the
+   * workspace chose to keep. The row is immutable, and **it still does not act**:
+   * the phases that own doing the work still require their own human approval.
+   */
+  const recordNextActionHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.nextaction.recordRecommendation(workspaceId, actor.userId, {
+        accountId: body.accountId,
+      });
+      if (!result.ok) return { ok: false, error: fromNextActionError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** The recorded history, newest first, optionally narrowed by account or action. */
+  const listNextActionsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.nextaction.listRecommendations(workspaceId, actor.userId, {
+        accountId: req.query.accountId,
+        action: req.query.action,
+      });
+      if (!result.ok) return { ok: false, error: fromNextActionError(result.error) };
+      return { ok: true, value: ok({ recommendations: result.value }) };
+    });
+
+  /** One recorded recommendation, authorized against the caller's own workspace. */
+  const getNextActionHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+
+      const result = deps.nextaction.getRecommendation(id, actor.userId);
+      if (!result.ok) return { ok: false, error: fromNextActionError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * The recommendation rules this deployment enforces — every state, the action
+   * it produces, the §17 level and the expected outcome — plus everything the
+   * engine refuses to do.
+   *
+   * Readable before a workspace has a single account, so a workspace can see the
+   * whole rule set before handing over anything.
+   */
+  const getNextActionPolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.nextaction.policy(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromNextActionError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -2661,6 +2815,16 @@ export function createHandlers(deps: HandlerDeps) {
     prepareMeetingBriefHandler,
     getMeetingHistoryHandler,
     getMeetingPolicyHandler,
+
+    // -------------------------------------------------------------------------
+    // Phase 14 — Next Best Action Engine
+    // -------------------------------------------------------------------------
+    recommendNextActionHandler,
+    recommendWorkspaceActionsHandler,
+    recordNextActionHandler,
+    listNextActionsHandler,
+    getNextActionHandler,
+    getNextActionPolicyHandler,
   };
 }
 

@@ -44,6 +44,11 @@ import {
   createSuppressionReader,
 } from "@dealora/meeting";
 import type { MeetingCalendarProvider } from "@dealora/meeting";
+import {
+  createAccountIndexReader,
+  createAccountStateReader,
+  createNextActionService,
+} from "@dealora/nextaction";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -396,6 +401,21 @@ export function createDefaultHandlers(options?: {
       createMeetingContactReader(store as never),
       createSuppressionReader(store as never),
       calendarProvider(options?.calendarProviders),
+    ),
+    /**
+     * The recommendation boundary reads the account's whole revenue position and
+     * nothing else.
+     *
+     * The reader resolves the account through storage with the caller's own
+     * identity and returns nothing for an account that does not exist or belongs
+     * to another workspace, so the engine has no way to probe for a foreign id.
+     * It is given **no** sender, approver, calendar or scheduler: the strongest
+     * thing it can do is produce a sentence, which is the whole point.
+     */
+    nextaction: createNextActionService(
+      store as never,
+      createAccountStateReader(store as never),
+      createAccountIndexReader(store as never),
     ),
     resolveSession: (token) => {
       try {

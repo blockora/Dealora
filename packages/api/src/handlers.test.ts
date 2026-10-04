@@ -51,6 +51,11 @@ import {
   createSuppressionReader,
 } from "@dealora/meeting";
 import { createContactReader as createMeetingContactReader } from "@dealora/meeting";
+import {
+  createAccountIndexReader,
+  createAccountStateReader,
+  createNextActionService,
+} from "@dealora/nextaction";
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
 import type { RevenueGoal } from "@dealora/db";
@@ -168,6 +173,21 @@ function meetingService(store: Store, clock?: () => Date) {
     createSuppressionReader(store as never),
     new SandboxCalendarProvider(),
     clock,
+  );
+}
+
+/**
+ * Wire the Next Best Action service the way the production wiring does.
+ *
+ * The same narrow account-state reader and account index, so a route test that
+ * asks "what should happen next?" exercises the real engine reading the real
+ * store rather than a stand-in that could not disagree with it.
+ */
+function nextActionService(store: Store) {
+  return createNextActionService(
+    store as never,
+    createAccountStateReader(store as never),
+    createAccountIndexReader(store as never),
   );
 }
 
@@ -319,6 +339,7 @@ function fixture(options?: {
     outbound: outboundService(store),
     conversation: conversationService(store),
     meeting: meetingService(store),
+    nextaction: nextActionService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -801,6 +822,7 @@ describe("API Revenue Goal routes", () => {
       outbound: outboundService(store),
       conversation: conversationService(store),
       meeting: meetingService(store),
+      nextaction: nextActionService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1137,6 +1159,7 @@ describe("API Revenue Plan routes", () => {
       outbound: outboundService(store),
       conversation: conversationService(store),
       meeting: meetingService(store),
+      nextaction: nextActionService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1354,6 +1377,7 @@ describe("API Business Brain routes", () => {
       outbound: outboundService(failingStore),
       conversation: conversationService(failingStore),
       meeting: meetingService(failingStore),
+      nextaction: nextActionService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1696,6 +1720,7 @@ describe("API Account & Contact routes", () => {
       outbound: outboundService(store),
       conversation: conversationService(store),
       meeting: meetingService(store),
+      nextaction: nextActionService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -2005,6 +2030,7 @@ describe("API Research routes", () => {
       outbound: outboundService(store),
       conversation: conversationService(store),
       meeting: meetingService(store),
+      nextaction: nextActionService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -2058,6 +2084,7 @@ describe("API Research routes", () => {
       outbound: outboundService(store),
       conversation: conversationService(store),
       meeting: meetingService(store),
+      nextaction: nextActionService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3199,6 +3226,7 @@ describe("API Qualification routes", () => {
       outbound: outboundService(store),
       conversation: conversationService(store),
       meeting: meetingService(store),
+      nextaction: nextActionService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -3208,5 +3236,304 @@ describe("API Qualification routes", () => {
     expect(error.code).toBe("SERVER_ERROR");
     expect(error.message).toBe("unexpected failure");
     expect(JSON.stringify(error)).not.toContain("UNAVAILABLE");
+  });
+});
+
+describe("API Next Best Action routes", () => {
+  /** One account in tenant A, so the routes have something real to read. */
+  function nextActionFixture(): {
+    handlers: ReturnType<typeof createHandlers>;
+    token: string;
+    workspaceId: string;
+    accountId: string;
+  } {
+    const built = fixture();
+    const account = built.store.createAccount({
+      workspaceId: built.workspaceA,
+      createdBy: built.userA,
+      account: {
+        name: "Northwind",
+        website: null,
+        domain: "northwind.example",
+        industry: "SaaS",
+        companySize: "50-200",
+        geography: "Germany",
+        description: null,
+        source: "manual",
+        sourceReference: null,
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(account)) throw new Error("fixture account failed");
+    return {
+      handlers: built.handlers,
+      token: built.tokenA,
+      workspaceId: built.workspaceA,
+      accountId: account.value.id,
+    };
+  }
+
+  it("answers the next action for an account, with all seven required fields", async () => {
+    const f = nextActionFixture();
+    const data = (await dataOf(
+      f.handlers.recommendNextActionHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: { accountId: f.accountId },
+        }),
+      ),
+    )) as Record<string, unknown>;
+
+    expect(data.action).toBe("research_account");
+    expect(data.supportingState).toBe("no_research");
+    expect(data.reason).toEqual(expect.any(String));
+    expect(data.confidenceReasons).toEqual(expect.any(Array));
+    expect(["low", "medium", "high"]).toContain(data.confidence);
+    expect(data.expectedOutcome).toBe("research_findings_available");
+    expect(data.approvalRequired).toBe(false);
+    expect(data.riskLevel).toBe("level_0_read");
+    expect(data.ruleVersion).toBe("next-action-1.0.0");
+  });
+
+  it("requires authentication on every Phase 14 route", async () => {
+    const f = nextActionFixture();
+    const anonymous = { ...request({ params: { workspaceId: f.workspaceId } }) };
+    delete (anonymous.query as Record<string, unknown>).sessionToken;
+    const calls = [
+      f.handlers.recommendNextActionHandler({
+        ...anonymous,
+        body: { accountId: f.accountId },
+      }),
+      f.handlers.recommendWorkspaceActionsHandler(anonymous),
+      f.handlers.recordNextActionHandler({ ...anonymous, body: { accountId: f.accountId } }),
+      f.handlers.listNextActionsHandler(anonymous),
+      f.handlers.getNextActionHandler(request({ params: { id: "nb-1" } })),
+      f.handlers.getNextActionPolicyHandler(anonymous),
+    ];
+    for (const call of calls) {
+      const error = await errorOf(call);
+      expect(error.code).toBe("UNAUTHENTICATED");
+    }
+  });
+
+  it("requires a workspace id on the workspace-scoped routes", async () => {
+    const f = nextActionFixture();
+    const error = await errorOf(
+      f.handlers.recommendNextActionHandler(request({ token: f.token, body: { accountId: "a1" } })),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("maps a domain refusal onto the transport envelope", async () => {
+    const f = nextActionFixture();
+    const notFound = await errorOf(
+      f.handlers.recommendNextActionHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: { accountId: "acct-does-not-exist" },
+        }),
+      ),
+    );
+    expect(notFound.code).toBe("NOT_FOUND");
+
+    const invalid = await errorOf(
+      f.handlers.recommendNextActionHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: { accountId: 42 },
+        }),
+      ),
+    );
+    expect(invalid.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("records, lists and reads back a recommendation", async () => {
+    const f = nextActionFixture();
+
+    const recorded = (await dataOf(
+      f.handlers.recordNextActionHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: { accountId: f.accountId },
+        }),
+      ),
+    )) as { id: string; action: string; createdBy: string };
+    expect(recorded.action).toBe("research_account");
+
+    const reread = (await dataOf(
+      f.handlers.getNextActionHandler(request({ token: f.token, params: { id: recorded.id } })),
+    )) as { id: string };
+    expect(reread.id).toBe(recorded.id);
+
+    const listed = (await dataOf(
+      f.handlers.listNextActionsHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    )) as { recommendations: { id: string }[] };
+    expect(listed.recommendations.map((r) => r.id)).toContain(recorded.id);
+
+    const filtered = (await dataOf(
+      f.handlers.listNextActionsHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          query: { action: "research_account" },
+        }),
+      ),
+    )) as { recommendations: { id: string }[] };
+    expect(filtered.recommendations).toHaveLength(1);
+
+    const unknownFilter = await errorOf(
+      f.handlers.listNextActionsHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          query: { action: "escalate_to_manager" },
+        }),
+      ),
+    );
+    expect(unknownFilter.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("keeps tenant A's recommendation out of tenant B's reach", async () => {
+    const built = fixture();
+    const account = built.store.createAccount({
+      workspaceId: built.workspaceA,
+      createdBy: built.userA,
+      account: {
+        name: "Northwind",
+        website: null,
+        domain: "northwind.example",
+        industry: "SaaS",
+        companySize: "50-200",
+        geography: "Germany",
+        description: null,
+        source: "manual",
+        sourceReference: null,
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(account)) throw new Error("fixture account failed");
+
+    const recorded = (await dataOf(
+      built.handlers.recordNextActionHandler(
+        request({
+          token: built.tokenA,
+          params: { workspaceId: built.workspaceA },
+          body: { accountId: account.value.id },
+        }),
+      ),
+    )) as { id: string; createdBy: string };
+    // The author came from the session, not from the body.
+    expect(recorded.createdBy).toBe(built.userA);
+
+    const stolen = await errorOf(
+      built.handlers.getNextActionHandler(
+        request({ token: built.tokenB, params: { id: recorded.id } }),
+      ),
+    );
+    expect(stolen.code).toBe("NOT_FOUND");
+
+    const crossed = await errorOf(
+      built.handlers.recommendNextActionHandler(
+        request({
+          token: built.tokenB,
+          params: { workspaceId: built.workspaceB },
+          body: { accountId: account.value.id },
+        }),
+      ),
+    );
+    expect(crossed.code).toBe("NOT_FOUND");
+  });
+
+  it("publishes the whole rule set through the policy route", async () => {
+    const f = nextActionFixture();
+    const policy = (await dataOf(
+      f.handlers.getNextActionPolicyHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    )) as { states: string[]; actions: string[]; rules: unknown[]; neverDoes: string[] };
+    expect(policy.states.length).toBe(policy.rules.length);
+    expect(policy.actions.length).toBeGreaterThan(0);
+    expect(policy.neverDoes.length).toBeGreaterThan(0);
+  });
+
+  it("turns a storage failure into SERVER_ERROR without surfacing the message", async () => {
+    const failingStore = new Store(emptyState());
+    const broken = {
+      authorize: () => ({ ok: true as const }),
+      listNextBestActions: () => ({
+        ok: false as const,
+        error: { code: "UNAVAILABLE", message: "the disk is on fire" },
+      }),
+    };
+    const handlers = createHandlers({
+      identity: {
+        signup: () => {
+          throw new Error("not used");
+        },
+        authenticate: () => {
+          throw new Error("not used");
+        },
+        listWorkspaces: () => ({ ok: true, value: [] }),
+        getWorkspace: () => ({ ok: true, value: undefined }) as never,
+        authorize: () => ({ ok: true }) as never,
+        updateWorkspace: () => {
+          throw new Error("not used");
+        },
+        getUser: () => ({ ok: true, value: undefined }) as never,
+      },
+      brain: new BusinessBrainService(failingStore as unknown as BrainRepository),
+      goal: new RevenueGoalService(
+        failingStore as unknown as GoalRepository,
+        deterministicGoalParser,
+      ),
+      brainContext: () => {
+        throw new Error("not used");
+      },
+      plan: new RevenuePlanService(
+        failingStore as unknown as PlanRepository,
+        deterministicPlanCompiler,
+        () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        () => {
+          throw new Error("not used");
+        },
+      ),
+      planContext: () => {
+        throw new Error("not used");
+      },
+      account: new AccountService(failingStore as unknown as AccountRepository, () => ({
+        ok: false,
+        error: { code: "UNAVAILABLE" },
+      })),
+      research: createResearchService(failingStore as never),
+      evidence: createEvidenceService(failingStore as never),
+      qualification: qualificationService(failingStore),
+      personalization: personalizationService(failingStore),
+      approval: approvalService(failingStore),
+      outbound: outboundService(failingStore),
+      conversation: conversationService(failingStore),
+      meeting: meetingService(failingStore),
+      nextaction: createNextActionService(
+        broken as never,
+        createAccountStateReader(failingStore as never),
+        createAccountIndexReader(failingStore as never),
+      ),
+      resolveSession: () => ({ userId: "u1" }),
+    });
+
+    const error = await errorOf(
+      handlers.listNextActionsHandler(request({ token: "t", params: { workspaceId: "w1" } })),
+    );
+    expect(error.code).toBe("SERVER_ERROR");
+    // `UNAVAILABLE` is an internal condition and is never surfaced verbatim.
+    expect(error.message).toBe("unexpected failure");
+    expect(JSON.stringify(error)).not.toContain("disk");
   });
 });

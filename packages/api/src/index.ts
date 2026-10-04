@@ -98,6 +98,24 @@ export type {
 } from "@dealora/meeting";
 
 /**
+ * The Next Best Action domain's public surface, re-exported so API consumers can
+ * type a recommendation response without depending on the domain package
+ * directly.
+ */
+export type {
+  NextActionBoard,
+  NextActionError,
+  NextActionPolicyView,
+  NextActionRecommendation,
+  NextActionRuleView,
+  NextBestAction,
+  NextBestActionKind,
+  NextBestActionOutcome,
+  NextBestActionRiskLevel,
+  NextBestActionState,
+} from "@dealora/nextaction";
+
+/**
  * The Qualification domain's public surface, re-exported so API consumers can
  * type a qualification response without depending on the domain package
  * directly.
