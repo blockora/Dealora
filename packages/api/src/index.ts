@@ -28,6 +28,7 @@ export { createDefaultHandlers } from "./wiring.js";
  * a response without depending on the domain package directly.
  */
 export type { Evidence, EvidenceError, EvidenceStatus, AccountClaim } from "@dealora/evidence";
+export type { DraftPersonalizationPoint } from "@dealora/db";
 
 /**
  * The Qualification domain's public surface, re-exported so API consumers can
@@ -43,3 +44,21 @@ export type {
   QualificationError,
   QualificationState,
 } from "@dealora/qualification";
+
+/**
+ * The Personalization domain's public surface, re-exported so API consumers can
+ * type a draft response without depending on the domain package directly.
+ * `DraftPersonalizationPoint` is a `@dealora/db` type, re-exported by the
+ * domain package, so it is listed with the db re-exports above rather than
+ * here.
+ */
+export type {
+  DraftInspection,
+  DraftRenderInput,
+  DraftRenderOutput,
+  PersonalizedDraft,
+  PersonalizationApprovedClaim,
+  PersonalizationError,
+  PersonalizationOfferSnapshot,
+  PersonalizationQualificationSnapshot,
+} from "@dealora/personalization";

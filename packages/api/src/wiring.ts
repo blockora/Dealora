@@ -15,6 +15,11 @@ import {
   toIcpSnapshot,
   toPlanReader,
 } from "@dealora/qualification";
+import {
+  createPersonalizationService,
+  toOfferSnapshot,
+  toQualificationSnapshot,
+} from "@dealora/personalization";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -237,6 +242,49 @@ export function createDefaultHandlers(options?: {
         const plan = store.getRevenuePlan(planId, userId);
         return plan.ok ? plan.value : null;
       }),
+    ),
+    /**
+     * Personalization reads two narrow things from the rest of the system: the
+     * qualification a draft may be generated for, and the active offer whose own
+     * words it may quote.
+     *
+     * Each read is authorized before it is used, and both return `null` for a
+     * record that does not exist or belongs to another workspace, so a draft can
+     * never be rendered against another tenant's qualification or offer — and
+     * a foreign one is never revealed to exist. The engine never sees a whole
+     * Business Brain, a whole offer or a whole qualification record.
+     */
+    personalization: createPersonalizationService(
+      store as never,
+      {
+        latest: (workspaceId, userId, accountId) => {
+          const auth = store.authorize(workspaceId, userId);
+          if (!auth.ok) return null;
+          const listed = store.listQualifications(workspaceId, userId, { accountId });
+          if (!listed.ok) return null;
+          // Newest first, as the store orders them: the evaluation a draft
+          // would be generated against by default.
+          const latest = listed.value[0];
+          return latest === undefined ? null : toQualificationSnapshot(latest);
+        },
+        byId: (qualificationId, userId) => {
+          const found = store.getQualification(qualificationId, userId);
+          return found.ok ? toQualificationSnapshot(found.value) : null;
+        },
+      },
+      {
+        byId: (offerId, userId) => {
+          const found = store.getOffer(offerId, userId);
+          return found.ok ? toOfferSnapshot(found.value) : null;
+        },
+        listActive: (workspaceId, userId) => {
+          const auth = store.authorize(workspaceId, userId);
+          if (!auth.ok) return [];
+          const offers = store.listOffers(workspaceId, userId);
+          if (!offers.ok) return [];
+          return offers.value.filter((offer) => offer.status === "active").map(toOfferSnapshot);
+        },
+      },
     ),
     resolveSession: (token) => {
       try {

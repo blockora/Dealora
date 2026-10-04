@@ -20,6 +20,7 @@
     "@dealora/evidence": "workspace:*",
     "@dealora/goal": "workspace:*",
     "@dealora/plan": "workspace:*",
+    "@dealora/personalization": "workspace:*",
     "@dealora/qualification": "workspace:*",
     "@dealora/research": "workspace:*"
   },

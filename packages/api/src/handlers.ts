@@ -20,6 +20,8 @@ import { ACCOUNT_CLAIM_STATUSES, EVIDENCE_STATUSES } from "@dealora/evidence";
 import type { EvidenceError, EvidenceService } from "@dealora/evidence";
 import { SUPPORTED_RULE_VERSIONS } from "@dealora/qualification";
 import type { QualificationError, QualificationService } from "@dealora/qualification";
+import { SUPPORTED_RENDERER_VERSIONS } from "@dealora/personalization";
+import type { PersonalizationError, PersonalizationService } from "@dealora/personalization";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -197,6 +199,27 @@ function fromQualificationError(error: QualificationError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `PersonalizationError` into the safe API error envelope.
+ *
+ * `UNAVAILABLE` is an internal condition and is never surfaced verbatim. An
+ * `UNSUPPORTED_RENDERER_VERSION` is the caller's mistake rather than ours, so
+ * it reads as a validation failure, exactly as an unsupported rule version or
+ * provider does in the layers before it.
+ */
+function fromPersonalizationError(error: PersonalizationError): ApiError {
+  if (error.code === "UNAVAILABLE") {
+    return { code: "SERVER_ERROR", message: "unexpected failure" };
+  }
+  const code: ApiErrorCode =
+    error.code === "UNSUPPORTED_RENDERER_VERSION"
+      ? "VALIDATION_ERROR"
+      : (error.code as ApiErrorCode);
+  const mapped: ApiError = { code, message: error.message };
+  if (error.details) mapped.details = error.details;
+  return mapped;
+}
+
 /** Parse a JSON body, tolerating already-parsed objects. */
 async function parseBody(req: RequestBody): Promise<Record<string, unknown> | ApiError> {
   const raw = req.body;
@@ -229,6 +252,7 @@ export interface HandlerDeps {
   research: ResearchService;
   evidence: EvidenceService;
   qualification: QualificationService;
+  personalization: PersonalizationService;
   resolveSession: SessionResolver;
 }
 
@@ -1597,6 +1621,138 @@ export function createHandlers(deps: HandlerDeps) {
       return Promise.resolve({ ok: true, value: ok(result.value) });
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 9 — Personalization Engine
+  //
+  // These handlers translate and nothing more. The account comes from the
+  // route, the identity from the session, and every rule — that the account is
+  // qualified, that the offer is active, that the contact belongs to the
+  // account, and above all what a draft may say — is enforced by the
+  // personalization service against the server-side identity.
+  //
+  // Nothing about the content is accepted from a caller. A `subject`, `body`,
+  // `warnings` or `personalizationPoints` field in a body is not read: the
+  // server renders the draft or there is no draft. The four selectors a body
+  // may carry — `qualificationId`, `offerId`, `contactId` and
+  // `rendererVersion` — choose *which of the workspace's own* context to draft
+  // from, and each is validated server-side against the real records and the
+  // renderer versions this deployment implements.
+  //
+  // No handler here sends anything. There is no send route, no channel and no
+  // provider at this phase: the only path out of a draft is the Phase 10
+  // approval boundary.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Generate one draft for a qualified account.
+   *
+   * Generation inserts a new immutable version rather than rewriting an
+   * existing draft, so a draft a reviewer has already seen can never change
+   * underneath them — which is what lets an approval bind to one exact version.
+   */
+  const createPersonalizedDraftHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const accountId = param(req, "accountId");
+      if (isApiError(accountId)) return { ok: false, error: accountId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      // Only the context selectors are read. `workspaceId`, `userId` and
+      // `accountId` in the body are ignored in favour of the route's and the
+      // token's, and no content field is read at all.
+      const result = deps.personalization.generateDraft(workspaceId, actor.userId, accountId, {
+        qualificationId: body.qualificationId,
+        offerId: body.offerId,
+        contactId: body.contactId,
+        rendererVersion: body.rendererVersion,
+      });
+      if (!result.ok) return { ok: false, error: fromPersonalizationError(result.error) };
+      return { ok: true, value: ok({ draft: result.value }) };
+    });
+
+  /**
+   * The rules this workspace's drafts are composed under, before any draft
+   * exists.
+   *
+   * A `rendererVersion` may be asked for explicitly and is validated against
+   * what this deployment implements; when it is omitted the current renderer is
+   * described, so a caller never has to know a version number to learn what a
+   * draft may and may not state.
+   */
+  const getPersonalizationRendererHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+
+      const requested = req.query.rendererVersion;
+      if (requested !== undefined && typeof requested !== "string") {
+        return Promise.resolve({
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "rendererVersion must be one of: " + SUPPORTED_RENDERER_VERSIONS.join(", "),
+          },
+        });
+      }
+      const result = deps.personalization.describePersonalizationRenderer(
+        workspaceId,
+        actor.userId,
+        { rendererVersion: requested },
+      );
+      if (!result.ok)
+        return Promise.resolve({ ok: false, error: fromPersonalizationError(result.error) });
+      return Promise.resolve({ ok: true, value: ok(result.value) });
+    });
+
+  /** One draft, exactly as it was rendered and stored. */
+  const getPersonalizedDraftHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.personalization.getDraft(id, actor.userId);
+      if (!result.ok)
+        return Promise.resolve({ ok: false, error: fromPersonalizationError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ draft: result.value }) });
+    });
+
+  /** A workspace's drafts, newest first, optionally narrowed to one account. */
+  const listPersonalizedDraftsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return Promise.resolve({ ok: false, error: workspaceId });
+
+      const accountId =
+        typeof req.query.accountId === "string" && req.query.accountId !== ""
+          ? req.query.accountId
+          : undefined;
+
+      const result = deps.personalization.listDrafts(workspaceId, actor.userId, { accountId });
+      if (!result.ok)
+        return Promise.resolve({ ok: false, error: fromPersonalizationError(result.error) });
+      return Promise.resolve({ ok: true, value: ok({ drafts: result.value }) });
+    });
+
+  /**
+   * The draft together with the claim and evidence records behind every
+   * statement in it.
+   *
+   * This is the phase's gate — "a personalized draft with supporting evidence"
+   * — in one read. The records are joined from storage rather than copied into
+   * the draft, so the stored document stays small and Phase 7's records stay
+   * the single source of truth.
+   */
+  const getPersonalizedDraftEvidenceHandler: ApiHandler = (req) =>
+    authenticated(req, deps, (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return Promise.resolve({ ok: false, error: id });
+      const result = deps.personalization.inspectDraft(id, actor.userId);
+      if (!result.ok)
+        return Promise.resolve({ ok: false, error: fromPersonalizationError(result.error) });
+      return Promise.resolve({ ok: true, value: ok(result.value) });
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -1673,6 +1829,11 @@ export function createHandlers(deps: HandlerDeps) {
     getQualificationHandler,
     listQualificationsHandler,
     getQualificationExplanationHandler,
+    createPersonalizedDraftHandler,
+    getPersonalizationRendererHandler,
+    getPersonalizedDraftHandler,
+    listPersonalizedDraftsHandler,
+    getPersonalizedDraftEvidenceHandler,
   };
 }
 

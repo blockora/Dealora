@@ -23,6 +23,11 @@ import {
   toIcpSnapshot,
   toPlanReader,
 } from "@dealora/qualification";
+import {
+  createPersonalizationService,
+  toOfferSnapshot,
+  toQualificationSnapshot,
+} from "@dealora/personalization";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -54,6 +59,48 @@ function qualificationService(store: Store, clock?: () => Date) {
       const plan = store.getRevenuePlan(planId, userId);
       return plan.ok ? plan.value : null;
     }),
+    clock,
+  );
+}
+
+/**
+ * Wire the Personalization service the way the production wiring does.
+ *
+ * The readers are the same narrow ones `createDefaultHandlers` builds: the
+ * newest qualification for an account, and the active offers whose own words a
+ * draft may quote. Route tests then exercise the real service rather than a
+ * stand-in.
+ */
+function personalizationService(store: Store, clock?: () => Date) {
+  return createPersonalizationService(
+    store as never,
+    {
+      latest: (workspaceId, userId, accountId) => {
+        const auth = store.authorize(workspaceId, userId);
+        if (!auth.ok) return null;
+        const listed = store.listQualifications(workspaceId, userId, { accountId });
+        if (!listed.ok) return null;
+        const latest = listed.value[0];
+        return latest === undefined ? null : toQualificationSnapshot(latest);
+      },
+      byId: (qualificationId, userId) => {
+        const found = store.getQualification(qualificationId, userId);
+        return found.ok ? toQualificationSnapshot(found.value) : null;
+      },
+    },
+    {
+      byId: (offerId, userId) => {
+        const found = store.getOffer(offerId, userId);
+        return found.ok ? toOfferSnapshot(found.value) : null;
+      },
+      listActive: (workspaceId, userId) => {
+        const auth = store.authorize(workspaceId, userId);
+        if (!auth.ok) return [];
+        const offers = store.listOffers(workspaceId, userId);
+        if (!offers.ok) return [];
+        return offers.value.filter((offer) => offer.status === "active").map(toOfferSnapshot);
+      },
+    },
     clock,
   );
 }
@@ -159,6 +206,7 @@ function fixture(options?: {
     ]),
     evidence: createEvidenceService(store as never, options?.evidenceClock),
     qualification: qualificationService(store, options?.evidenceClock),
+    personalization: personalizationService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -636,6 +684,7 @@ describe("API Revenue Goal routes", () => {
       research: createResearchService(store as never),
       evidence: createEvidenceService(store as never),
       qualification: qualificationService(store),
+      personalization: personalizationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -967,6 +1016,7 @@ describe("API Revenue Plan routes", () => {
       research: createResearchService(store as never),
       evidence: createEvidenceService(store as never),
       qualification: qualificationService(store),
+      personalization: personalizationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1179,6 +1229,7 @@ describe("API Business Brain routes", () => {
         authorize: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       } as never),
       qualification: qualificationService(failingStore),
+      personalization: personalizationService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1516,6 +1567,7 @@ describe("API Account & Contact routes", () => {
       research: createResearchService(store as never),
       evidence: createEvidenceService(store as never),
       qualification: qualificationService(store),
+      personalization: personalizationService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1820,6 +1872,7 @@ describe("API Research routes", () => {
         listEvidence: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       } as never),
       qualification: qualificationService(store),
+      personalization: personalizationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -1868,6 +1921,7 @@ describe("API Research routes", () => {
         listEvidence: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
       } as never),
       qualification: qualificationService(store),
+      personalization: personalizationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -2990,6 +3044,14 @@ describe("API Qualification routes", () => {
         () => null,
         () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
         () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+      ),
+      personalization: createPersonalizationService(
+        {
+          authorize: () => ({ ok: true as const, value: {} }),
+          listDrafts: () => ({ ok: false as const, error: { code: "UNAVAILABLE" } }),
+        } as never,
+        { latest: () => null, byId: () => null },
+        { byId: () => null, listActive: () => [] },
       ),
       resolveSession: () => ({ userId: "u1" }),
     });
