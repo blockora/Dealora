@@ -3176,6 +3176,261 @@ describe("inbound messages and conversation classifications", () => {
   });
 });
 
+describe("next best action recommendations", () => {
+  interface Fixture {
+    store: Store;
+    ownerId: string;
+    workspaceId: string;
+    accountId: string;
+  }
+
+  /** A tenant with one account — the minimum a recommendation can be filed against. */
+  function seeded(name = "Acme", email = "owner@example.com"): Fixture {
+    const store = seed();
+    const owner = makeOwner(store, email);
+    const workspaceId = makeWorkspace(store, owner.id, name);
+    const account = store.createAccount({
+      workspaceId,
+      createdBy: owner.id,
+      account: {
+        name: "Northwind",
+        website: null,
+        domain: "northwind.example",
+        industry: "SaaS",
+        companySize: "50-200",
+        geography: "Germany",
+        description: null,
+        source: "manual",
+        sourceReference: null,
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(account)) throw new Error("seed account creation failed");
+    return { store, ownerId: owner.id, workspaceId, accountId: account.value.id };
+  }
+
+  function recommendation(
+    fixture: Fixture,
+    overrides: Partial<Parameters<Store["createNextBestAction"]>[0]["recommendation"]> = {},
+  ) {
+    return fixture.store.createNextBestAction({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      recommendation: {
+        accountId: fixture.accountId,
+        action: "research_account",
+        supportingState: "no_research",
+        reason: "no Phase 6 research request exists for this account",
+        confidence: "high",
+        confidenceReasons: ["the absence of a research request is a fact about storage"],
+        riskLevel: "level_0_read",
+        approvalRequired: false,
+        expectedOutcome: "research_findings_available",
+        evidenceIds: [],
+        claimIds: [],
+        ruleVersion: "next-action-1.0.0",
+        ...overrides,
+      },
+    });
+  }
+
+  it("persists a recommendation with every field the domain produced", () => {
+    const fixture = seeded();
+    const created = recommendation(fixture, {
+      evidenceIds: ["ev-1"],
+      claimIds: ["cl-1"],
+      confidenceReasons: ["the account has a stored Phase 8 evaluation"],
+    });
+    expect(isOk(created)).toBe(true);
+    if (!isOk(created)) return;
+    expect(created.value.id).toBeTruthy();
+    expect(created.value.workspaceId).toBe(fixture.workspaceId);
+    expect(created.value.accountId).toBe(fixture.accountId);
+    expect(created.value.createdBy).toBe(fixture.ownerId);
+    expect(created.value.createdAt).toBeTruthy();
+    expect(created.value.evidenceIds).toEqual(["ev-1"]);
+    expect(created.value.claimIds).toEqual(["cl-1"]);
+  });
+
+  it("refuses a recommendation whose approval flag disagrees with its risk level", () => {
+    const fixture = seeded();
+    // A Level 2 external action that claims it needs no approval is exactly the
+    // bug that turns advice into an unattended outbound action.
+    const lies = recommendation(fixture, {
+      action: "send_approved_message",
+      supportingState: "approved_without_send",
+      riskLevel: "level_2_external_action",
+      approvalRequired: false,
+      expectedOutcome: "message_delivered",
+    });
+    expect(isErr(lies)).toBe(true);
+
+    // And the mirror image: claiming approval is required for a read.
+    const overcautious = recommendation(fixture, { approvalRequired: true });
+    expect(isErr(overcautious)).toBe(true);
+
+    const honest = recommendation(fixture, {
+      action: "send_approved_message",
+      supportingState: "approved_without_send",
+      riskLevel: "level_2_external_action",
+      approvalRequired: true,
+      expectedOutcome: "message_delivered",
+    });
+    expect(isOk(honest)).toBe(true);
+  });
+
+  it("refuses a recommendation with no reason", () => {
+    const fixture = seeded();
+    expect(isErr(recommendation(fixture, { reason: "   " }))).toBe(true);
+  });
+
+  it("refuses to file a recommendation against another tenant's account", () => {
+    const mine = seeded("Mine");
+    const theirs = seeded("Theirs", "other@example.com");
+    const crossed = mine.store.createNextBestAction({
+      workspaceId: mine.workspaceId,
+      createdBy: mine.ownerId,
+      recommendation: {
+        accountId: theirs.accountId,
+        action: "research_account",
+        supportingState: "no_research",
+        reason: "crossing tenants",
+        confidence: "high",
+        confidenceReasons: [],
+        riskLevel: "level_0_read",
+        approvalRequired: false,
+        expectedOutcome: "research_findings_available",
+        evidenceIds: [],
+        claimIds: [],
+        ruleVersion: "next-action-1.0.0",
+      },
+    });
+    expect(isErr(crossed)).toBe(true);
+    if (!isErr(crossed)) return;
+    // Reported as absent rather than forbidden, so a foreign account id cannot be
+    // discovered by watching which error comes back.
+    expect(crossed.error.code).toBe("NOT_FOUND");
+  });
+
+  it("refuses a non-member every read and write", () => {
+    const fixture = seeded();
+    const created = recommendation(fixture);
+    expect(isOk(created)).toBe(true);
+    if (!isOk(created)) return;
+    const stranger = "a-stranger-with-no-membership";
+    expect(isErr(fixture.store.getNextBestAction(created.value.id, stranger))).toBe(true);
+    expect(isErr(fixture.store.listNextBestActions(fixture.workspaceId, stranger))).toBe(true);
+  });
+
+  it("keeps another tenant's recommendations invisible", () => {
+    const mine = seeded("Mine");
+    const theirs = seeded("Theirs", "other@example.com");
+    expect(isOk(recommendation(mine))).toBe(true);
+    expect(isOk(recommendation(theirs))).toBe(true);
+
+    const mineList = mine.store.listNextBestActions(mine.workspaceId, mine.ownerId);
+    expect(isOk(mineList)).toBe(true);
+    if (!isOk(mineList)) return;
+    expect(mineList.value).toHaveLength(1);
+
+    // Naming the other tenant's id is not a way to read it.
+    const stolenId = theirs.store.listNextBestActions(theirs.workspaceId, theirs.ownerId);
+    expect(isOk(stolenId)).toBe(true);
+    if (!isOk(stolenId)) return;
+    const id = stolenId.value[0]?.id ?? "";
+    expect(isErr(mine.store.getNextBestAction(id, mine.ownerId))).toBe(true);
+  });
+
+  it("appends rather than replaces, so the history is a history", () => {
+    const fixture = seeded();
+    const first = recommendation(fixture);
+    const second = recommendation(fixture, {
+      action: "convert_findings_to_evidence",
+      supportingState: "researched_without_evidence",
+      expectedOutcome: "evidence_available",
+    });
+    expect(isOk(first)).toBe(true);
+    expect(isOk(second)).toBe(true);
+    if (!isOk(first) || !isOk(second)) return;
+    expect(first.value.id).not.toBe(second.value.id);
+    const all = fixture.store.listNextBestActions(fixture.workspaceId, fixture.ownerId);
+    expect(isOk(all)).toBe(true);
+    if (!isOk(all)) return;
+    expect(all.value).toHaveLength(2);
+  });
+
+  it("narrows the history by account and by action", () => {
+    const fixture = seeded();
+    expect(isOk(recommendation(fixture))).toBe(true);
+    expect(
+      isOk(
+        recommendation(fixture, {
+          action: "propose_meeting",
+          supportingState: "positive_response_without_meeting",
+          expectedOutcome: "meeting_proposed",
+        }),
+      ),
+    ).toBe(true);
+
+    const byAccount = fixture.store.listNextBestActions(fixture.workspaceId, fixture.ownerId, {
+      accountId: fixture.accountId,
+    });
+    expect(isOk(byAccount)).toBe(true);
+    if (!isOk(byAccount)) return;
+    expect(byAccount.value).toHaveLength(2);
+
+    const byAction = fixture.store.listNextBestActions(fixture.workspaceId, fixture.ownerId, {
+      action: "propose_meeting",
+    });
+    expect(isOk(byAction)).toBe(true);
+    if (!isOk(byAction)) return;
+    expect(byAction.value).toHaveLength(1);
+
+    const byOtherAccount = fixture.store.listNextBestActions(fixture.workspaceId, fixture.ownerId, {
+      accountId: "acct-does-not-exist",
+    });
+    expect(isOk(byOtherAccount)).toBe(true);
+    if (!isOk(byOtherAccount)) return;
+    expect(byOtherAccount.value).toEqual([]);
+  });
+
+  it("migrates a Phase 13 document forward without touching a single meeting row", () => {
+    const fixture = seeded();
+    expect(isOk(recommendation(fixture))).toBe(true);
+    const document = JSON.parse(JSON.stringify(fixture.store.db)) as typeof fixture.store.db;
+    const phase13 = {
+      ...document,
+      schemaVersion: 13,
+      nextBestActions: undefined,
+    };
+
+    const migrated = migrateState(phase13 as unknown as DbState);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    expect(migrated.nextBestActions).toEqual([]);
+    // Everything this phase was built to read survives byte for byte.
+    expect(migrated.accounts).toEqual(document.accounts);
+    expect(migrated.conversationClassifications).toEqual(document.conversationClassifications);
+    expect(migrated.qualifications).toEqual(document.qualifications);
+    expect(migrated.evidence).toEqual(document.evidence);
+    expect(migrated.approvalRequests).toEqual(document.approvalRequests);
+    expect(migrated.outboundActions).toEqual(document.outboundActions);
+  });
+
+  it("keeps already-recorded recommendations across a round trip", () => {
+    const fixture = seeded();
+    expect(isOk(recommendation(fixture))).toBe(true);
+    const document = JSON.parse(JSON.stringify(fixture.store.db)) as typeof fixture.store.db;
+    const migrated = migrateState(document);
+    const listed = fixture.store.listNextBestActions(fixture.workspaceId, fixture.ownerId);
+    expect(isOk(listed)).toBe(true);
+    if (!isOk(listed)) return;
+    expect(listed.value).toHaveLength(1);
+    expect(migrated.nextBestActions).toHaveLength(1);
+    expect(migrated.nextBestActions?.[0]?.ruleVersion).toBe("next-action-1.0.0");
+  });
+});
+
 describe("meetings, briefs and the booking audit trail", () => {
   /**
    * A tenant that has a sent message, a **positive** classification and a

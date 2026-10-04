@@ -43,6 +43,10 @@ import type {
   ConversationClassification,
   ConversationEvent,
   ConversationEventKind,
+  NextBestAction,
+  NextBestActionKind,
+  NextBestActionRiskLevel,
+  NextBestActionState,
   Meeting,
   MeetingBrief,
   MeetingBookingState,
@@ -128,7 +132,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 13;
+export const LATEST_SCHEMA_VERSION = 14;
 
 export interface DbState {
   schemaVersion?: number;
@@ -164,6 +168,7 @@ export interface DbState {
   meetings?: Meeting[];
   meetingBriefs?: MeetingBrief[];
   meetingEvents?: MeetingEvent[];
+  nextBestActions?: NextBestAction[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -204,6 +209,7 @@ export function emptyState(): CompleteDbState {
     meetings: [],
     meetingBriefs: [],
     meetingEvents: [],
+    nextBestActions: [],
   };
 }
 
@@ -402,6 +408,19 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.meetingEvents;
   }
 
+  // Phase 14 adds the history of recommendations the Next Best Action Engine
+  // produced. Additive like every step before it: a Phase 13 document gains one
+  // empty table and keeps every meeting it already booked, so a booking recorded
+  // before the upgrade can still be recommended against afterwards. Nothing
+  // before it is touched — in particular no meeting, classification or
+  // qualification is rewritten, because Phase 14 adds the ability to *advise*
+  // about what already happened, never to change it.
+  if (version >= 14) {
+    state.nextBestActions = Array.isArray(input.nextBestActions)
+      ? input.nextBestActions
+      : base.nextBestActions;
+  }
+
   return state;
 }
 
@@ -453,6 +472,7 @@ type RowTable =
   | "meetings"
   | "meetingBriefs"
   | "meetingEvents"
+  | "nextBestActions"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -4024,6 +4044,115 @@ export class Store {
         .map((entry) => entry.row),
     };
   }
+
+  // -------------------------------------------------------------------------
+  // Phase 14 — Next Best Action Engine
+  // -------------------------------------------------------------------------
+
+  /**
+   * Persist one recommendation snapshot.
+   *
+   * The caller supplies the whole recommendation, because the domain engine is the
+   * only thing that can produce one — but storage re-checks the one invariant
+   * that matters and cannot be inferred from prose: that `approval_required`
+   * agrees with the §17 risk level. A bug that labelled a Level 2 external action
+   * as needing no approval would otherwise be stored happily, and that is exactly
+   * the mistake that turns advice into an unattended outbound action.
+   *
+   * The account is re-checked against the workspace here too, so a recommendation
+   * cannot be filed against another tenant's account.
+   */
+  createNextBestAction(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    recommendation: {
+      accountId: EntityId;
+      action: NextBestActionKind;
+      supportingState: NextBestActionState;
+      reason: string;
+      confidence: NextBestAction["confidence"];
+      confidenceReasons: string[];
+      riskLevel: NextBestActionRiskLevel;
+      approvalRequired: boolean;
+      expectedOutcome: NextBestAction["expectedOutcome"];
+      evidenceIds: EntityId[];
+      claimIds: EntityId[];
+      ruleVersion: string;
+    };
+  }): Result<NextBestAction, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+
+    const account = this.findById("accounts", input.recommendation.accountId);
+    if (!account || account.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("NOT_FOUND", "account not found") };
+    }
+    if (
+      input.recommendation.approvalRequired !==
+      (input.recommendation.riskLevel === "level_2_external_action")
+    ) {
+      return {
+        ok: false,
+        error: toError("INVALID", "approvalRequired must agree with the risk level"),
+      };
+    }
+    if (input.recommendation.reason.trim() === "") {
+      return { ok: false, error: toError("INVALID", "a recommendation must say why") };
+    }
+
+    const recommendation: NextBestAction = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      accountId: input.recommendation.accountId,
+      action: input.recommendation.action,
+      supportingState: input.recommendation.supportingState,
+      reason: input.recommendation.reason,
+      confidence: input.recommendation.confidence,
+      confidenceReasons: input.recommendation.confidenceReasons,
+      riskLevel: input.recommendation.riskLevel,
+      approvalRequired: input.recommendation.approvalRequired,
+      expectedOutcome: input.recommendation.expectedOutcome,
+      evidenceIds: input.recommendation.evidenceIds,
+      claimIds: input.recommendation.claimIds,
+      ruleVersion: input.recommendation.ruleVersion,
+      createdBy: input.createdBy,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("nextBestActions", (rows) => rows.push(recommendation));
+    return { ok: true, value: recommendation };
+  }
+
+  getNextBestAction(id: EntityId, userId: EntityId): Result<NextBestAction, StorageError> {
+    const recommendation = this.findById("nextBestActions", id);
+    if (!recommendation) {
+      return { ok: false, error: toError("NOT_FOUND", "recommendation not found") };
+    }
+    const auth = this.requireWorkspace(recommendation.workspaceId, userId);
+    // Reported as not found rather than unauthorized, so a foreign id is
+    // indistinguishable from one that was never issued.
+    if (!auth.ok) return { ok: false, error: toError("NOT_FOUND", "recommendation not found") };
+    return { ok: true, value: recommendation };
+  }
+
+  /** A workspace's recorded recommendations, newest first, optionally narrowed. */
+  listNextBestActions(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: { accountId?: EntityId; action?: NextBestActionKind },
+  ): Result<NextBestAction[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const filtered = this.rows("nextBestActions").filter(
+      (r) =>
+        r.workspaceId === workspaceId &&
+        (filter?.accountId === undefined || r.accountId === filter.accountId) &&
+        (filter?.action === undefined || r.action === filter.action),
+    );
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)),
+    };
+  }
 }
 
 /** Default single-process store for local runs. */
@@ -4167,6 +4296,10 @@ export const db = {
   listMeetingBriefs: store.listMeetingBriefs.bind(store),
   createMeetingEvent: store.createMeetingEvent.bind(store),
   listMeetingEvents: store.listMeetingEvents.bind(store),
+
+  createNextBestAction: store.createNextBestAction.bind(store),
+  getNextBestAction: store.getNextBestAction.bind(store),
+  listNextBestActions: store.listNextBestActions.bind(store),
 
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),

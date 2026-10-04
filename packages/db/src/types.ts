@@ -1896,3 +1896,177 @@ export interface MeetingEvent {
   detail: string | null;
   createdAt: DateTime;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 14 — Next Best Action Engine (DEALORA_BLUEPRINT.md §25, ROADMAP.md §21)
+// ---------------------------------------------------------------------------
+
+/**
+ * What DEALORA recommends doing next about one account.
+ *
+ * Closed and, more importantly, **entirely producible**: every member is emitted
+ * by a branch of the engine that reads stored rows. A vocabulary a reader cannot
+ * trust to be reachable is worse than a short one, and an earlier draft of this
+ * phase was corrected for exactly that.
+ *
+ * None of these is an action DEALORA takes. They are the next *step a person or
+ * a later phase could take*, and the strongest ones still name the phase that
+ * owns doing it.
+ */
+export type NextBestActionKind =
+  /** Do not contact this address: it asked to stop, or refused. */
+  | "stop_contacting"
+  /** The account has no research yet, so nothing downstream can be honest. */
+  | "research_account"
+  /** Findings exist but no one has converted them into evidence. */
+  | "convert_findings_to_evidence"
+  /** Evidence exists but the account has never been evaluated against the ICP. */
+  | "qualify_account"
+  /** The account qualified and nobody has written a draft for it. */
+  | "personalize_outreach"
+  /** A draft exists and no approval has ever been requested for it. */
+  | "request_approval"
+  /** An approval is in hand and nothing has gone out. */
+  | "send_approved_message"
+  /** A response was read as positive and nobody has proposed a meeting. */
+  | "propose_meeting"
+  /** A meeting a person approved has not reached a calendar. */
+  | "book_meeting"
+  /** A meeting is booked and nobody has prepared the brief. */
+  | "prepare_meeting_brief"
+  /** A response was read as a question or a price and no reply is prepared. */
+  | "prepare_reply_for_approval"
+  /** Nothing is actionable without a person. Reported rather than guessed. */
+  | "hold";
+
+/**
+ * The revenue state that produced the recommendation.
+ *
+ * Closed, and **one member per decision branch of the engine**, so "supporting
+ * state" is always a named, checkable fact about the workspace's own records
+ * rather than a summary that could drift from them. Every member is reachable
+ * from stored rows and each one is tested by the engine; the two properties are
+ * kept together deliberately, because a state the engine can never observe is
+ * the same kind of dead vocabulary Phase 13 was corrected for.
+ *
+ * The list walks the revenue loop in the order it actually happens, with the
+ * safety conditions first — exactly the precedence the engine applies, so the
+ * order here is also the answer to "which condition wins when several are true".
+ */
+export type NextBestActionState =
+  /** Phase 11 suppression or a Phase 12 opt-out already blocks this account. */
+  | "suppressed"
+  /** A meeting was proposed and no one has requested approval for it yet. */
+  | "meeting_recommended"
+  /** A meeting is waiting on a person's approval decision. */
+  | "meeting_awaiting_approval"
+  /** A meeting a person approved has not reached a calendar. */
+  | "meeting_approved"
+  /** A meeting is booked and has no preparation brief. */
+  | "meeting_booked_without_brief"
+  /** A meeting is booked and briefed. Nothing further is DEALORA's to do. */
+  | "meeting_booked"
+  /** The newest meeting reached a terminal Phase 13 state. */
+  | "meeting_closed"
+  /** A response read as positive and no meeting has ever been proposed. */
+  | "positive_response_without_meeting"
+  /** No Phase 6 research request exists for the account. */
+  | "no_research"
+  /** Findings exist and no one has converted any of them into evidence. */
+  | "researched_without_evidence"
+  /** Evidence exists and the account has never been evaluated. */
+  | "evidenced_without_qualification"
+  /** The newest Phase 8 evaluation exists but is not `qualified`. */
+  | "not_qualified"
+  /** The account qualified and no draft has been rendered. */
+  | "qualified_without_draft"
+  /** A draft exists and no approval request has ever been raised for it. */
+  | "drafted_without_approval"
+  /** An approval request is waiting on a reviewer. */
+  | "approval_pending"
+  /** An approval was granted and nothing has gone out for it. */
+  | "approved_without_send"
+  /** A message went out and no response has been classified yet. */
+  | "awaiting_response"
+  /** A response was classified and needs a reply a person must approve. */
+  | "response_needing_reply";
+
+/**
+ * The `DEALORA_BLUEPRINT.md` §17 risk classification of the recommended step.
+ *
+ * The Blueprint's own vocabulary rather than an invented one, because
+ * "approval requirement" in `ROADMAP.md` §21 means exactly this: whether acting
+ * on the recommendation requires a person first.
+ *
+ * `level_3_high_impact` is deliberately absent. No branch in this phase
+ * recommends a financial commitment, a contract action or an irreversible
+ * change, and listing a level nothing can reach would be advertising behaviour
+ * that does not exist.
+ */
+export type NextBestActionRiskLevel = "level_0_read" | "level_1_draft" | "level_2_external_action";
+
+/**
+ * What acting on the recommendation is expected to produce.
+ *
+ * Closed, and derived from the action through a single map, so "expected
+ * outcome" can never disagree with the action it belongs to and can never be a
+ * free-text promise the engine has no way to keep.
+ */
+export type NextBestActionOutcome =
+  | "contact_stopped"
+  | "research_findings_available"
+  | "evidence_available"
+  | "qualification_available"
+  | "draft_available"
+  | "approval_decided"
+  | "message_delivered"
+  | "meeting_proposed"
+  | "meeting_booked"
+  | "brief_available"
+  | "reply_prepared"
+  | "no_action_available";
+
+/**
+ * One recommendation, immutable once written (Phase 14).
+ *
+ * `ROADMAP.md` §21 requires seven things on every recommendation — action,
+ * reason, supporting state, evidence, confidence, expected outcome and approval
+ * requirement — and all seven are fields here rather than prose assembled at
+ * read time, so a stored recommendation can still be checked against it years
+ * later.
+ *
+ * **A recommendation is not a decision and not a fact.** Nothing in this phase
+ * acts on one, and this record writes nothing to the Phase 7 evidence graph: a
+ * "next step" is DEALORA's own advice, which is an inference about the
+ * workspace's own records, not an attested fact about an account.
+ */
+export interface NextBestAction {
+  id: EntityId;
+  workspaceId: EntityId;
+  accountId: EntityId;
+  action: NextBestActionKind;
+  /** The named revenue state this recommendation came from. */
+  supportingState: NextBestActionState;
+  /**
+   * Why, in one sentence, assembled from named stored facts.
+   *
+   * Never a claim about the account that the workspace's own records do not
+   * support: every clause names something the engine read.
+   */
+  reason: string;
+  /** The specific factors that set the confidence band, in order. */
+  confidenceReasons: string[];
+  confidence: ResearchConfidence;
+  riskLevel: NextBestActionRiskLevel;
+  /** True exactly when `riskLevel` is `level_2_external_action`. */
+  approvalRequired: boolean;
+  expectedOutcome: NextBestActionOutcome;
+  /** Every evidence record that supports this recommendation. References. */
+  evidenceIds: EntityId[];
+  /** Every account claim that supports it. References. */
+  claimIds: EntityId[];
+  /** Which rule set produced it. Never overwritten. */
+  ruleVersion: string;
+  createdBy: EntityId;
+  createdAt: DateTime;
+}

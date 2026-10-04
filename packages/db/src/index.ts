@@ -112,6 +112,11 @@ export type {
   MeetingEvent,
   MeetingEventKind,
   MeetingRecommendationReason,
+  NextBestAction,
+  NextBestActionKind,
+  NextBestActionOutcome,
+  NextBestActionRiskLevel,
+  NextBestActionState,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -152,6 +157,7 @@ export {
   meetingTable,
   meetingBriefTable,
   meetingEventTable,
+  nextBestActionTable,
   createTableSql,
   slugify,
   capString,

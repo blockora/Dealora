@@ -259,12 +259,21 @@ export const COLUMNS = {
   cancelledAt: "cancelled_at",
   qualificationScore: "qualification_score",
   conversationExcerpt: "conversation_excerpt",
+
+  // Phase 14 — Next Best Action Engine
+  action: "action",
+  supportingState: "supporting_state",
+  confidenceReasons: "confidence_reasons",
+  approvalRequired: "approval_required",
+  expectedOutcome: "expected_outcome",
   gaps: "gaps",
   // `title`, `state`, `decisionReason`, `approvedBy`, `approvedAt`,
   // `qualificationId`, `intent`, `claimIds`, `evidenceIds`, `timezone`,
-  // `channel` and `rendererVersion` are already declared above and are reused
-  // here for the same reason: one concept, one column name, across every phase
-  // that touches it.
+  // `channel`, `rendererVersion` and `riskLevel` are already declared above
+  // and are reused here for the same reason: one concept, one column name,
+  // across every phase that touches it. A recommendation's `risk_level` is
+  // Phase 10's `DEALORA_BLUEPRINT.md` §17 vocabulary — the same ladder a
+  // draft's approval request climbs — not a second scale.
 } as const;
 
 export type ColumnName = (typeof COLUMNS)[keyof typeof COLUMNS];
@@ -543,6 +552,31 @@ export const meetingBriefTable = "meeting_briefs" as const;
  */
 export const meetingEventTable = "meeting_events" as const;
 
+/**
+ * Table: next best action recommendations (Phase 14).
+ *
+ * One immutable recommendation per (account, state) the engine observed. The row
+ * carries all seven things `ROADMAP.md` §21 requires — action, reason,
+ * supporting state, evidence, confidence, expected outcome and approval
+ * requirement — as fields rather than as prose, so a stored recommendation is
+ * still checkable after the rules move on.
+ *
+ * `evidence_ids` and `claim_ids` are **reference lists**: the recommendation
+ * points at the records that support it and never copies them, so a Phase 7
+ * supersession is visible from the recommendation instead of being frozen into a
+ * duplicate of the evidence graph.
+ *
+ * `approval_required` is constrained to agree with `risk_level`, which is what
+ * makes "does a person have to act first?" a property of the row rather than
+ * something a reader has to infer from the action name.
+ *
+ * The table is a **history of advice**, not the advice itself: the live
+ * recommendation is recomputed from current rows on every read, so a workspace
+ * never sees a stale suggestion, while "what did DEALORA advise, and on what
+ * evidence" remains answerable.
+ */
+export const nextBestActionTable = "next_best_actions" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -577,6 +611,7 @@ export const tables = [
   meetingTable,
   meetingBriefTable,
   meetingEventTable,
+  nextBestActionTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -754,6 +789,12 @@ export const indexes = {
     `${COLUMN(meetingEventTable, COLUMNS.id)} PRIMARY KEY`,
     `${COLUMN(meetingEventTable, COLUMNS.meetingId)} NOT NULL`,
     `${COLUMN(meetingEventTable, COLUMNS.workspaceId)} NOT NULL`,
+  ],
+  nextBestActions: [
+    `${COLUMN(nextBestActionTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(nextBestActionTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(nextBestActionTable, COLUMNS.accountId)} NOT NULL`,
+    `${COLUMN(nextBestActionTable, COLUMNS.action)} NOT NULL`,
   ],
 };
 
@@ -1491,6 +1532,37 @@ ${COLUMN(meetingEventTable, COLUMNS.meetingId)} REFERENCES "${meetingTable}"("${
 ${COLUMN(meetingEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(meetingEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(meetingEventTable, COLUMNS.kind)} CHECK (${COLUMN(meetingEventTable, COLUMNS.kind)} IN ('recommended','approval_requested','approved','declined','booking_attempted','booked','booking_failed','brief_generated','cancelled','marked_held','marked_no_show'))`,
+  ),
+  createTableSql(
+    nextBestActionTable,
+    [
+      COLUMN(nextBestActionTable, COLUMNS.id),
+      COLUMN(nextBestActionTable, COLUMNS.workspaceId),
+      COLUMN(nextBestActionTable, COLUMNS.accountId),
+      COLUMN(nextBestActionTable, COLUMNS.action),
+      COLUMN(nextBestActionTable, COLUMNS.supportingState),
+      COLUMN(nextBestActionTable, COLUMNS.reason),
+      COLUMN(nextBestActionTable, COLUMNS.confidence),
+      COLUMN(nextBestActionTable, COLUMNS.confidenceReasons),
+      COLUMN(nextBestActionTable, COLUMNS.riskLevel),
+      COLUMN(nextBestActionTable, COLUMNS.approvalRequired),
+      COLUMN(nextBestActionTable, COLUMNS.expectedOutcome),
+      COLUMN(nextBestActionTable, COLUMNS.evidenceIds),
+      COLUMN(nextBestActionTable, COLUMNS.claimIds),
+      COLUMN(nextBestActionTable, COLUMNS.ruleVersion),
+      COLUMN(nextBestActionTable, COLUMNS.createdBy),
+    ],
+    `${COLUMN(nextBestActionTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(nextBestActionTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(nextBestActionTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(nextBestActionTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(nextBestActionTable, COLUMNS.action)} CHECK (${COLUMN(nextBestActionTable, COLUMNS.action)} IN ('stop_contacting','research_account','convert_findings_to_evidence','qualify_account','personalize_outreach','request_approval','send_approved_message','propose_meeting','book_meeting','prepare_meeting_brief','prepare_reply_for_approval','hold')),
+${COLUMN(nextBestActionTable, COLUMNS.supportingState)} CHECK (${COLUMN(nextBestActionTable, COLUMNS.supportingState)} IN ('suppressed','meeting_recommended','meeting_awaiting_approval','meeting_approved','meeting_booked_without_brief','meeting_booked','meeting_closed','positive_response_without_meeting','no_research','researched_without_evidence','evidenced_without_qualification','not_qualified','qualified_without_draft','drafted_without_approval','approval_pending','approved_without_send','awaiting_response','response_needing_reply')),
+${COLUMN(nextBestActionTable, COLUMNS.riskLevel)} CHECK (${COLUMN(nextBestActionTable, COLUMNS.riskLevel)} IN ('level_0_read','level_1_draft','level_2_external_action')),
+${COLUMN(nextBestActionTable, COLUMNS.expectedOutcome)} CHECK (${COLUMN(nextBestActionTable, COLUMNS.expectedOutcome)} IN ('contact_stopped','research_findings_available','evidence_available','qualification_available','draft_available','approval_decided','message_delivered','meeting_proposed','meeting_booked','brief_available','reply_prepared','no_action_available')),
+${COLUMN(nextBestActionTable, COLUMNS.confidence)} CHECK (${COLUMN(nextBestActionTable, COLUMNS.confidence)} IN ('low','medium','high')),
+${COLUMN(nextBestActionTable, COLUMNS.reason)} CHECK (length(${COLUMN(nextBestActionTable, COLUMNS.reason)}) > 0),
+${COLUMN(nextBestActionTable, COLUMNS.approvalRequired)} CHECK (${COLUMN(nextBestActionTable, COLUMNS.approvalRequired)} = (${COLUMN(nextBestActionTable, COLUMNS.riskLevel)} = 'level_2_external_action'))`,
   ),
 ].join("\n\n");
 
