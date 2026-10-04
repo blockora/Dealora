@@ -16,6 +16,7 @@
     { "path": "packages/approval" },
     { "path": "packages/outbound" },
     { "path": "packages/conversation" },
+    { "path": "packages/meeting" },
     { "path": "packages/api" }
   ]
 }

@@ -35,6 +35,15 @@ import {
   createOutboundReader,
   createSuppressionWriter,
 } from "@dealora/conversation";
+import {
+  SandboxCalendarProvider,
+  createClassificationReader,
+  createContactReader as createMeetingContactReader,
+  createMeetingService,
+  createQualificationReader,
+  createSuppressionReader,
+} from "@dealora/meeting";
+import type { MeetingCalendarProvider } from "@dealora/meeting";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -60,6 +69,15 @@ export function createDefaultHandlers(options?: {
    * does not change.
    */
   outboundProviders?: readonly OutboundProvider[];
+  /**
+   * The calendar adapters the meeting boundary may book through.
+   *
+   * Defaults to a single sandbox that performs no network I/O. Supplying a real
+   * adapter is an explicit deployment decision whose keys must be documented in
+   * the same commit that introduces them — ROADMAP.md §30 puts live calendar
+   * integrations in Phase 23.
+   */
+  calendarProviders?: readonly MeetingCalendarProvider[];
 }): ReturnType<typeof createHandlers> {
   const identity: IdentityService = {
     signup,
@@ -361,6 +379,24 @@ export function createDefaultHandlers(options?: {
       createOutboundReader(store as never),
       createSuppressionWriter(store as never),
     ),
+    /**
+     * The meeting boundary reads four things and reaches one external system:
+     * whether a response read as positive, whether the account qualified, who the
+     * contact is, and whether the address is suppressed. It reuses the Phase 11
+     * opt-out list rather than keeping a second one, so an unsubscribe stops a
+     * booking as reliably as it stops a send.
+     *
+     * The calendar adapter defaults to the sandbox, which performs no network
+     * I/O — ROADMAP.md §30 puts real calendar integrations in Phase 23.
+     */
+    meeting: createMeetingService(
+      store as never,
+      createClassificationReader(store as never),
+      createQualificationReader(store as never),
+      createMeetingContactReader(store as never),
+      createSuppressionReader(store as never),
+      calendarProvider(options?.calendarProviders),
+    ),
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());
@@ -392,4 +428,21 @@ function providerRegistry(configured?: readonly OutboundProvider[]): ProviderReg
     registry.register("email", provider);
   }
   return registry;
+}
+
+/**
+ * The calendar adapter the meeting boundary books through.
+ *
+ * Defaults to the Phase 11-shaped sandbox: no network I/O, no credential, and a
+ * record of what it accepted. `ROADMAP.md` §30 places real calendar integrations
+ * in Phase 23, so a deployment registers its own here and the booking boundary
+ * does not change — the same seam Phase 11 established for email.
+ */
+function calendarProvider(
+  configured?: readonly MeetingCalendarProvider[],
+): MeetingCalendarProvider {
+  const providers = configured === undefined ? [new SandboxCalendarProvider()] : configured;
+  const first = providers[0];
+  if (first === undefined) return new SandboxCalendarProvider();
+  return first;
 }

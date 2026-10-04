@@ -26,6 +26,7 @@ import { APPROVAL_STATUSES } from "@dealora/approval";
 import type { ApprovalError, ApprovalService } from "@dealora/approval";
 import type { OutboundError, OutboundService } from "@dealora/outbound";
 import type { ConversationError, ConversationService } from "@dealora/conversation";
+import type { MeetingError, MeetingService } from "@dealora/meeting";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -363,6 +364,46 @@ function fromConversationError(error: ConversationError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `MeetingError` into the safe API error envelope.
+ *
+ * Written as an exhaustive switch, with no cast, so the `ApiErrorCode`
+ * annotation is a real guarantee: TypeScript accepts the function only while
+ * every member of the domain's error union has a case, which is what stops a new
+ * domain code from reaching the wire as something the transport contract does not
+ * define.
+ *
+ * The two domain codes that are not a plain mapping both become `CONFLICT`:
+ * a booking that changed after it was proposed, and a booking whose state moved
+ * on. Both are real-world conflicts a caller can re-read and retry deliberately —
+ * not bad requests, and not something that a blind retry would fix.
+ *
+ * `UNAVAILABLE` is an internal condition and is never surfaced verbatim.
+ */
+function fromMeetingError(error: MeetingError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+        return "VALIDATION_ERROR";
+      case "SUPPRESSED":
+      case "PREREQUISITE_NOT_MET":
+      case "INVALID_TRANSITION":
+      case "CONFLICT":
+        return "CONFLICT";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = [...error.details];
+  return mapped;
+}
+
 export interface HandlerDeps {
   identity: IdentityService;
   brain: BusinessBrainService;
@@ -378,6 +419,7 @@ export interface HandlerDeps {
   approval: ApprovalService;
   outbound: OutboundService;
   conversation: ConversationService;
+  meeting: MeetingService;
   resolveSession: SessionResolver;
 }
 
@@ -2337,6 +2379,168 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok(result.value) };
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 13 — Meeting Workflow
+  //
+  // These handlers turn a response that read as positive into a booking record
+  // with a measurable state, and produce the preparation brief BLUEPRINT.md §22
+  // describes. They are the only thing Phase 13 can do through the API.
+  //
+  // **None of them can book a meeting.** `DEALORA_BLUEPRINT.md` §17 classifies
+  // scheduling an event as a Level 2 external action requiring approval or policy
+  // authorization, so proposing, approving and booking are three separate
+  // authenticated calls, and the service refuses any booking that has no approval
+  // behind it.
+  //
+  // No server-owned field is read from a request body. A caller supplies a
+  // classification id, the booking's own times and title, and a decision — never
+  // an account, a contact, a qualification, a recommendation reason, a state, an
+  // approver, a provider reference or a booked instant. All of those are derived
+  // server-side or come from the session.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Propose a meeting from a positive response.
+   *
+   * The result is always `recommended`: nothing is scheduled, no invitation is
+   * sent, and no calendar has been contacted. The account, contact, qualification
+   * and reason are all resolved server-side from the named classification.
+   */
+  const recommendMeetingHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.meeting.recommendMeeting(workspaceId, actor.userId, {
+        classificationId: body.classificationId,
+        title: body.title,
+        startsAt: body.startsAt,
+        endsAt: body.endsAt,
+        timezone: body.timezone,
+        durationMinutes: body.durationMinutes,
+      });
+      if (!result.ok) return { ok: false, error: fromMeetingError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** A workspace's meetings, newest first, optionally narrowed by state. */
+  const listMeetingsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const result = deps.meeting.listMeetings(workspaceId, actor.userId, {
+        state: req.query.state,
+        accountId: req.query.accountId,
+        contactId: req.query.contactId,
+      });
+      if (!result.ok) return { ok: false, error: fromMeetingError(result.error) };
+      return { ok: true, value: ok({ meetings: result.value }) };
+    });
+
+  /** One meeting with its brief, authorized against the caller's own workspace. */
+  const getMeetingHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const result = deps.meeting.getMeeting(id, actor.userId);
+      if (!result.ok) return { ok: false, error: fromMeetingError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * Record a person's decision about a proposed booking.
+   *
+   * The approver identity and the instant come from the session, never from the
+   * body: a caller can say *whether* they approve, but not *who* approved or
+   * *when*. A decline or a cancellation must say why.
+   */
+  const decideMeetingHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.meeting.decideMeeting(
+        workspaceId,
+        actor.userId,
+        id,
+        body.decision,
+        body.reason,
+      );
+      if (!result.ok) return { ok: false, error: fromMeetingError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * Book an approved meeting through the calendar adapter.
+   *
+   * This is the only route that reaches an external system, and it refuses unless
+   * the stored row already carries an approval. The event is created by the
+   * adapter; `booked` is written only on its confirmation, so a refusal or a
+   * thrown call is recorded as a booking failure and never as a meeting.
+   *
+   * It books nothing else: no invitation is sent, because Phase 10's approval and
+   * Phase 11's send path still govern every message.
+   */
+  const bookMeetingHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+
+      const result = await deps.meeting.bookMeeting(workspaceId, actor.userId, id);
+      if (!result.ok) return { ok: false, error: fromMeetingError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * Produce the preparation brief for a meeting.
+   *
+   * Versioned rather than replaced, and explicit about what the workspace does
+   * not have: every section `DEALORA_BLUEPRINT.md` §22 names that has no record
+   * behind it is returned in `gaps` instead of being filled in.
+   */
+  const prepareMeetingBriefHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+
+      const result = deps.meeting.prepareBrief(workspaceId, actor.userId, id);
+      if (!result.ok) return { ok: false, error: fromMeetingError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** One meeting's append-only audit trail, oldest first. */
+  const getMeetingHistoryHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+      const result = deps.meeting.meetingHistory(id, actor.userId);
+      if (!result.ok) return { ok: false, error: fromMeetingError(result.error) };
+      return { ok: true, value: ok({ events: result.value }) };
+    });
+
+  /**
+   * The booking policy this deployment enforces, plus the brief renderer version —
+   * readable before any meeting exists, including every legal state transition.
+   */
+  const getMeetingPolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const result = deps.meeting.policy(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromMeetingError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -2445,6 +2649,18 @@ export function createHandlers(deps: HandlerDeps) {
     listConversationClassificationsHandler,
     conversationHistoryHandler,
     getConversationPolicyHandler,
+
+    // -------------------------------------------------------------------------
+    // Phase 13 — Meeting Workflow
+    // -------------------------------------------------------------------------
+    recommendMeetingHandler,
+    listMeetingsHandler,
+    getMeetingHandler,
+    decideMeetingHandler,
+    bookMeetingHandler,
+    prepareMeetingBriefHandler,
+    getMeetingHistoryHandler,
+    getMeetingPolicyHandler,
   };
 }
 

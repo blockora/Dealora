@@ -43,6 +43,14 @@ import {
   createSuppressionWriter,
 } from "@dealora/conversation";
 
+import {
+  SandboxCalendarProvider,
+  createClassificationReader,
+  createMeetingService,
+  createQualificationReader,
+  createSuppressionReader,
+} from "@dealora/meeting";
+import { createContactReader as createMeetingContactReader } from "@dealora/meeting";
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
 import type { RevenueGoal } from "@dealora/db";
@@ -140,6 +148,25 @@ function conversationService(store: Store, clock?: () => Date) {
     store as never,
     createOutboundReader(store as never),
     createSuppressionWriter(store as never),
+    clock,
+  );
+}
+
+/**
+ * Wire the Meeting service the way the production wiring does.
+ *
+ * The same narrow readers, the same Phase 11 suppression list and the same
+ * sandbox calendar, so a route test that proposes or books a meeting exercises
+ * the real engine rather than a stand-in.
+ */
+function meetingService(store: Store, clock?: () => Date) {
+  return createMeetingService(
+    store as never,
+    createClassificationReader(store as never),
+    createQualificationReader(store as never),
+    createMeetingContactReader(store as never),
+    createSuppressionReader(store as never),
+    new SandboxCalendarProvider(),
     clock,
   );
 }
@@ -291,6 +318,7 @@ function fixture(options?: {
     approval: approvalService(store),
     outbound: outboundService(store),
     conversation: conversationService(store),
+    meeting: meetingService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -772,6 +800,7 @@ describe("API Revenue Goal routes", () => {
       approval: approvalService(store),
       outbound: outboundService(store),
       conversation: conversationService(store),
+      meeting: meetingService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1107,6 +1136,7 @@ describe("API Revenue Plan routes", () => {
       approval: approvalService(store),
       outbound: outboundService(store),
       conversation: conversationService(store),
+      meeting: meetingService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1323,6 +1353,7 @@ describe("API Business Brain routes", () => {
       approval: approvalService(failingStore),
       outbound: outboundService(failingStore),
       conversation: conversationService(failingStore),
+      meeting: meetingService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1664,6 +1695,7 @@ describe("API Account & Contact routes", () => {
       approval: approvalService(store),
       outbound: outboundService(store),
       conversation: conversationService(store),
+      meeting: meetingService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1972,6 +2004,7 @@ describe("API Research routes", () => {
       approval: approvalService(store),
       outbound: outboundService(store),
       conversation: conversationService(store),
+      meeting: meetingService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -2024,6 +2057,7 @@ describe("API Research routes", () => {
       approval: approvalService(store),
       outbound: outboundService(store),
       conversation: conversationService(store),
+      meeting: meetingService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3164,6 +3198,7 @@ describe("API Qualification routes", () => {
       ),
       outbound: outboundService(store),
       conversation: conversationService(store),
+      meeting: meetingService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 

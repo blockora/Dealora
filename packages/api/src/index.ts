@@ -83,6 +83,21 @@ export type {
 } from "@dealora/conversation";
 
 /**
+ * The Meeting domain's public surface, re-exported so API consumers can type a
+ * booking response without depending on the domain package directly.
+ */
+export type {
+  Meeting,
+  MeetingBrief,
+  MeetingBookingChannel,
+  MeetingBookingState,
+  MeetingEvent,
+  MeetingEventKind,
+  MeetingPolicyView,
+  MeetingRecommendationReason,
+} from "@dealora/meeting";
+
+/**
  * The Qualification domain's public surface, re-exported so API consumers can
  * type a qualification response without depending on the domain package
  * directly.
