@@ -105,6 +105,13 @@ export type {
   InboundMessage,
   ConversationClassification,
   ConversationEvent,
+  Meeting,
+  MeetingBookingState,
+  MeetingBrief,
+  MeetingBookingChannel,
+  MeetingEvent,
+  MeetingEventKind,
+  MeetingRecommendationReason,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -142,6 +149,9 @@ export {
   inboundMessageTable,
   conversationClassificationTable,
   conversationEventTable,
+  meetingTable,
+  meetingBriefTable,
+  meetingEventTable,
   createTableSql,
   slugify,
   capString,

@@ -244,6 +244,27 @@ export const COLUMNS = {
   // Phase 9's draft text, Phase 8's confidence band and Phase 10's audit row
   // already named, and inventing parallel columns for them would make two
   // vocabularies for one idea.
+
+  // Phase 13 — Meeting Workflow
+  meetingId: "meeting_id",
+  recommendationReason: "recommendation_reason",
+  policyVersion: "policy_version",
+  bookingDigest: "booking_digest",
+  startsAt: "starts_at",
+  endsAt: "ends_at",
+  durationMinutes: "duration_minutes",
+  externalEventId: "external_event_id",
+  suppressionCheckedAt: "suppression_checked_at",
+  bookedAt: "booked_at",
+  cancelledAt: "cancelled_at",
+  qualificationScore: "qualification_score",
+  conversationExcerpt: "conversation_excerpt",
+  gaps: "gaps",
+  // `title`, `state`, `decisionReason`, `approvedBy`, `approvedAt`,
+  // `qualificationId`, `intent`, `claimIds`, `evidenceIds`, `timezone`,
+  // `channel` and `rendererVersion` are already declared above and are reused
+  // here for the same reason: one concept, one column name, across every phase
+  // that touches it.
 } as const;
 
 export type ColumnName = (typeof COLUMNS)[keyof typeof COLUMNS];
@@ -477,6 +498,51 @@ export const conversationClassificationTable = "conversation_classifications" as
  */
 export const conversationEventTable = "conversation_events" as const;
 
+/**
+ * Table: meetings (Phase 13).
+ *
+ * One row per proposed meeting, carrying the booking state that ROADMAP.md §20's
+ * gate asks to be *measurable*. The `state` vocabulary starts at `recommended`
+ * and has to pass through `approved` before `booked` is reachable, because
+ * `DEALORA_BLUEPRINT.md` §17 classifies scheduling an event as a Level 2
+ * external action requiring approval or policy authorization.
+ *
+ * The provenance chain is stored as foreign keys rather than re-derived: a
+ * meeting must point at the classification, the qualification and the approval
+ * that produced it, so "why is this on someone's calendar?" is answerable from
+ * the row itself.
+ *
+ * `booking_digest` is the digest of the exact booking a reviewer was shown. It is
+ * re-derived at decision time, which is what makes an approval mean "I
+ * authorized *this*", and it is CHECK-constrained to exist in every state at or
+ * past `approved` — a row cannot claim authorization without something to
+ * authorize.
+ */
+export const meetingTable = "meetings" as const;
+
+/**
+ * Table: meeting briefs (Phase 13).
+ *
+ * The preparation brief `DEALORA_BLUEPRINT.md` §22 describes, assembled from
+ * records that already exist and referencing rather than copying them.
+ * `claim_ids`/`evidence_ids` are reference lists, so a reader can trace every
+ * sentence back to the workspace's own record.
+ *
+ * `gaps` is a first-class column, not an afterthought: §22 lists sections a
+ * workspace may simply not have data for, and storing that absence explicitly is
+ * what stops an empty section from reading as "nothing to report".
+ */
+export const meetingBriefTable = "meeting_briefs" as const;
+
+/**
+ * Table: the append-only meeting audit trail (Phase 13).
+ *
+ * Who recommended it, who authorized it, whether the provider confirmed it, and
+ * what happened afterwards. An event that reached a real calendar has to be
+ * explainable to the person whose calendar it reached.
+ */
+export const meetingEventTable = "meeting_events" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -508,6 +574,9 @@ export const tables = [
   inboundMessageTable,
   conversationClassificationTable,
   conversationEventTable,
+  meetingTable,
+  meetingBriefTable,
+  meetingEventTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -667,6 +736,24 @@ export const indexes = {
     `${COLUMN(conversationEventTable, COLUMNS.id)} PRIMARY KEY`,
     `${COLUMN(conversationEventTable, COLUMNS.classificationId)} NOT NULL`,
     `${COLUMN(conversationEventTable, COLUMNS.workspaceId)} NOT NULL`,
+  ],
+  meetings: [
+    `${COLUMN(meetingTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(meetingTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(meetingTable, COLUMNS.state)} NOT NULL`,
+    `${COLUMN(meetingTable, COLUMNS.classificationId)} NOT NULL`,
+    `${COLUMN(meetingTable, COLUMNS.title)} NOT NULL`,
+  ],
+  meetingBriefs: [
+    `${COLUMN(meetingBriefTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(meetingBriefTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(meetingBriefTable, COLUMNS.meetingId)} NOT NULL`,
+    `${COLUMN(meetingBriefTable, COLUMNS.version)} NOT NULL`,
+  ],
+  meetingEvents: [
+    `${COLUMN(meetingEventTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(meetingEventTable, COLUMNS.meetingId)} NOT NULL`,
+    `${COLUMN(meetingEventTable, COLUMNS.workspaceId)} NOT NULL`,
   ],
 };
 
@@ -1305,6 +1392,105 @@ ${COLUMN(conversationEventTable, COLUMNS.inboundMessageId)} REFERENCES "${inboun
 ${COLUMN(conversationEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(conversationEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(conversationEventTable, COLUMNS.kind)} CHECK (${COLUMN(conversationEventTable, COLUMNS.kind)} IN ('recorded','classified','suppressed','escalated','held'))`,
+  ),
+  createTableSql(
+    meetingTable,
+    [
+      COLUMN(meetingTable, COLUMNS.id),
+      COLUMN(meetingTable, COLUMNS.workspaceId),
+      COLUMN(meetingTable, COLUMNS.accountId),
+      COLUMN(meetingTable, COLUMNS.contactId),
+      COLUMN(meetingTable, COLUMNS.classificationId),
+      COLUMN(meetingTable, COLUMNS.inboundMessageId),
+      COLUMN(meetingTable, COLUMNS.outboundActionId),
+      COLUMN(meetingTable, COLUMNS.qualificationId),
+      COLUMN(meetingTable, COLUMNS.state),
+      COLUMN(meetingTable, COLUMNS.recommendationReason),
+      COLUMN(meetingTable, COLUMNS.policyVersion),
+      COLUMN(meetingTable, COLUMNS.bookingDigest),
+      COLUMN(meetingTable, COLUMNS.title),
+      COLUMN(meetingTable, COLUMNS.startsAt),
+      COLUMN(meetingTable, COLUMNS.endsAt),
+      COLUMN(meetingTable, COLUMNS.timezone),
+      COLUMN(meetingTable, COLUMNS.durationMinutes),
+      COLUMN(meetingTable, COLUMNS.channel),
+      COLUMN(meetingTable, COLUMNS.externalEventId),
+      COLUMN(meetingTable, COLUMNS.suppressionCheckedAt),
+      COLUMN(meetingTable, COLUMNS.approvedBy),
+      COLUMN(meetingTable, COLUMNS.approvedAt),
+      COLUMN(meetingTable, COLUMNS.bookedAt),
+      COLUMN(meetingTable, COLUMNS.cancelledAt),
+      COLUMN(meetingTable, COLUMNS.decisionReason),
+      COLUMN(meetingTable, COLUMNS.createdBy),
+    ],
+    `${COLUMN(meetingTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(meetingTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingTable, COLUMNS.contactId)} REFERENCES "${contactTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingTable, COLUMNS.classificationId)} REFERENCES "${conversationClassificationTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingTable, COLUMNS.inboundMessageId)} REFERENCES "${inboundMessageTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingTable, COLUMNS.outboundActionId)} REFERENCES "${outboundActionTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingTable, COLUMNS.qualificationId)} REFERENCES "${qualificationTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingTable, COLUMNS.state)} CHECK (${COLUMN(meetingTable, COLUMNS.state)} IN ('recommended','awaiting_approval','approved','booked','held','no_show','cancelled')),
+${COLUMN(meetingTable, COLUMNS.recommendationReason)} CHECK (${COLUMN(meetingTable, COLUMNS.recommendationReason)} IN ('positive_intent','question_answered_live','pricing_answered_live','expressed_interest','requested_by_user')),
+${COLUMN(meetingTable, COLUMNS.channel)} CHECK (${COLUMN(meetingTable, COLUMNS.channel)} IN ('sandbox','provider')),
+${COLUMN(meetingTable, COLUMNS.durationMinutes)} CHECK (${COLUMN(meetingTable, COLUMNS.durationMinutes)} > 0),
+${COLUMN(meetingTable, COLUMNS.endsAt)} CHECK (${COLUMN(meetingTable, COLUMNS.endsAt)} > ${COLUMN(meetingTable, COLUMNS.startsAt)}),
+${COLUMN(meetingTable, COLUMNS.title)} CHECK (length(${COLUMN(meetingTable, COLUMNS.title)}) > 0),
+${COLUMN(meetingTable, COLUMNS.approvedAt)} CHECK (${COLUMN(meetingTable, COLUMNS.approvedAt)} IS NULL OR ${COLUMN(meetingTable, COLUMNS.state)} NOT IN ('recommended','awaiting_approval')),
+${COLUMN(meetingTable, COLUMNS.approvedBy)} CHECK (${COLUMN(meetingTable, COLUMNS.approvedBy)} IS NULL OR ${COLUMN(meetingTable, COLUMNS.state)} NOT IN ('recommended','awaiting_approval')),
+${COLUMN(meetingTable, COLUMNS.bookedAt)} CHECK (${COLUMN(meetingTable, COLUMNS.bookedAt)} IS NULL OR ${COLUMN(meetingTable, COLUMNS.state)} NOT IN ('recommended','awaiting_approval','approved')),
+${COLUMN(meetingTable, COLUMNS.externalEventId)} CHECK (${COLUMN(meetingTable, COLUMNS.externalEventId)} IS NULL OR ${COLUMN(meetingTable, COLUMNS.state)} NOT IN ('recommended','awaiting_approval','approved')),
+${COLUMN(meetingTable, COLUMNS.cancelledAt)} CHECK (${COLUMN(meetingTable, COLUMNS.cancelledAt)} IS NULL OR ${COLUMN(meetingTable, COLUMNS.state)} = 'cancelled'),
+${COLUMN(meetingTable, COLUMNS.state)} CHECK (${COLUMN(meetingTable, COLUMNS.state)} NOT IN ('approved','booked','held','no_show') OR length(${COLUMN(meetingTable, COLUMNS.bookingDigest)}) > 0)`,
+  ),
+  createTableSql(
+    meetingBriefTable,
+    [
+      COLUMN(meetingBriefTable, COLUMNS.id),
+      COLUMN(meetingBriefTable, COLUMNS.workspaceId),
+      COLUMN(meetingBriefTable, COLUMNS.meetingId),
+      COLUMN(meetingBriefTable, COLUMNS.version),
+      COLUMN(meetingBriefTable, COLUMNS.rendererVersion),
+      COLUMN(meetingBriefTable, COLUMNS.accountId),
+      COLUMN(meetingBriefTable, COLUMNS.contactId),
+      COLUMN(meetingBriefTable, COLUMNS.qualificationId),
+      COLUMN(meetingBriefTable, COLUMNS.qualificationScore),
+      COLUMN(meetingBriefTable, COLUMNS.classificationId),
+      COLUMN(meetingBriefTable, COLUMNS.intent),
+      COLUMN(meetingBriefTable, COLUMNS.claimIds),
+      COLUMN(meetingBriefTable, COLUMNS.evidenceIds),
+      COLUMN(meetingBriefTable, COLUMNS.conversationExcerpt),
+      COLUMN(meetingBriefTable, COLUMNS.gaps),
+      COLUMN(meetingBriefTable, COLUMNS.createdBy),
+    ],
+    `${COLUMN(meetingBriefTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(meetingBriefTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingBriefTable, COLUMNS.meetingId)} REFERENCES "${meetingTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingBriefTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingBriefTable, COLUMNS.contactId)} REFERENCES "${contactTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingBriefTable, COLUMNS.qualificationId)} REFERENCES "${qualificationTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingBriefTable, COLUMNS.classificationId)} REFERENCES "${conversationClassificationTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingBriefTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingBriefTable, COLUMNS.intent)} CHECK (${COLUMN(meetingBriefTable, COLUMNS.intent)} IN ('interested','question','pricing','objection','not_now','wrong_person','unsubscribe','positive_intent','negative_intent','unknown')),
+${COLUMN(meetingBriefTable, COLUMNS.version)} CHECK (${COLUMN(meetingBriefTable, COLUMNS.version)} > 0)`,
+  ),
+  createTableSql(
+    meetingEventTable,
+    [
+      COLUMN(meetingEventTable, COLUMNS.id),
+      COLUMN(meetingEventTable, COLUMNS.meetingId),
+      COLUMN(meetingEventTable, COLUMNS.workspaceId),
+      COLUMN(meetingEventTable, COLUMNS.actorUserId),
+      COLUMN(meetingEventTable, COLUMNS.kind),
+      COLUMN(meetingEventTable, COLUMNS.detail),
+    ],
+    `${COLUMN(meetingEventTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(meetingEventTable, COLUMNS.meetingId)} REFERENCES "${meetingTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(meetingEventTable, COLUMNS.kind)} CHECK (${COLUMN(meetingEventTable, COLUMNS.kind)} IN ('recommended','approval_requested','approved','declined','booking_attempted','booked','booking_failed','brief_generated','cancelled','marked_held','marked_no_show'))`,
   ),
 ].join("\n\n");
 

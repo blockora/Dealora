@@ -2679,148 +2679,152 @@ describe("approval requests and outbound actions", () => {
 // are enforced in the store rather than trusted from the caller.
 // ---------------------------------------------------------------------------
 
-describe("inbound messages and conversation classifications", () => {
-  /**
-   * A whole tenant whose one outbound action has been driven all the way to
-   * `sent`.
-   *
-   * Built from real account, contact, draft and approval rows rather than from
-   * a stubbed action, because the store refuses an action that does not point at
-   * rows that exist — and because a Phase 12 test that passed against a
-   * fabricated action would not be testing the rule at all.
-   */
-  function sent(name = "Acme", email = "owner@example.com", shared?: Store) {
-    const store = shared ?? seed();
-    const owner = makeOwner(store, email);
-    const workspaceId = makeWorkspace(store, owner.id, name);
-    const account = store.createAccount({
-      workspaceId,
-      createdBy: owner.id,
-      account: {
-        name: "Northwind",
-        website: null,
-        domain: "northwind.example",
-        industry: "SaaS",
-        companySize: "50-200",
-        geography: "Germany",
-        description: null,
-        source: "manual",
-        sourceReference: null,
-        revenuePlanId: null,
-        status: "active",
-      },
-    });
-    if (!isOk(account)) throw new Error("seed account failed");
-    const contact = store.createContact({
-      workspaceId,
-      createdBy: owner.id,
-      contact: {
-        accountId: account.value.id,
-        firstName: "Ada",
-        lastName: "Lovelace",
-        fullName: "Ada Lovelace",
-        jobTitle: "VP Support",
-        email: "ada@northwind.example",
-        phone: null,
-        profileUrl: null,
-        source: "manual",
-        sourceReference: null,
-        status: "active",
-      },
-    });
-    if (!isOk(contact)) throw new Error("seed contact failed");
-    const draft = store.createDraft({
-      workspaceId,
-      createdBy: owner.id,
+/**
+ * A whole tenant whose one outbound action has been driven all the way to
+ * `sent`.
+ *
+ * Built from real account, contact, draft and approval rows rather than from
+ * a stubbed action, because the store refuses an action that does not point at
+ * rows that exist — and because a test that passed against a fabricated action
+ * would not be testing the rule at all.
+ *
+ * Declared at module scope because Phase 12 and Phase 13 both build on it: a
+ * meeting can only be proposed from a response to a message that genuinely went
+ * out, so the Phase 13 fixture starts from exactly this tenant.
+ */
+function sent(name = "Acme", email = "owner@example.com", shared?: Store) {
+  const store = shared ?? seed();
+  const owner = makeOwner(store, email);
+  const workspaceId = makeWorkspace(store, owner.id, name);
+  const account = store.createAccount({
+    workspaceId,
+    createdBy: owner.id,
+    account: {
+      name: "Northwind",
+      website: null,
+      domain: "northwind.example",
+      industry: "SaaS",
+      companySize: "50-200",
+      geography: "Germany",
+      description: null,
+      source: "manual",
+      sourceReference: null,
+      revenuePlanId: null,
+      status: "active",
+    },
+  });
+  if (!isOk(account)) throw new Error("seed account failed");
+  const contact = store.createContact({
+    workspaceId,
+    createdBy: owner.id,
+    contact: {
       accountId: account.value.id,
-      draft: {
-        contactId: contact.value.id,
-        rendererVersion: "deterministic-1.0.0",
-        contextDigest: "fnv1a-seed",
-        qualificationId: null,
-        offerId: null,
-        subject: "Support Automation for Northwind",
-        body: "Hi Ada,\n\nAbout Support Automation.",
-        personalizationPoints: [],
-        approvedClaimIds: [],
-        warnings: [],
-      },
-    });
-    if (!isOk(draft)) throw new Error("seed draft failed");
-    const approval = store.createApprovalRequest({
-      workspaceId,
-      createdBy: owner.id,
-      approval: {
-        actionKind: "send_message",
-        riskLevel: "level_2_external_action",
-        draftId: draft.value.id,
-        draftVersion: draft.value.version,
-        previewSubject: draft.value.subject,
-        previewDigest: "fnv1a-preview",
-        expiresAt: null,
-      },
-    });
-    if (!isOk(approval)) throw new Error("seed approval failed");
-
-    const created = store.createOutboundAction({
-      workspaceId,
-      createdBy: owner.id,
-      action: {
-        channel: "email",
-        draftId: draft.value.id,
-        draftVersion: draft.value.version,
-        draftDigest: "fnv1a-draft",
-        approvalId: approval.value.id,
-        contactId: contact.value.id,
-        recipientEmail: "ada@northwind.example",
-      },
-    });
-    if (!isOk(created)) throw new Error("seed action failed");
-    const attempted = store.recordOutboundAttempt({
-      id: created.value.id,
-      userId: owner.id,
-      provider: "sandbox-email",
-      attemptedAt: "2026-10-05T09:00:00.000Z",
-    });
-    if (!isOk(attempted)) throw new Error("seed attempt failed");
-    const confirmed = store.confirmOutboundSent({
-      id: created.value.id,
-      userId: owner.id,
-      provider: "sandbox-email",
-      providerReference: "provider-1",
-      sentAt: "2026-10-05T09:00:01.000Z",
-    });
-    if (!isOk(confirmed)) throw new Error("seed confirmation failed");
-    return {
-      store,
-      ownerId: owner.id,
-      workspaceId,
-      accountId: account.value.id,
+      firstName: "Ada",
+      lastName: "Lovelace",
+      fullName: "Ada Lovelace",
+      jobTitle: "VP Support",
+      email: "ada@northwind.example",
+      phone: null,
+      profileUrl: null,
+      source: "manual",
+      sourceReference: null,
+      status: "active",
+    },
+  });
+  if (!isOk(contact)) throw new Error("seed contact failed");
+  const draft = store.createDraft({
+    workspaceId,
+    createdBy: owner.id,
+    accountId: account.value.id,
+    draft: {
       contactId: contact.value.id,
-      actionId: confirmed.value.id,
-    };
-  }
+      rendererVersion: "deterministic-1.0.0",
+      contextDigest: "fnv1a-seed",
+      qualificationId: null,
+      offerId: null,
+      subject: "Support Automation for Northwind",
+      body: "Hi Ada,\n\nAbout Support Automation.",
+      personalizationPoints: [],
+      approvedClaimIds: [],
+      warnings: [],
+    },
+  });
+  if (!isOk(draft)) throw new Error("seed draft failed");
+  const approval = store.createApprovalRequest({
+    workspaceId,
+    createdBy: owner.id,
+    approval: {
+      actionKind: "send_message",
+      riskLevel: "level_2_external_action",
+      draftId: draft.value.id,
+      draftVersion: draft.value.version,
+      previewSubject: draft.value.subject,
+      previewDigest: "fnv1a-preview",
+      expiresAt: null,
+    },
+  });
+  if (!isOk(approval)) throw new Error("seed approval failed");
 
-  function messageFor(
-    fixture: ReturnType<typeof sent>,
-    body = "Please unsubscribe me.",
-    receivedAt = "2026-10-05T09:30:00.000Z",
-  ) {
-    return fixture.store.createInboundMessage({
-      workspaceId: fixture.workspaceId,
-      createdBy: fixture.ownerId,
-      message: {
-        outboundActionId: fixture.actionId,
-        source: "manual",
-        fromAddress: "ada@northwind.example",
-        subject: "Re: support automation",
-        body,
-        providerMessageId: null,
-        receivedAt,
-      },
-    });
-  }
+  const created = store.createOutboundAction({
+    workspaceId,
+    createdBy: owner.id,
+    action: {
+      channel: "email",
+      draftId: draft.value.id,
+      draftVersion: draft.value.version,
+      draftDigest: "fnv1a-draft",
+      approvalId: approval.value.id,
+      contactId: contact.value.id,
+      recipientEmail: "ada@northwind.example",
+    },
+  });
+  if (!isOk(created)) throw new Error("seed action failed");
+  const attempted = store.recordOutboundAttempt({
+    id: created.value.id,
+    userId: owner.id,
+    provider: "sandbox-email",
+    attemptedAt: "2026-10-05T09:00:00.000Z",
+  });
+  if (!isOk(attempted)) throw new Error("seed attempt failed");
+  const confirmed = store.confirmOutboundSent({
+    id: created.value.id,
+    userId: owner.id,
+    provider: "sandbox-email",
+    providerReference: "provider-1",
+    sentAt: "2026-10-05T09:00:01.000Z",
+  });
+  if (!isOk(confirmed)) throw new Error("seed confirmation failed");
+  return {
+    store,
+    ownerId: owner.id,
+    workspaceId,
+    accountId: account.value.id,
+    contactId: contact.value.id,
+    actionId: confirmed.value.id,
+  };
+}
 
+function messageFor(
+  fixture: ReturnType<typeof sent>,
+  body = "Please unsubscribe me.",
+  receivedAt = "2026-10-05T09:30:00.000Z",
+) {
+  return fixture.store.createInboundMessage({
+    workspaceId: fixture.workspaceId,
+    createdBy: fixture.ownerId,
+    message: {
+      outboundActionId: fixture.actionId,
+      source: "manual",
+      fromAddress: "ada@northwind.example",
+      subject: "Re: support automation",
+      body,
+      providerMessageId: null,
+      receivedAt,
+    },
+  });
+}
+
+describe("inbound messages and conversation classifications", () => {
   function classificationFor(
     fixture: ReturnType<typeof sent>,
     inboundMessageId: string,
@@ -3157,7 +3161,7 @@ describe("inbound messages and conversation classifications", () => {
     };
 
     const migrated = migrateState(phase11 as unknown as Parameters<typeof migrateState>[0]);
-    expect(migrated.schemaVersion).toBe(12);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
     expect(migrated.inboundMessages).toEqual([]);
     expect(migrated.conversationClassifications).toEqual([]);
     expect(migrated.conversationEvents).toEqual([]);
@@ -3169,5 +3173,357 @@ describe("inbound messages and conversation classifications", () => {
     expect(migrated.personalizedDrafts).toEqual(document.personalizedDrafts);
     expect(migrated.evidence).toEqual(document.evidence);
     expect(migrated.accountClaims).toEqual(document.accountClaims);
+  });
+});
+
+describe("meetings, briefs and the booking audit trail", () => {
+  /**
+   * A tenant that has a sent message, a **positive** classification and a
+   * `qualified` evaluation — the three prerequisites a meeting record demands.
+   *
+   * Built on the same real rows the Phase 12 tests use, because the store refuses
+   * a meeting whose classification or qualification does not exist, and a test
+   * that passed against a fabricated prerequisite would not be testing the rule.
+   */
+  function meetingFixture(name = "Acme", email = "owner@example.com", shared?: Store) {
+    const fixture = sent(name, email, shared);
+    const store = fixture.store;
+    const message = messageFor(fixture, "Happy to chat, book a call.");
+    if (!isOk(message)) throw new Error("seed message failed");
+    const classification = store.createConversationClassification({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      classification: {
+        inboundMessageId: message.value.id,
+        outboundActionId: fixture.actionId,
+        classifierVersion: "deterministic-1.0.0",
+        intent: "positive_intent",
+        confidence: "high",
+        reasons: ['matched "book a call"'],
+        signals: ["positive_sentiment"],
+        recommendedNextAction: "prepare_reply_for_approval",
+        humanInterventionRequired: true,
+        suppressed: false,
+      },
+    });
+    if (!isOk(classification)) throw new Error("seed classification failed");
+    const qualification = store.createQualification({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      accountId: fixture.accountId,
+      qualification: {
+        ruleVersion: "deterministic-1.0.0",
+        revenuePlanId: null,
+        revenueGoalId: null,
+        icpId: null,
+        contextDigest: "digest-seed",
+        evaluatedAt: "2026-10-06T00:00:00.000Z",
+        state: "qualified",
+        score: 82,
+        confidence: "high",
+        reason: "meets the workspace criteria",
+        evidenceIds: [],
+        claimIds: [],
+        conflictedClaimIds: [],
+        dimensions: [],
+      },
+    });
+    if (!isOk(qualification)) throw new Error("seed qualification failed");
+    return {
+      ...fixture,
+      messageId: message.value.id,
+      classificationId: classification.value.id,
+      qualificationId: qualification.value.id,
+    };
+  }
+
+  const BOOKING = {
+    title: "Intro call with Northwind",
+    startsAt: "2026-11-02T10:00:00.000Z",
+    endsAt: "2026-11-02T10:30:00.000Z",
+    timezone: "Europe/Berlin",
+    durationMinutes: 30,
+  };
+
+  function meetingFor(
+    fixture: ReturnType<typeof meetingFixture>,
+    overrides: Record<string, unknown> = {},
+  ) {
+    return fixture.store.createMeeting({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      meeting: {
+        accountId: fixture.accountId,
+        contactId: fixture.contactId,
+        classificationId: fixture.classificationId,
+        inboundMessageId: fixture.messageId,
+        outboundActionId: fixture.actionId,
+        qualificationId: fixture.qualificationId,
+        state: "recommended",
+        recommendationReason: "positive_intent",
+        policyVersion: "deterministic-1.0.0",
+        bookingDigest: "bk_seeddigest",
+        channel: "sandbox",
+        ...BOOKING,
+        ...overrides,
+      },
+    });
+  }
+
+  it("stores a proposed meeting with its whole provenance chain", () => {
+    const fixture = meetingFixture();
+    const created = meetingFor(fixture);
+    if (!isOk(created)) throw new Error("seed meeting failed");
+
+    // The chain is stored as references, so "why is this on a calendar?" is
+    // answerable from the row itself rather than by re-running anything.
+    expect(created.value.classificationId).toBe(fixture.classificationId);
+    expect(created.value.qualificationId).toBe(fixture.qualificationId);
+    expect(created.value.inboundMessageId).toBe(fixture.messageId);
+    expect(created.value.contactId).toBe(fixture.contactId);
+    // A proposal is `recommended`, and carries no approval or booking.
+    expect(created.value.state).toBe("recommended");
+    expect(created.value.approvedAt).toBeNull();
+    expect(created.value.bookedAt).toBeNull();
+
+    const reread = fixture.store.getMeeting(created.value.id, fixture.ownerId);
+    if (!isOk(reread)) throw new Error("reload failed");
+    expect(reread.value.bookingDigest).toBe("bk_seeddigest");
+    expect(reread.value.title).toBe(BOOKING.title);
+  });
+
+  it("refuses a meeting for a response that was not positive", () => {
+    const fixture = meetingFixture();
+    const other = messageFor(fixture, "Too expensive for us right now.");
+    if (!isOk(other)) throw new Error("seed message failed");
+    const objection = fixture.store.createConversationClassification({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      classification: {
+        inboundMessageId: other.value.id,
+        outboundActionId: fixture.actionId,
+        classifierVersion: "deterministic-1.0.0",
+        intent: "objection",
+        confidence: "high",
+        reasons: ['matched "too expensive"'],
+        signals: ["objection_signal"],
+        recommendedNextAction: "request_human_review",
+        humanInterventionRequired: true,
+        suppressed: false,
+      },
+    });
+    if (!isOk(objection)) throw new Error("seed objection failed");
+
+    // The prerequisite is re-derived here, so the domain service cannot be the
+    // only thing standing between an objection and a calendar entry.
+    const refused = meetingFor(fixture, { classificationId: objection.value.id });
+    expect(isErr(refused)).toBe(true);
+  });
+
+  it("refuses a meeting whose qualification is not qualified", () => {
+    const fixture = meetingFixture();
+    const unqualified = fixture.store.createQualification({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      accountId: fixture.accountId,
+      qualification: {
+        ruleVersion: "deterministic-1.0.0",
+        revenuePlanId: null,
+        revenueGoalId: null,
+        icpId: null,
+        contextDigest: "digest-2",
+        evaluatedAt: "2026-10-06T00:00:00.000Z",
+        state: "unqualified",
+        score: 12,
+        confidence: "low",
+        reason: "does not meet the criteria",
+        evidenceIds: [],
+        claimIds: [],
+        conflictedClaimIds: [],
+        dimensions: [],
+      },
+    });
+    if (!isOk(unqualified)) throw new Error("seed qualification failed");
+    expect(isErr(meetingFor(fixture, { qualificationId: unqualified.value.id }))).toBe(true);
+  });
+
+  it("refuses a second meeting for the same response", () => {
+    const fixture = meetingFixture();
+    if (!isOk(meetingFor(fixture))) throw new Error("seed meeting failed");
+    // One response is one occurrence of interest; a second meeting would be a
+    // second calendar entry for one conversation.
+    expect(isErr(meetingFor(fixture))).toBe(true);
+  });
+
+  it("refuses a booked state with no approval behind it", () => {
+    const fixture = meetingFixture();
+    const created = meetingFor(fixture);
+    if (!isOk(created)) throw new Error("seed meeting failed");
+    // A booking that a person never authorized is not representable, whichever
+    // layer asks for it.
+    const booked = fixture.store.updateMeetingState({
+      meetingId: created.value.id,
+      actorUserId: fixture.ownerId,
+      state: "booked",
+      bookedAt: "2026-11-01T00:00:00.000Z",
+    });
+    expect(isErr(booked)).toBe(true);
+    const reread = fixture.store.getMeeting(created.value.id, fixture.ownerId);
+    if (!isOk(reread)) throw new Error("reload failed");
+    expect(reread.value.state).toBe("recommended");
+  });
+
+  it("refuses an approval with no record of who or when", () => {
+    const fixture = meetingFixture();
+    const created = meetingFor(fixture);
+    if (!isOk(created)) throw new Error("seed meeting failed");
+    expect(
+      isErr(
+        fixture.store.updateMeetingState({
+          meetingId: created.value.id,
+          actorUserId: fixture.ownerId,
+          state: "approved",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("will not carry a booked meeting back to approved", () => {
+    const fixture = meetingFixture();
+    const created = meetingFor(fixture);
+    if (!isOk(created)) throw new Error("seed meeting failed");
+    const approved = fixture.store.updateMeetingState({
+      meetingId: created.value.id,
+      actorUserId: fixture.ownerId,
+      state: "approved",
+      approvedBy: fixture.ownerId,
+      approvedAt: "2026-11-01T00:00:00.000Z",
+    });
+    if (!isOk(approved)) throw new Error("approval failed");
+    const booked = fixture.store.updateMeetingState({
+      meetingId: created.value.id,
+      actorUserId: fixture.ownerId,
+      state: "booked",
+      bookedAt: "2026-11-01T00:01:00.000Z",
+      externalEventId: "sandbox-1",
+    });
+    if (!isOk(booked)) throw new Error("booking failed");
+    // A replayed or reordered call cannot resurrect a booking.
+    expect(
+      isErr(
+        fixture.store.updateMeetingState({
+          meetingId: created.value.id,
+          actorUserId: fixture.ownerId,
+          state: "approved",
+          approvedBy: fixture.ownerId,
+          approvedAt: "2026-11-01T00:00:00.000Z",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("requires a cancellation to record when and why", () => {
+    const fixture = meetingFixture();
+    const created = meetingFor(fixture);
+    if (!isOk(created)) throw new Error("seed meeting failed");
+    const noReason = fixture.store.updateMeetingState({
+      meetingId: created.value.id,
+      actorUserId: fixture.ownerId,
+      state: "cancelled",
+      cancelledAt: "2026-11-01T00:00:00.000Z",
+    });
+    expect(isErr(noReason)).toBe(true);
+    const cancelled = fixture.store.updateMeetingState({
+      meetingId: created.value.id,
+      actorUserId: fixture.ownerId,
+      state: "cancelled",
+      cancelledAt: "2026-11-01T00:00:00.000Z",
+      decisionReason: "Not the right account",
+    });
+    if (!isOk(cancelled)) throw new Error("cancellation failed");
+    expect(cancelled.value.decisionReason).toBe("Not the right account");
+  });
+
+  it("writes an append-only trail and refuses an event for a foreign meeting", () => {
+    const fixture = meetingFixture();
+    const created = meetingFor(fixture);
+    if (!isOk(created)) throw new Error("seed meeting failed");
+    const written = fixture.store.createMeetingEvent({
+      workspaceId: fixture.workspaceId,
+      actorUserId: fixture.ownerId,
+      event: { meetingId: created.value.id, kind: "recommended", detail: "positive intent" },
+    });
+    if (!isOk(written)) throw new Error("event failed");
+    const trail = fixture.store.listMeetingEvents(created.value.id, fixture.ownerId);
+    if (!isOk(trail)) throw new Error("trail failed");
+    expect(trail.value).toHaveLength(1);
+
+    const stranger = "no-membership-here";
+    expect(isErr(fixture.store.getMeeting(created.value.id, stranger))).toBe(true);
+    expect(isErr(fixture.store.listMeetingEvents(created.value.id, stranger))).toBe(true);
+    expect(isErr(fixture.store.listMeetings(fixture.workspaceId, stranger))).toBe(true);
+  });
+
+  it("versions briefs instead of rewriting the first one", () => {
+    const fixture = meetingFixture();
+    const created = meetingFor(fixture);
+    if (!isOk(created)) throw new Error("seed meeting failed");
+    const brief = {
+      meetingId: created.value.id,
+      rendererVersion: "brief-1.0.0",
+      accountId: fixture.accountId,
+      contactId: fixture.contactId,
+      qualificationId: fixture.qualificationId,
+      qualificationScore: 82,
+      classificationId: fixture.classificationId,
+      intent: "positive_intent" as const,
+      claimIds: [],
+      evidenceIds: [],
+      conversationExcerpt: "Happy to chat, book a call.",
+      gaps: ["No evidence backs this account."],
+    };
+    const first = fixture.store.createMeetingBrief({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      brief,
+    });
+    if (!isOk(first)) throw new Error("first brief failed");
+    const second = fixture.store.createMeetingBrief({
+      workspaceId: fixture.workspaceId,
+      createdBy: fixture.ownerId,
+      brief,
+    });
+    if (!isOk(second)) throw new Error("second brief failed");
+    expect(first.value.version).toBe(1);
+    expect(second.value.version).toBe(2);
+    const all = fixture.store.listMeetingBriefs(created.value.id, fixture.ownerId);
+    if (!isOk(all)) throw new Error("list failed");
+    // A person may have read the first before the second was rendered.
+    expect(all.value).toHaveLength(2);
+  });
+
+  it("migrates a Phase 12 document forward without touching a single conversation row", () => {
+    const fixture = meetingFixture();
+    const document = JSON.parse(JSON.stringify(fixture.store.db)) as typeof fixture.store.db;
+    const phase12 = {
+      ...document,
+      schemaVersion: 12,
+      meetings: undefined,
+      meetingBriefs: undefined,
+      meetingEvents: undefined,
+    };
+
+    const migrated = migrateState(phase12 as unknown as Parameters<typeof migrateState>[0]);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    expect(migrated.meetings).toEqual([]);
+    expect(migrated.meetingBriefs).toEqual([]);
+    expect(migrated.meetingEvents).toEqual([]);
+    // Every earlier table is carried over byte for byte, including the response
+    // this phase was built to read.
+    expect(migrated.inboundMessages).toEqual(document.inboundMessages);
+    expect(migrated.conversationClassifications).toEqual(document.conversationClassifications);
+    expect(migrated.conversationEvents).toEqual(document.conversationEvents);
+    expect(migrated.qualifications).toEqual(document.qualifications);
+    expect(migrated.outboundActions).toEqual(document.outboundActions);
   });
 });

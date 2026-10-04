@@ -43,6 +43,12 @@ import type {
   ConversationClassification,
   ConversationEvent,
   ConversationEventKind,
+  Meeting,
+  MeetingBrief,
+  MeetingBookingState,
+  MeetingEvent,
+  MeetingEventKind,
+  MeetingRecommendationReason,
   User,
   Workspace,
   WorkspaceMember,
@@ -122,7 +128,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 12;
+export const LATEST_SCHEMA_VERSION = 13;
 
 export interface DbState {
   schemaVersion?: number;
@@ -155,6 +161,9 @@ export interface DbState {
   inboundMessages?: InboundMessage[];
   conversationClassifications?: ConversationClassification[];
   conversationEvents?: ConversationEvent[];
+  meetings?: Meeting[];
+  meetingBriefs?: MeetingBrief[];
+  meetingEvents?: MeetingEvent[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -192,6 +201,9 @@ export function emptyState(): CompleteDbState {
     inboundMessages: [],
     conversationClassifications: [],
     conversationEvents: [],
+    meetings: [],
+    meetingBriefs: [],
+    meetingEvents: [],
   };
 }
 
@@ -374,6 +386,22 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.conversationEvents;
   }
 
+  // Phase 13 adds meetings, their briefs and the booking audit trail. Additive
+  // like every step before it: a Phase 12 document gains three empty tables and
+  // keeps every response it already classified, so a classification recorded
+  // before the upgrade can still become a meeting afterwards. Nothing before it
+  // is touched, and no conversation row is rewritten or re-stated — Phase 13 adds
+  // the ability to *book* what was already read, never to re-read it differently.
+  if (version >= 13) {
+    state.meetings = Array.isArray(input.meetings) ? input.meetings : base.meetings;
+    state.meetingBriefs = Array.isArray(input.meetingBriefs)
+      ? input.meetingBriefs
+      : base.meetingBriefs;
+    state.meetingEvents = Array.isArray(input.meetingEvents)
+      ? input.meetingEvents
+      : base.meetingEvents;
+  }
+
   return state;
 }
 
@@ -422,6 +450,9 @@ type RowTable =
   | "inboundMessages"
   | "conversationClassifications"
   | "conversationEvents"
+  | "meetings"
+  | "meetingBriefs"
+  | "meetingEvents"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -3592,6 +3623,407 @@ export class Store {
         .map((entry) => entry.row),
     };
   }
+
+  // -------------------------------------------------------------------------
+  // Phase 13 — Meeting Workflow
+  // -------------------------------------------------------------------------
+
+  /**
+   * Persist one proposed meeting.
+   *
+   * The booking record is created in `recommended` and nothing else: a positive
+   * response is an *input* to a meeting, not a booking. Every prerequisite is
+   * re-derived here from stored rows rather than trusted from the caller — the
+   * classification must exist in this workspace and read as positive intent, and
+   * the qualification must exist and read as `qualified` — so a bug in the
+   * domain service cannot propose a meeting out of nothing.
+   *
+   * `bookingDigest` is mandatory from the first row. It is the digest of the
+   * exact booking that a reviewer will be shown, and it is what an approval will
+   * later be checked against; storing it up front is what makes "I authorized
+   * *this*" checkable later.
+   */
+  createMeeting(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    meeting: {
+      accountId: EntityId;
+      contactId: EntityId;
+      classificationId: EntityId;
+      inboundMessageId: EntityId;
+      outboundActionId: EntityId;
+      qualificationId: EntityId;
+      state: MeetingBookingState;
+      recommendationReason: MeetingRecommendationReason;
+      policyVersion: string;
+      bookingDigest: string;
+      title: string;
+      startsAt: DateTime;
+      endsAt: DateTime;
+      timezone: string;
+      durationMinutes: number;
+      channel: Meeting["channel"];
+      externalEventId?: string | null;
+      suppressionCheckedAt?: DateTime | null;
+      approvedBy?: EntityId | null;
+      approvedAt?: DateTime | null;
+      bookedAt?: DateTime | null;
+      cancelledAt?: DateTime | null;
+      decisionReason?: string | null;
+    };
+  }): Result<Meeting, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+
+    const classification = this.findById(
+      "conversationClassifications",
+      input.meeting.classificationId,
+    );
+    if (!classification || classification.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("NOT_FOUND", "conversation classification not found") };
+    }
+    const qualification = this.findById("qualifications", input.meeting.qualificationId);
+    if (!qualification || qualification.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("NOT_FOUND", "qualification not found") };
+    }
+    // The prerequisites are re-checked at the storage boundary, so "a meeting
+    // without a positive response" and "a meeting for an account that did not
+    // qualify" are not representable, whichever layer asks.
+    if (classification.intent !== "positive_intent" && classification.intent !== "interested") {
+      return {
+        ok: false,
+        error: toError("INVALID", "a meeting requires a positive or interested response"),
+      };
+    }
+    if (qualification.state !== "qualified") {
+      return {
+        ok: false,
+        error: toError("INVALID", "a meeting requires a qualified account"),
+      };
+    }
+    // One meeting per response. A response is a single occurrence of interest;
+    // letting it become two meetings would be two calendar entries for one
+    // conversation.
+    const existing = this.rows("meetings").find(
+      (m) => m.classificationId === input.meeting.classificationId,
+    );
+    if (existing) {
+      return { ok: false, error: toError("CONFLICT", "this response already has a meeting") };
+    }
+
+    const createdAt = toDateTime(now());
+    const meeting: Meeting = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      accountId: input.meeting.accountId,
+      contactId: input.meeting.contactId,
+      classificationId: input.meeting.classificationId,
+      inboundMessageId: input.meeting.inboundMessageId,
+      outboundActionId: input.meeting.outboundActionId,
+      qualificationId: input.meeting.qualificationId,
+      state: input.meeting.state,
+      recommendationReason: input.meeting.recommendationReason,
+      policyVersion: input.meeting.policyVersion,
+      bookingDigest: input.meeting.bookingDigest,
+      title: input.meeting.title,
+      startsAt: input.meeting.startsAt,
+      endsAt: input.meeting.endsAt,
+      timezone: input.meeting.timezone,
+      durationMinutes: input.meeting.durationMinutes,
+      channel: input.meeting.channel,
+      externalEventId: input.meeting.externalEventId ?? null,
+      suppressionCheckedAt: input.meeting.suppressionCheckedAt ?? null,
+      approvedBy: input.meeting.approvedBy ?? null,
+      approvedAt: input.meeting.approvedAt ?? null,
+      bookedAt: input.meeting.bookedAt ?? null,
+      cancelledAt: input.meeting.cancelledAt ?? null,
+      decisionReason: input.meeting.decisionReason ?? null,
+      createdBy: input.createdBy,
+      createdAt,
+      updatedAt: createdAt,
+    };
+    this.mutate("meetings", (rows) => rows.push(meeting));
+    return { ok: true, value: meeting };
+  }
+
+  /** Resolve one meeting for reading, authorized against its tenant. */
+  private requireMeeting(id: EntityId, userId: EntityId): Result<Meeting, StorageError> {
+    const meeting = this.findById("meetings", id);
+    if (!meeting) return { ok: false, error: toError("NOT_FOUND", "meeting not found") };
+    const auth = this.requireWorkspace(meeting.workspaceId, userId);
+    // Reported as not found rather than unauthorized, so a foreign id is
+    // indistinguishable from one that was never issued.
+    if (!auth.ok) return { ok: false, error: toError("NOT_FOUND", "meeting not found") };
+    return { ok: true, value: meeting };
+  }
+
+  getMeeting(id: EntityId, userId: EntityId): Result<Meeting, StorageError> {
+    return this.requireMeeting(id, userId);
+  }
+
+  /** A workspace's meetings, newest first, optionally narrowed. */
+  listMeetings(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: { state?: MeetingBookingState; accountId?: EntityId; contactId?: EntityId },
+  ): Result<Meeting[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const filtered = this.rows("meetings").filter(
+      (m) =>
+        m.workspaceId === workspaceId &&
+        (filter?.state === undefined || m.state === filter.state) &&
+        (filter?.accountId === undefined || m.accountId === filter.accountId) &&
+        (filter?.contactId === undefined || m.contactId === filter.contactId),
+    );
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)),
+    };
+  }
+
+  /**
+   * Move one meeting to a new booking state.
+   *
+   * Two invariants are enforced here that no caller should be trusted to hold:
+   *
+   * - **A booking is never un-booked into an approved state.** Re-deriving the
+   *   approval at decision time is the service's job, but storage refuses the
+   *   transition that would matter most — going back to `approved` after
+   *   `booked` — so a replayed or reordered call cannot resurrect a booking.
+   * - **A cancelled meeting keeps its cancellation instant**, and a state that
+   *   claims an approval or a provider reference must carry the matching
+   *   timestamp. These are the same CHECKs the schema declares, re-checked at
+   *   the point of writing, because a document store does not enforce its own
+   *   declared DDL.
+   */
+  updateMeetingState(input: {
+    meetingId: EntityId;
+    actorUserId: EntityId;
+    state: MeetingBookingState;
+    approvedBy?: EntityId | null;
+    approvedAt?: DateTime | null;
+    bookedAt?: DateTime | null;
+    cancelledAt?: DateTime | null;
+    externalEventId?: string | null;
+    suppressionCheckedAt?: DateTime | null;
+    decisionReason?: string | null;
+  }): Result<Meeting, StorageError> {
+    const current = this.requireMeeting(input.meetingId, input.actorUserId);
+    if (!current.ok) return current;
+
+    const next = input.state;
+    if (next === "approved" && current.value.state === "booked") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", "a booked meeting cannot return to approved"),
+      };
+    }
+    const approvedBy = input.approvedBy === undefined ? current.value.approvedBy : input.approvedBy;
+    const approvedAt = input.approvedAt === undefined ? current.value.approvedAt : input.approvedAt;
+    const bookedAt = input.bookedAt === undefined ? current.value.bookedAt : input.bookedAt;
+    const cancelledAt =
+      input.cancelledAt === undefined ? current.value.cancelledAt : input.cancelledAt;
+    const externalEventId =
+      input.externalEventId === undefined ? current.value.externalEventId : input.externalEventId;
+    const suppressionCheckedAt =
+      input.suppressionCheckedAt === undefined
+        ? current.value.suppressionCheckedAt
+        : input.suppressionCheckedAt;
+    const decisionReason =
+      input.decisionReason === undefined ? current.value.decisionReason : input.decisionReason;
+
+    // Mirrors the schema CHECKs: a state that claims an approval, a booking or a
+    // provider reference must carry the matching evidence, and a cancellation
+    // must say when and why.
+    if (next !== "cancelled" && cancelledAt !== null) {
+      return {
+        ok: false,
+        error: toError("INVALID", "only a cancelled meeting may carry a cancellation instant"),
+      };
+    }
+    if (next === "cancelled" && cancelledAt === null) {
+      return {
+        ok: false,
+        error: toError("INVALID", "a cancellation must record when it happened"),
+      };
+    }
+    if (next === "cancelled" && decisionReason === null) {
+      return {
+        ok: false,
+        error: toError("INVALID", "a cancellation must say why"),
+      };
+    }
+    const approving = next === "approved";
+    const booked = next === "booked" || next === "held" || next === "no_show";
+    if (approving && (approvedBy === null || approvedAt === null)) {
+      return {
+        ok: false,
+        error: toError("INVALID", "an approval must record who decided and when"),
+      };
+    }
+    if (booked && bookedAt === null) {
+      return {
+        ok: false,
+        error: toError("INVALID", "a booked meeting must record when it was booked"),
+      };
+    }
+    // A booked, held or missed meeting is a meeting somebody authorized, so the
+    // approval has to already exist on the row. This is the storage-level half of
+    // "no calendar event without a person behind it".
+    if (booked && current.value.approvedAt === null) {
+      return {
+        ok: false,
+        error: toError("INVALID", "a meeting cannot be booked without an approval"),
+      };
+    }
+
+    const updated: Meeting = {
+      ...current.value,
+      state: next,
+      approvedBy,
+      approvedAt,
+      bookedAt,
+      cancelledAt,
+      externalEventId,
+      suppressionCheckedAt,
+      decisionReason,
+      updatedAt: toDateTime(now()),
+    };
+    this.mutate("meetings", (rows) => {
+      const index = (rows as Meeting[]).findIndex((m) => m.id === input.meetingId);
+      if (index >= 0) rows[index] = updated;
+    });
+    return { ok: true, value: updated };
+  }
+
+  /**
+   * Persist one meeting brief.
+   *
+   * Versioned rather than replaced: a person may have read the brief before the
+   * meeting, and rewriting it in place would leave them acting on text that no
+   * longer exists. Regenerating inserts the next version.
+   */
+  createMeetingBrief(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    brief: {
+      meetingId: EntityId;
+      rendererVersion: string;
+      accountId: EntityId;
+      contactId: EntityId;
+      qualificationId: EntityId;
+      qualificationScore: number | null;
+      classificationId: EntityId;
+      intent: MeetingBrief["intent"];
+      claimIds: EntityId[];
+      evidenceIds: EntityId[];
+      conversationExcerpt: string;
+      gaps: string[];
+    };
+  }): Result<MeetingBrief, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+
+    const meeting = this.findById("meetings", input.brief.meetingId);
+    if (!meeting || meeting.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("NOT_FOUND", "meeting not found") };
+    }
+    // The next version in the meeting's lineage. A brief is never rewritten.
+    const latest = this.rows("meetingBriefs")
+      .filter((b) => b.meetingId === input.brief.meetingId)
+      .reduce((max, b) => (b.version > max ? b.version : max), 0);
+
+    const brief: MeetingBrief = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      meetingId: input.brief.meetingId,
+      version: latest + 1,
+      rendererVersion: input.brief.rendererVersion,
+      accountId: input.brief.accountId,
+      contactId: input.brief.contactId,
+      qualificationId: input.brief.qualificationId,
+      qualificationScore: input.brief.qualificationScore,
+      classificationId: input.brief.classificationId,
+      intent: input.brief.intent,
+      claimIds: input.brief.claimIds,
+      evidenceIds: input.brief.evidenceIds,
+      conversationExcerpt: input.brief.conversationExcerpt,
+      gaps: input.brief.gaps,
+      createdBy: input.createdBy,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("meetingBriefs", (rows) => rows.push(brief));
+    return { ok: true, value: brief };
+  }
+
+  getMeetingBrief(id: EntityId, userId: EntityId): Result<MeetingBrief, StorageError> {
+    const brief = this.findById("meetingBriefs", id);
+    if (!brief) return { ok: false, error: toError("NOT_FOUND", "meeting brief not found") };
+    const auth = this.requireWorkspace(brief.workspaceId, userId);
+    if (!auth.ok) return { ok: false, error: toError("NOT_FOUND", "meeting brief not found") };
+    return { ok: true, value: brief };
+  }
+
+  /** One meeting's briefs, newest first. */
+  listMeetingBriefs(meetingId: EntityId, userId: EntityId): Result<MeetingBrief[], StorageError> {
+    const meeting = this.requireMeeting(meetingId, userId);
+    if (!meeting.ok) return meeting;
+    const briefs = this.rows("meetingBriefs").filter((b) => b.meetingId === meetingId);
+    return {
+      ok: true,
+      value: [...briefs].sort((a, b) => (a.version > b.version ? -1 : 1)),
+    };
+  }
+
+  /** One append-only audit row for a meeting. */
+  createMeetingEvent(input: {
+    workspaceId: EntityId;
+    actorUserId: EntityId;
+    event: {
+      meetingId: EntityId;
+      kind: MeetingEventKind;
+      detail: string | null;
+    };
+  }): Result<MeetingEvent, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.actorUserId);
+    if (!auth.ok) return auth;
+    const meeting = this.findById("meetings", input.event.meetingId);
+    if (!meeting || meeting.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("NOT_FOUND", "meeting not found") };
+    }
+    const event: MeetingEvent = {
+      id: newId(),
+      meetingId: input.event.meetingId,
+      workspaceId: input.workspaceId,
+      actorUserId: input.actorUserId,
+      kind: input.event.kind,
+      detail: input.event.detail,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("meetingEvents", (rows) => rows.push(event));
+    return { ok: true, value: event };
+  }
+
+  /** One meeting's audit trail, oldest first. */
+  listMeetingEvents(meetingId: EntityId, userId: EntityId): Result<MeetingEvent[], StorageError> {
+    const meeting = this.requireMeeting(meetingId, userId);
+    if (!meeting.ok) return meeting;
+    const events = this.rows("meetingEvents").filter((e) => e.meetingId === meetingId);
+    return {
+      ok: true,
+      value: events
+        .map((row, index) => ({ row, index }))
+        .sort((a, b) =>
+          a.row.createdAt !== b.row.createdAt
+            ? a.row.createdAt < b.row.createdAt
+              ? -1
+              : 1
+            : a.index - b.index,
+        )
+        .map((entry) => entry.row),
+    };
+  }
 }
 
 /** Default single-process store for local runs. */
@@ -3725,6 +4157,16 @@ export const db = {
     store.findConversationClassificationByMessage.bind(store),
   createConversationEvent: store.createConversationEvent.bind(store),
   listConversationEvents: store.listConversationEvents.bind(store),
+
+  createMeeting: store.createMeeting.bind(store),
+  getMeeting: store.getMeeting.bind(store),
+  listMeetings: store.listMeetings.bind(store),
+  updateMeetingState: store.updateMeetingState.bind(store),
+  createMeetingBrief: store.createMeetingBrief.bind(store),
+  getMeetingBrief: store.getMeetingBrief.bind(store),
+  listMeetingBriefs: store.listMeetingBriefs.bind(store),
+  createMeetingEvent: store.createMeetingEvent.bind(store),
+  listMeetingEvents: store.listMeetingEvents.bind(store),
 
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),

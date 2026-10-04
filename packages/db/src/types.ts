@@ -1674,3 +1674,226 @@ export interface ConversationEvent {
   detail: string | null;
   createdAt: DateTime;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 13 — Meeting Workflow (DEALORA_BLUEPRINT.md §21/§22, ROADMAP.md §20)
+// ---------------------------------------------------------------------------
+
+/**
+ * The booking state a meeting moves through.
+ *
+ * `DEALORA_BLUEPRINT.md` §17 classifies *scheduling an event* as a **Level 2
+ * external action**: it "requires configurable approval or policy authorization".
+ * The vocabulary is built around that, which is why it starts at `recommended`
+ * and passes through `awaiting_approval` and `approved` before anything reaches
+ * a calendar: there is no state in which a meeting is booked without a human
+ * having authorized the exact booking first.
+ *
+ * The states are deliberately *measurable* rather than optimistic —
+ * `ROADMAP.md` §20's gate is "a qualified positive response can result in a
+ * measurable meeting state". A meeting that has merely been suggested is
+ * `recommended` and says so; it is never reported as a meeting that happened.
+ */
+export type MeetingBookingState =
+  /** Suggested from a positive response. Nothing scheduled, nothing sent. */
+  | "recommended"
+  /** A person has been asked to authorize this exact booking. */
+  | "awaiting_approval"
+  /** A person authorized this exact booking. Still not on any calendar. */
+  | "approved"
+  /** The calendar provider confirmed the event exists. */
+  | "booked"
+  /** The meeting time passed without being cancelled. */
+  | "held"
+  /** The meeting time passed and it was cancelled or missed. */
+  | "no_show"
+  /** A person withdrew it before booking, or after. Terminal. */
+  | "cancelled";
+
+/**
+ * Why DEALORA recommended a meeting.
+ *
+ * Closed and inspectable, for the same reason ROADMAP.md Rule 9 exists: a
+ * recommendation the user cannot interrogate is an assertion, not a decision aid.
+ */
+export type MeetingRecommendationReason =
+  /** The response read as positive intent at a usable confidence. */
+  | "positive_intent"
+  /** The response asked a question the answer to is better given live. */
+  | "question_answered_live"
+  /** The response asked about pricing. */
+  | "pricing_answered_live"
+  /** The response expressed interest without naming which. */
+  | "expressed_interest"
+  /** A human asked for a meeting directly, independently of any classification. */
+  | "requested_by_user";
+
+/**
+ * How a booking reached the calendar, or failed to.
+ *
+ * Phase 13 ships the *boundary*, not a live calendar: ROADMAP.md §30 defers
+ * "CRM, calendar, email, Slack" integrations to Phase 23, explicitly "only after
+ * the core revenue loop works". The adapter interface is real and the shipped
+ * implementation performs no network I/O, so every booking claim in this
+ * repository means "the provider recorded it", never "DEALORA asserted it".
+ */
+export type MeetingBookingChannel = "sandbox" | "provider";
+
+/** The steps a meeting's audit trail records. */
+export type MeetingEventKind =
+  | "recommended"
+  | "approval_requested"
+  | "approved"
+  | "declined"
+  | "booking_attempted"
+  | "booked"
+  | "booking_failed"
+  | "brief_generated"
+  | "cancelled"
+  | "marked_held"
+  | "marked_no_show";
+
+/**
+ * One meeting booking, persisted — the phase's measurable state.
+ *
+ * Every id this record carries is a **reference** to the record it came from, not
+ * a copy of its content, and the chain is verifiable in both directions:
+ *
+ *   classification (positive intent)
+ *     → qualification (the account qualified)
+ *       → contact / account (who it is for)
+ *         → approval (a person authorized this exact booking)
+ *           → calendar (the provider confirmed an event exists)
+ *
+ * The chain is stored rather than re-derived because each link is a fact someone
+ * made: re-computing "was this authorized?" from the current state of the world
+ * would make an approval retroactively valid or invalid, which is exactly the
+ * failure mode Phase 10 was built to prevent.
+ *
+ * **A booking record is not evidence.** Nothing here feeds `evidence` or
+ * `accountClaims`, and meeting metadata is exactly what its owner supplied — not
+ * an attested fact about the account.
+ */
+export interface Meeting {
+  id: EntityId;
+  workspaceId: EntityId;
+  accountId: EntityId;
+  /** The contact the meeting is with. Always resolved server-side. */
+  contactId: EntityId;
+  /** The positive-intent classification this meeting came from. */
+  classificationId: EntityId;
+  /** The inbound response that classification was made from. */
+  inboundMessageId: EntityId;
+  /** The outbound action that response answers. */
+  outboundActionId: EntityId;
+  /** The qualification that made this account worth a meeting. */
+  qualificationId: EntityId;
+  state: MeetingBookingState;
+  recommendationReason: MeetingRecommendationReason;
+  /** The rule set that produced the recommendation. Never overwritten. */
+  policyVersion: string;
+  /**
+   * A digest of the exact booking a person was shown.
+   *
+   * Re-derived at decision time exactly as Phase 10 re-derives a draft digest, so
+   * an approval can only ever mean "I authorized *this* booking" — never "I
+   * authorized something like it".
+   */
+  bookingDigest: string;
+  /** The meeting's own metadata. Supplied by a person, never invented. */
+  title: string;
+  /** ISO-8601 instant the meeting is proposed to start. */
+  startsAt: DateTime;
+  /** ISO-8601 instant the meeting is proposed to end. */
+  endsAt: DateTime;
+  /** IANA timezone the times above were stated in. */
+  timezone: string;
+  durationMinutes: number;
+  channel: MeetingBookingChannel;
+  /** The provider's own reference for the created event, when one was issued. */
+  externalEventId: string | null;
+  /**
+   * Whether the booking is still permitted by the Phase 11 opt-out list.
+   *
+   * Denormalized on purpose: an opt-out recorded *after* a meeting was approved
+   * must be able to stop the booking, and the send path already re-checks the
+   * suppression list for exactly this reason.
+   */
+  suppressionCheckedAt: DateTime | null;
+  /** The Phase 10 approval behind this booking, once one exists. */
+  approvedBy: EntityId | null;
+  approvedAt: DateTime | null;
+  bookedAt: DateTime | null;
+  cancelledAt: DateTime | null;
+  /** Why a booking was declined or cancelled. Required for both. */
+  decisionReason: string | null;
+  createdBy: EntityId;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}
+
+/**
+ * The preparation brief for one meeting — BLUEPRINT.md §22.
+ *
+ * Assembled from records that already exist, never from a new claim. Each section
+ * names the record it came from, so a reader can check the brief against the
+ * workspace's own record instead of taking it on trust, and an empty section says
+ * `unavailable` rather than being quietly filled in.
+ *
+ * **The brief is not a recommendation engine.** ROADMAP.md §21 (Next Best
+ * Action) is a later phase; this brief reports what is known and what is missing,
+ * and names the questions a person should ask. It does not score, rank or
+ * predict.
+ */
+export interface MeetingBrief {
+  id: EntityId;
+  workspaceId: EntityId;
+  meetingId: EntityId;
+  /** 1-based version within the meeting's lineage. Never reused. */
+  version: number;
+  /** Which brief renderer produced this. Never overwritten. */
+  rendererVersion: string;
+  /** The account this brief is about. */
+  accountId: EntityId;
+  contactId: EntityId;
+  /** The qualification the brief reads, referenced not copied. */
+  qualificationId: EntityId;
+  /** The score the qualification resolved to, or `null` when it resolved none. */
+  qualificationScore: number | null;
+  /** The classification the brief reads, referenced not copied. */
+  classificationId: EntityId;
+  /** The intent that classification resolved to. */
+  intent: ConversationIntent;
+  /** Every claim the brief quoted. References, never copies. */
+  claimIds: EntityId[];
+  /** Every evidence record behind those claims. References, never copies. */
+  evidenceIds: EntityId[];
+  /** The response text this meeting came from, quoted verbatim. */
+  conversationExcerpt: string;
+  /**
+   * Named gaps: things §22 lists that the workspace has no record of.
+   *
+   * Present so the brief is honest about its own limits. An empty array would
+   * read as "everything is known", which is a claim nobody can make.
+   */
+  gaps: string[];
+  createdBy: EntityId;
+  createdAt: DateTime;
+}
+
+/**
+ * One append-only audit record for a meeting booking (Phase 13).
+ *
+ * A booking that reached someone's calendar has to be explainable: which
+ * response proposed it, who authorized it, and whether the provider confirmed it.
+ * These rows are written by the server and never edited or deleted.
+ */
+export interface MeetingEvent {
+  id: EntityId;
+  meetingId: EntityId;
+  workspaceId: EntityId;
+  actorUserId: EntityId;
+  kind: MeetingEventKind;
+  detail: string | null;
+  createdAt: DateTime;
+}
