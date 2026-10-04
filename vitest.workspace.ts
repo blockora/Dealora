@@ -66,6 +66,10 @@ export default defineConfig({
         replacement: new URL("./packages/meeting/src/index.ts", import.meta.url).pathname,
       },
       {
+        find: "@dealora/nextaction",
+        replacement: new URL("./packages/nextaction/src/index.ts", import.meta.url).pathname,
+      },
+      {
         find: "@dealora/api",
         replacement: new URL("./packages/api/src/index.ts", import.meta.url).pathname,
       },

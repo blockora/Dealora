@@ -17,6 +17,7 @@
     { "path": "packages/outbound" },
     { "path": "packages/conversation" },
     { "path": "packages/meeting" },
+    { "path": "packages/nextaction" },
     { "path": "packages/api" }
   ]
 }

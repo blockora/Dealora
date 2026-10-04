@@ -1,0 +1,19 @@
+{
+  "name": "@dealora/nextaction",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DEALORA Next Best Action Engine: one deterministic answer to \"what should happen next?\", with its reason, evidence, confidence and approval requirement attached.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./types": "./dist/types.js"
+  },
+  "dependencies": {
+    "@dealora/core": "workspace:*",
+    "@dealora/db": "workspace:*"
+  },
+  "devDependencies": {}
+}
