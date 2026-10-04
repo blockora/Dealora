@@ -179,15 +179,27 @@ because `failureCode` answers "why is this action not sent" and the newest reaso
 is the true one; the earlier provider failure is preserved in the append-only
 event trail.
 
-### Idempotency, at two levels
+### Idempotency, at three levels
 
-- **System level.** `findOutboundActionByApproval` returns the action already
-  raised for an approval. Staging the same approval twice returns *that* action
-  rather than creating a second one, and a `sent` action refuses a further send.
+- **Storage level.** `createOutboundAction` refuses to raise a second action for
+  an approval that already has one. This is the root of the guarantee: an
+  invariant that only one caller respects is a convention, not a guarantee. The
+  storage check is what makes "one approval, one message" true regardless of which
+  path asks.
+- **Service level.** `findOutboundActionByApproval` returns the action already
+  raised for an approval, so staging the same approval twice returns *that*
+  action rather than creating a second one. The send path additionally refuses if
+  the approval is bound to a different action than the one being sent, so a
+  by-approval lookup can never quietly stand in for the record that was fetched
+  and authorized.
 - **Provider level.** The idempotency key is derived from the action id, so it is
   stable across retries of the same send and different for every distinct action.
   The sandbox de-duplicates on it. This is what makes a retry safe even if the
   process crashes between the provider's confirmation and the local write.
+
+Because the attempt counter is advanced synchronously and before the provider is
+called, two simultaneous sends of one action admit exactly one attempt: the loser
+finds the action already `sending`.
 
 ### Retry policy
 
@@ -322,18 +334,47 @@ be mass-outreach infrastructure — the one thing §18's critical rule forbids.
 
 ## Limitations
 
+### Open ROADMAP §18 requirements
+
+§18 lists eight items to implement. Five are delivered in full (**send controls,
+opt-out protection, audit logging, failure states, retry policies**), one is
+delivered by delegation (**rate limits** — see below), and **two are not
+implemented**. They are recorded here as *open requirements*, not as settled
+limitations, because §18 asks for them and this phase does not deliver them:
+
+- **OAuth / credential handling — not implemented.** This is the adapter's
+  concern. No outbound credential exists in this repository, and a generic OAuth
+  layer built for a channel that cannot yet authenticate would be inventing a
+  credential flow for a service that does not exist. It closes with the first
+  real adapter, and its keys must be documented in `CONTRIBUTING.md` in that same
+  commit.
+- **Permission scopes — not implemented.** `OutboundProvider` has no scope
+  vocabulary and `ProviderRegistry` grants whatever a provider declares, because
+  there is exactly one provider and it performs no I/O, so there is no
+  privilege to narrow yet. Blueprint §44 ("every external tool should have
+  explicit permission scopes", "least-privilege tool access") is a real
+  requirement, and it is **not** satisfied by this phase. It closes with the
+  first real adapter, where a declared scope set can be compared against a
+  deployment's grant.
+
+### Other limitations
+
 - **No real transport.** The shipped provider is a sandbox. A deployment must
   supply an adapter to actually deliver mail; nothing here has been proven
-  against a live API.
-- **No OAuth or credential handling yet.** §18 lists it as a requirement, and it
-  is deliberately unimplemented here: credential handling belongs with the
-  specific provider adapter, and inventing a generic OAuth layer for one channel
-  would be building for a second one before the first works.
-- **Rate limiting is the provider's**, with DEALORA's attempt cap as the only
-  backstop (§18 lists it as a requirement; the honest implementation for one
-  channel is the provider's own limiter plus a cap).
+  against a live API. ROADMAP §18's gate — *a real approved message can be sent
+  and its state can be observed* — is satisfied on DEALORA's side of the
+  boundary, and is **not** satisfied against a live mail API.
+- **Rate limiting is delegated to the provider**, with DEALORA's five-attempt cap
+  as the only DEALORA-side backstop. No DEALORA-side rate limiter was built: it
+  would be a second, weaker mechanism in front of one that already exists, and
+  mass-outreach infrastructure is the one thing §18's critical rule forbids.
 - **`Response` is out of scope.** §18's loop names it, and it is Phase 12
   (Conversation Engine). This phase ends at delivery state.
+- **Stop conditions and frequency caps are later phases.** Blueprint §46's
+  anti-spam list includes frequency limits and abuse monitoring, which
+  `ROADMAP.md` assigns to its security phase (§37), and unsubscribe handling,
+  which ROADMAP assigns to Phase 12. Opt-out handling — the part that must exist
+  before any send — is implemented here.
 - **Single-process storage only**, as in every prior phase. A send is synchronous
   with the provider call; a process that dies mid-call leaves `sending` behind,
   which is visible and recoverable but not automatically cleaned up.

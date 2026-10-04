@@ -173,9 +173,13 @@ capped; there is no scheduler, no queue, no retry loop and no mass-outreach
 surface. The shipped provider is a **sandbox** that performs no network I/O and
 records what it accepted, because no outbound credential is configured in this
 repository — every delivery claim in the tests means "the provider recorded it",
-never "DEALORA asserted it". Its gate is covered by
-`tests/phase11-gate.test.ts`, and the three phases together by
-`tests/phases9-11-integration.test.ts`.
+never "DEALORA asserted it". Two `ROADMAP.md` §18 requirements are **open and not
+implemented**: OAuth/credential handling and provider permission scopes. Both
+belong to the first real adapter, which does not exist here, and both are
+recorded as open requirements rather than limitations in
+[`docs/adr/0011-first-outbound-integration.md`](./docs/adr/0011-first-outbound-integration.md).
+Its gate is covered by `tests/phase11-gate.test.ts`, and the three phases together
+by `tests/phases9-11-integration.test.ts`.
 
 Next is **Phase 12 — Conversation Engine**.
 
