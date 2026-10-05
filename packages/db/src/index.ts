@@ -125,6 +125,8 @@ export type {
   AgentRegistryStatus,
   AgentRegistryEvent,
   AgentRegistryEventKind,
+  AgentEvaluationObservation,
+  AgentEvaluationRun,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -169,6 +171,8 @@ export {
   costEventTable,
   agentRegistryTable,
   agentRegistryEventTable,
+  agentEvaluationRunTable,
+  agentEvaluationObservationTable,
   createTableSql,
   slugify,
   capString,

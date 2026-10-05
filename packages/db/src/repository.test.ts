@@ -4324,3 +4324,392 @@ describe("agent registry", () => {
     expect(migrated.users).toEqual(document.users);
   });
 });
+
+describe("agent evaluation runs and observations", () => {
+  /** A workspace with an owner and a round opened against `analytics`. */
+  const evaluationFixture = () => {
+    const store = seed();
+    const owner = makeOwner(store, "evaluation-owner@example.com");
+    const workspaceId = makeWorkspace(store, owner.id, "Evaluation Co");
+    const opened = store.createAgentEvaluationRun({
+      workspaceId,
+      userId: owner.id,
+      agentId: "analytics",
+      version: "1.0.0",
+    });
+    if (!isOk(opened)) throw new Error("evaluation run open failed");
+    return { store, owner, workspaceId, run: opened.value };
+  };
+
+  const judgement = (
+    runId: string,
+    subjectId: string,
+    overrides?: Partial<{
+      workspaceId: string;
+      userId: string;
+      metric: string;
+      verdict: string | null;
+      amountMinor: number | null;
+      durationMs: number | null;
+      note: string | null;
+    }>,
+  ) => ({
+    workspaceId: "",
+    userId: "",
+    runId,
+    metric: "task_success",
+    subjectId,
+    verdict: "met",
+    amountMinor: null,
+    durationMs: null,
+    note: null,
+    ...overrides,
+  });
+
+  it("opens a round that pins the agent version, with server-side attribution", () => {
+    const fx = evaluationFixture();
+    expect(fx.run.version).toBe("1.0.0");
+    expect(fx.run.runNumber).toBe(1);
+    expect(fx.run.createdBy).toBe(fx.owner.id);
+    expect(fx.run.agentId).toBe("analytics");
+    expect(fx.store.db.agentEvaluationRuns).toHaveLength(1);
+  });
+
+  it("numbers rounds from storage, so a caller cannot renumber history", () => {
+    const fx = evaluationFixture();
+    const second = fx.store.createAgentEvaluationRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "analytics",
+      version: "1.0.0",
+    });
+    const third = fx.store.createAgentEvaluationRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "analytics",
+      version: "1.0.0",
+    });
+    if (!isOk(second) || !isOk(third)) throw new Error("run open failed");
+    expect(second.value.runNumber).toBe(2);
+    expect(third.value.runNumber).toBe(3);
+
+    const current = fx.store.getCurrentAgentEvaluationRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "analytics",
+      version: "1.0.0",
+    });
+    if (!isOk(current)) throw new Error("current run read failed");
+    expect(current.value?.id).toBe(third.value.id);
+
+    // A different version has its own sequence, so evidence never crosses over.
+    const otherVersion = fx.store.getCurrentAgentEvaluationRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "analytics",
+      version: "1.1.0",
+    });
+    if (!isOk(otherVersion)) throw new Error("current run read failed");
+    expect(otherVersion.value).toBeNull();
+  });
+
+  it("refuses an unknown agent, an unknown version and an unknown workspace", () => {
+    const fx = evaluationFixture();
+    expect(
+      isErr(
+        fx.store.createAgentEvaluationRun({
+          workspaceId: fx.workspaceId,
+          userId: fx.owner.id,
+          agentId: "sales_agent",
+          version: "1.0.0",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isErr(
+        fx.store.createAgentEvaluationRun({
+          workspaceId: fx.workspaceId,
+          userId: fx.owner.id,
+          agentId: "analytics",
+          version: "latest",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isErr(
+        fx.store.createAgentEvaluationRun({
+          workspaceId: "ws-does-not-exist",
+          userId: fx.owner.id,
+          agentId: "analytics",
+          version: "1.0.0",
+        }),
+      ),
+    ).toBe(true);
+    expect(fx.store.db.agentEvaluationRuns).toHaveLength(1);
+  });
+
+  it("records a judgement with server-side attribution and no computed outcome", () => {
+    const fx = evaluationFixture();
+    const written = fx.store.createAgentEvaluationObservation(
+      judgement(fx.run.id, "task-1", {
+        workspaceId: fx.workspaceId,
+        userId: fx.owner.id,
+        note: "checked against the source",
+      }),
+    );
+    if (!isOk(written)) throw new Error("observation write failed");
+    expect(written.value.verdict).toBe("met");
+    expect(written.value.createdBy).toBe(fx.owner.id);
+    expect(written.value.workspaceId).toBe(fx.workspaceId);
+    expect(written.value.note).toBe("checked against the source");
+    // No column holds a rate, a threshold comparison or a pass.
+    expect(Object.keys(written.value).sort()).toEqual([
+      "amountMinor",
+      "createdAt",
+      "createdBy",
+      "durationMs",
+      "id",
+      "metric",
+      "note",
+      "runId",
+      "subjectId",
+      "verdict",
+      "workspaceId",
+    ]);
+  });
+
+  it("accepts exactly one shape per metric", () => {
+    const fx = evaluationFixture();
+    const base = { workspaceId: fx.workspaceId, userId: fx.owner.id, runId: fx.run.id };
+    const cost = fx.store.createAgentEvaluationObservation({
+      ...base,
+      metric: "cost",
+      subjectId: "run-1",
+      verdict: null,
+      amountMinor: 500,
+      durationMs: null,
+      note: null,
+    });
+    const latency = fx.store.createAgentEvaluationObservation({
+      ...base,
+      metric: "latency",
+      subjectId: "run-2",
+      verdict: null,
+      amountMinor: null,
+      durationMs: 1_200,
+      note: null,
+    });
+    expect(isOk(cost) && cost.value.amountMinor).toBe(500);
+    expect(isOk(latency) && latency.value.durationMs).toBe(1_200);
+
+    // A measured metric with no quantity, a negative quantity, a fraction, and
+    // a measured metric that also claims a verdict are all refused.
+    for (const bad of [
+      { metric: "cost", amountMinor: null, durationMs: null, verdict: null },
+      { metric: "cost", amountMinor: -1, durationMs: null, verdict: null },
+      { metric: "cost", amountMinor: 1.5, durationMs: null, verdict: null },
+      { metric: "latency", amountMinor: null, durationMs: null, verdict: null },
+      { metric: "latency", amountMinor: null, durationMs: -5, verdict: null },
+      { metric: "cost", amountMinor: 10, durationMs: null, verdict: "met" },
+      { metric: "task_success", verdict: "passed", amountMinor: null, durationMs: null },
+      { metric: "task_success", verdict: null, amountMinor: 10, durationMs: null },
+      { metric: "task_success", verdict: null, amountMinor: null, durationMs: null },
+      { metric: "vibes", verdict: "met", amountMinor: null, durationMs: null },
+    ]) {
+      expect(
+        isErr(
+          fx.store.createAgentEvaluationObservation({
+            ...base,
+            subjectId: `subject-${String(bad.metric)}-${String(bad.amountMinor)}`,
+            note: null,
+            ...bad,
+          }),
+        ),
+        JSON.stringify(bad),
+      ).toBe(true);
+    }
+    expect(fx.store.db.agentEvaluationObservations).toHaveLength(2);
+  });
+
+  it("replays an identical judgement and refuses a restated one", () => {
+    const fx = evaluationFixture();
+    const base = {
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      runId: fx.run.id,
+      metric: "task_success",
+      subjectId: "task-1",
+      amountMinor: null,
+      durationMs: null,
+      note: null,
+    };
+    const first = fx.store.createAgentEvaluationObservation({ ...base, verdict: "met" });
+    const replay = fx.store.createAgentEvaluationObservation({ ...base, verdict: "met" });
+    if (!isOk(first) || !isOk(replay)) throw new Error("observation write failed");
+    expect(replay.value.id).toBe(first.value.id);
+    expect(fx.store.db.agentEvaluationObservations).toHaveLength(1);
+
+    const restated = fx.store.createAgentEvaluationObservation({ ...base, verdict: "unmet" });
+    expect(isErr(restated)).toBe(true);
+    expect(fx.store.db.agentEvaluationObservations).toHaveLength(1);
+  });
+
+  it("refuses an empty or oversized subject id", () => {
+    const fx = evaluationFixture();
+    const base = {
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      runId: fx.run.id,
+      metric: "task_success",
+      verdict: "met",
+      amountMinor: null,
+      durationMs: null,
+      note: null,
+    };
+    expect(isErr(fx.store.createAgentEvaluationObservation({ ...base, subjectId: "" }))).toBe(true);
+    expect(
+      isErr(fx.store.createAgentEvaluationObservation({ ...base, subjectId: "x".repeat(201) })),
+    ).toBe(true);
+    expect(
+      isOk(fx.store.createAgentEvaluationObservation({ ...base, subjectId: "x".repeat(200) })),
+    ).toBe(true);
+  });
+
+  it("refuses to file a judgement against a round that does not exist", () => {
+    const fx = evaluationFixture();
+    expect(
+      isErr(
+        fx.store.createAgentEvaluationObservation(
+          judgement("run-does-not-exist", "task-1", {
+            workspaceId: fx.workspaceId,
+            userId: fx.owner.id,
+          }),
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      isErr(
+        fx.store.listAgentEvaluationObservations(fx.workspaceId, fx.owner.id, "run-does-not-exist"),
+      ),
+    ).toBe(true);
+  });
+
+  it("caps a note rather than storing an unbounded row", () => {
+    const fx = evaluationFixture();
+    const written = fx.store.createAgentEvaluationObservation(
+      judgement(fx.run.id, "task-1", {
+        workspaceId: fx.workspaceId,
+        userId: fx.owner.id,
+        note: "y".repeat(1_001),
+      }),
+    );
+    expect(isErr(written)).toBe(true);
+  });
+
+  it("isolates rounds and judgements by workspace, in reads and writes", () => {
+    const fx = evaluationFixture();
+    const otherOwner = makeOwner(fx.store, "evaluation-other@example.com");
+    const otherWorkspaceId = makeWorkspace(fx.store, otherOwner.id, "Other Evaluation Co");
+    fx.store.createAgentEvaluationObservation(
+      judgement(fx.run.id, "task-1", {
+        workspaceId: fx.workspaceId,
+        userId: fx.owner.id,
+      }),
+    );
+
+    // Another tenant's own round cannot accept this workspace's run.
+    const otherRun = fx.store.createAgentEvaluationRun({
+      workspaceId: otherWorkspaceId,
+      userId: otherOwner.id,
+      agentId: "analytics",
+      version: "1.0.0",
+    });
+    if (!isOk(otherRun)) throw new Error("run open failed");
+    expect(
+      isErr(
+        fx.store.createAgentEvaluationObservation(
+          judgement(fx.run.id, "task-2", {
+            workspaceId: otherWorkspaceId,
+            userId: otherOwner.id,
+          }),
+        ),
+      ),
+    ).toBe(true);
+
+    // A non-member can neither read nor write.
+    expect(
+      isErr(fx.store.listAgentEvaluationObservations(fx.workspaceId, otherOwner.id, fx.run.id)),
+    ).toBe(true);
+    expect(
+      isErr(fx.store.listAgentEvaluationRuns(fx.workspaceId, otherOwner.id, "analytics")),
+    ).toBe(true);
+    expect(
+      isErr(
+        fx.store.getCurrentAgentEvaluationRun({
+          workspaceId: fx.workspaceId,
+          userId: otherOwner.id,
+          agentId: "analytics",
+          version: "1.0.0",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isErr(
+        fx.store.createAgentEvaluationObservation(
+          judgement(fx.run.id, "task-3", {
+            workspaceId: fx.workspaceId,
+            userId: otherOwner.id,
+          }),
+        ),
+      ),
+    ).toBe(true);
+
+    // The other tenant's own round is empty, and this one is untouched.
+    const theirs = fx.store.listAgentEvaluationObservations(
+      otherWorkspaceId,
+      otherOwner.id,
+      otherRun.value.id,
+    );
+    if (!isOk(theirs)) throw new Error("observation list failed");
+    expect(theirs.value).toEqual([]);
+    const mine = fx.store.listAgentEvaluationObservations(fx.workspaceId, fx.owner.id, fx.run.id);
+    if (!isOk(mine)) throw new Error("observation list failed");
+    expect(mine.value).toHaveLength(1);
+  });
+
+  it("refuses an unknown agent when listing a workspace's rounds", () => {
+    const fx = evaluationFixture();
+    expect(isErr(fx.store.listAgentEvaluationRuns(fx.workspaceId, fx.owner.id, "sales"))).toBe(
+      true,
+    );
+    expect(isErr(fx.store.listAgentRegistryEvents(fx.workspaceId, fx.owner.id, "sales"))).toBe(
+      true,
+    );
+  });
+
+  it("migrates a v16 document forward by adding only the evaluation tables", () => {
+    const fx = evaluationFixture();
+    fx.store.createAgentEvaluationObservation(
+      judgement(fx.run.id, "task-1", {
+        workspaceId: fx.workspaceId,
+        userId: fx.owner.id,
+      }),
+    );
+    const document = JSON.parse(JSON.stringify(fx.store.db)) as typeof fx.store.db;
+    const v16 = {
+      ...document,
+      schemaVersion: 16,
+      agentEvaluationRuns: undefined,
+      agentEvaluationObservations: undefined,
+    };
+    const migrated = migrateState(v16 as unknown as Parameters<typeof migrateState>[0]);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    // The new tables exist and start empty; nothing before them is rewritten.
+    expect(migrated.agentEvaluationRuns).toEqual([]);
+    expect(migrated.agentEvaluationObservations).toEqual([]);
+    expect(migrated.agentRegistry).toEqual(document.agentRegistry);
+    expect(migrated.agentRegistryEvents).toEqual(document.agentRegistryEvents);
+    expect(migrated.costEvents).toEqual(document.costEvents);
+    expect(migrated.users).toEqual(document.users);
+  });
+});

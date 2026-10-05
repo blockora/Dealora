@@ -267,6 +267,20 @@ export const COLUMNS = {
   qualificationScore: "qualification_score",
   conversationExcerpt: "conversation_excerpt",
 
+  // Phase 19 — Agent Evaluation
+  runId: "run_id",
+  runNumber: "run_number",
+  metric: "metric",
+  subjectId: "subject_id",
+  verdict: "verdict",
+  durationMs: "duration_ms",
+  // `agentId`, `workspaceId`, `version`, `amountMinor`, `note`, `createdBy`
+  // and `createdAt` are already declared above and are reused here for the same
+  // reason Phase 12 gave: the evaluated agent, its tenant, the semantic version
+  // the row is about, a whole-minor-unit amount, a human's note and the
+  // server-derived attribution are one concept each, and a Phase 19 parallel
+  // column would make two vocabularies for one idea.
+
   // Phase 14 — Next Best Action Engine
   action: "action",
   supportingState: "supporting_state",
@@ -627,6 +641,31 @@ export const costEventTable = "cost_events" as const;
 export const agentRegistryTable = "agent_registry" as const;
 export const agentRegistryEventTable = "agent_registry_events" as const;
 
+/**
+ * Phase 19 — Agent Evaluation (`ROADMAP.md` §26).
+ *
+ * `agent_evaluation_runs` is one row per evaluation round: a run pins the exact
+ * agent **version** a judgement is about, and `runNumber` gives rounds a total
+ * order. UNIQUE(workspace_id, agent_id, agent_version, run_number) means one
+ * version can never have two round 1s, and the highest run is the live one — so
+ * superseded evidence is dropped by opening a new round rather than by editing
+ * or deleting anything.
+ *
+ * `agent_evaluation_observations` is the append-only judgement trail. Exactly
+ * one of three shapes is representable and the CHECK below enforces it: `cost`
+ * carries whole minor units, `latency` carries whole milliseconds, and every
+ * other metric carries one of three verdicts. There is deliberately **no**
+ * column for a computed rate, a threshold comparison, a pass, an agent status
+ * or an actor's workspace: the engine derives all of those from these rows, so
+ * nothing a client sends can be stored as an evaluation outcome.
+ *
+ * UNIQUE(workspace_id, run_id, metric, subject_id) means a subject cannot be
+ * judged twice for the same metric in the same round, so a replayed request
+ * returns the same judgement instead of adding a second vote.
+ */
+export const agentEvaluationRunTable = "agent_evaluation_runs" as const;
+export const agentEvaluationObservationTable = "agent_evaluation_observations" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -665,6 +704,8 @@ export const tables = [
   costEventTable,
   agentRegistryTable,
   agentRegistryEventTable,
+  agentEvaluationRunTable,
+  agentEvaluationObservationTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -876,6 +917,21 @@ export const indexes = {
     `${COLUMN(agentRegistryEventTable, COLUMNS.actorUserId)} NOT NULL`,
     `${COLUMN(agentRegistryEventTable, COLUMNS.kind)} NOT NULL`,
     `${COLUMN(agentRegistryEventTable, COLUMNS.toStatus)} NOT NULL`,
+  ],
+  agentEvaluationRuns: [
+    `${COLUMN(agentEvaluationRunTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(agentEvaluationRunTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(agentEvaluationRunTable, COLUMNS.agentId)} NOT NULL`,
+    `${COLUMN(agentEvaluationRunTable, COLUMNS.version)} NOT NULL`,
+    `${COLUMN(agentEvaluationRunTable, COLUMNS.runNumber)} NOT NULL`,
+  ],
+  agentEvaluationObservations: [
+    `${COLUMN(agentEvaluationObservationTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(agentEvaluationObservationTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(agentEvaluationObservationTable, COLUMNS.runId)} NOT NULL`,
+    `${COLUMN(agentEvaluationObservationTable, COLUMNS.metric)} NOT NULL`,
+    `${COLUMN(agentEvaluationObservationTable, COLUMNS.subjectId)} NOT NULL`,
+    `${COLUMN(agentEvaluationObservationTable, COLUMNS.createdBy)} NOT NULL`,
   ],
 };
 
@@ -1710,6 +1766,56 @@ ${COLUMN(agentRegistryEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}
 ${COLUMN(agentRegistryEventTable, COLUMNS.agentId)} CHECK (${COLUMN(agentRegistryEventTable, COLUMNS.agentId)} IN ('strategy','market_intelligence','account_research','prospect_discovery','qualification','personalization','conversation','follow_up','meeting','crm','analytics','optimization')),
 ${COLUMN(agentRegistryEventTable, COLUMNS.kind)} CHECK (${COLUMN(agentRegistryEventTable, COLUMNS.kind)} IN ('registered','state_changed','archived')),
 ${COLUMN(agentRegistryEventTable, COLUMNS.toStatus)} CHECK (${COLUMN(agentRegistryEventTable, COLUMNS.toStatus)} IN ('draft','testing','approved','production','paused','disabled','archived'))`,
+  ),
+  createTableSql(
+    agentEvaluationRunTable,
+    [
+      COLUMN(agentEvaluationRunTable, COLUMNS.id),
+      COLUMN(agentEvaluationRunTable, COLUMNS.workspaceId),
+      COLUMN(agentEvaluationRunTable, COLUMNS.agentId),
+      COLUMN(agentEvaluationRunTable, COLUMNS.version),
+      COLUMN(agentEvaluationRunTable, COLUMNS.runNumber),
+      COLUMN(agentEvaluationRunTable, COLUMNS.createdBy),
+      COLUMN(agentEvaluationRunTable, COLUMNS.createdAt),
+    ],
+    `${COLUMN(agentEvaluationRunTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(agentEvaluationRunTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentEvaluationRunTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentEvaluationRunTable, COLUMNS.agentId)} CHECK (${COLUMN(agentEvaluationRunTable, COLUMNS.agentId)} IN ('strategy','market_intelligence','account_research','prospect_discovery','qualification','personalization','conversation','follow_up','meeting','crm','analytics','optimization')),
+${COLUMN(agentEvaluationRunTable, COLUMNS.runNumber)} CHECK (${COLUMN(agentEvaluationRunTable, COLUMNS.runNumber)} > 0),
+${COLUMN(agentEvaluationRunTable, COLUMNS.createdAt)} CHECK (${COLUMN(agentEvaluationRunTable, COLUMNS.createdAt)} IS NOT NULL),
+UNIQUE("${COLUMNS.workspaceId}", "${COLUMNS.agentId}", "${COLUMNS.version}", "${COLUMNS.runNumber}")`,
+  ),
+  createTableSql(
+    agentEvaluationObservationTable,
+    [
+      COLUMN(agentEvaluationObservationTable, COLUMNS.id),
+      COLUMN(agentEvaluationObservationTable, COLUMNS.workspaceId),
+      COLUMN(agentEvaluationObservationTable, COLUMNS.runId),
+      COLUMN(agentEvaluationObservationTable, COLUMNS.metric),
+      COLUMN(agentEvaluationObservationTable, COLUMNS.subjectId),
+      COLUMN(agentEvaluationObservationTable, COLUMNS.verdict),
+      COLUMN(agentEvaluationObservationTable, COLUMNS.amountMinor),
+      COLUMN(agentEvaluationObservationTable, COLUMNS.durationMs),
+      COLUMN(agentEvaluationObservationTable, COLUMNS.note),
+      COLUMN(agentEvaluationObservationTable, COLUMNS.createdBy),
+      COLUMN(agentEvaluationObservationTable, COLUMNS.createdAt),
+    ],
+    `${COLUMN(agentEvaluationObservationTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(agentEvaluationObservationTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentEvaluationObservationTable, COLUMNS.runId)} REFERENCES "${agentEvaluationRunTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentEvaluationObservationTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentEvaluationObservationTable, COLUMNS.metric)} CHECK (${COLUMN(agentEvaluationObservationTable, COLUMNS.metric)} IN ('task_success','accuracy','relevance','hallucination_rate','tool_call_correctness','qualification_accuracy','personalization_quality','response_classification_accuracy','cost','latency','failure_rate','human_override_rate','business_outcome')),
+${COLUMN(agentEvaluationObservationTable, COLUMNS.subjectId)} CHECK (length(${COLUMN(agentEvaluationObservationTable, COLUMNS.subjectId)}) > 0),
+${COLUMN(agentEvaluationObservationTable, COLUMNS.amountMinor)} CHECK (${COLUMN(agentEvaluationObservationTable, COLUMNS.amountMinor)} IS NULL OR ${COLUMN(agentEvaluationObservationTable, COLUMNS.amountMinor)} >= 0),
+${COLUMN(agentEvaluationObservationTable, COLUMNS.durationMs)} CHECK (${COLUMN(agentEvaluationObservationTable, COLUMNS.durationMs)} IS NULL OR ${COLUMN(agentEvaluationObservationTable, COLUMNS.durationMs)} >= 0),
+${COLUMN(agentEvaluationObservationTable, COLUMNS.verdict)} CHECK (
+  (${COLUMN(agentEvaluationObservationTable, COLUMNS.metric)} = 'cost' AND ${COLUMN(agentEvaluationObservationTable, COLUMNS.verdict)} IS NULL AND ${COLUMN(agentEvaluationObservationTable, COLUMNS.amountMinor)} IS NOT NULL AND ${COLUMN(agentEvaluationObservationTable, COLUMNS.durationMs)} IS NULL)
+  OR (${COLUMN(agentEvaluationObservationTable, COLUMNS.metric)} = 'latency' AND ${COLUMN(agentEvaluationObservationTable, COLUMNS.verdict)} IS NULL AND ${COLUMN(agentEvaluationObservationTable, COLUMNS.durationMs)} IS NOT NULL AND ${COLUMN(agentEvaluationObservationTable, COLUMNS.amountMinor)} IS NULL)
+  OR (${COLUMN(agentEvaluationObservationTable, COLUMNS.metric)} NOT IN ('cost','latency') AND ${COLUMN(agentEvaluationObservationTable, COLUMNS.verdict)} IS NOT NULL AND ${COLUMN(agentEvaluationObservationTable, COLUMNS.verdict)} IN ('met','unmet','unobserved') AND ${COLUMN(agentEvaluationObservationTable, COLUMNS.amountMinor)} IS NULL AND ${COLUMN(agentEvaluationObservationTable, COLUMNS.durationMs)} IS NULL)
+),
+${COLUMN(agentEvaluationObservationTable, COLUMNS.createdAt)} CHECK (${COLUMN(agentEvaluationObservationTable, COLUMNS.createdAt)} IS NOT NULL),
+UNIQUE("${COLUMNS.workspaceId}", "${COLUMNS.runId}", "${COLUMNS.metric}", "${COLUMN(agentEvaluationObservationTable, COLUMNS.subjectId)}")`,
   ),
 ].join("\n\n");
 

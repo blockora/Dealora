@@ -2194,3 +2194,74 @@ export interface AgentRegistryEvent {
   detail: string | null;
   createdAt: DateTime;
 }
+
+/**
+ * Phase 19 — one judged subject inside an evaluation run (`ROADMAP.md` §26).
+ *
+ * A row is a **judgement**, never a computed result: `verdict` is what a person
+ * concluded about one thing the agent did, and the engine derives every rate,
+ * total and threshold comparison from the rows. Nothing here stores a score, a
+ * pass, a promotion or an agent status, so a caller cannot submit an evaluation
+ * outcome — only an observation to be measured.
+ *
+ * Exactly one of three shapes is representable, and the schema CHECKs it:
+ * - `cost` carries `amountMinor` and **no** `verdict`, because the engine
+ *   compares it with the Phase 18 declaration's own ceiling;
+ * - `latency` carries `durationMs` and no `verdict`, same reason;
+ * - every other metric carries a `verdict` and no measurement.
+ *
+ * A row is never updated or deleted. A fresh judgement replaces an earlier one
+ * by starting a **new run**, which is what makes the provenance trail a
+ * history rather than a mutable opinion.
+ */
+export interface AgentEvaluationObservation {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** The run this judgement belongs to; a run pins the exact agent version. */
+  runId: EntityId;
+  /** One of the thirteen metrics ROADMAP.md §26 names. */
+  metric: string;
+  /** What was judged: the execution, the claim, the reply — named by the caller. */
+  subjectId: string;
+  /** The judgement. Null for `cost` and `latency`, which carry a measurement. */
+  verdict: string | null;
+  /** Whole minor units of the workspace's currency. Non-negative. */
+  amountMinor: number | null;
+  /** Whole milliseconds. Non-negative. */
+  durationMs: number | null;
+  /** Optional, a person's reason. Never read by any rule. */
+  note: string | null;
+  /** Server-derived: the authenticated caller who recorded the judgement. */
+  createdBy: EntityId;
+  /** Server-derived: when it was recorded. Never client-controlled. */
+  createdAt: DateTime;
+}
+
+/**
+ * Phase 19 — one evaluation round against one exact agent version.
+ *
+ * A run exists so that "the evidence" is always a specific, answerable set: the
+ * highest-numbered run for `(workspace, agent, agentVersion)` is the live one,
+ * and anything recorded in an earlier run has been **superseded** rather than
+ * quietly accumulated. That is how staleness is decided without a clock — no
+ * read consults the current instant, so the same stored rows always produce the
+ * same report.
+ *
+ * `agentVersion` is copied from the `@dealora/agent` declaration table when the
+ * run is opened, never from a request: evidence recorded against version 1.0.0
+ * can never be read as evidence about version 1.1.0.
+ */
+export interface AgentEvaluationRun {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** One of the twelve agents ROADMAP.md §25 names. */
+  agentId: string;
+  /** The declaration version this run evaluates, copied server-side. */
+  version: string;
+  /** 1 for the first run of a version, then increasing. A total order, not a clock. */
+  runNumber: number;
+  /** Server-derived: who opened the round. */
+  createdBy: EntityId;
+  /** Server-derived: when the round was opened. */
+  createdAt: DateTime;
+}

@@ -51,6 +51,8 @@ import type {
   AgentRegistryEvent,
   AgentRegistryEventKind,
   AgentRegistryStatus,
+  AgentEvaluationObservation,
+  AgentEvaluationRun,
   NextBestAction,
   NextBestActionKind,
   NextBestActionRiskLevel,
@@ -180,6 +182,63 @@ function isStoredAgentStatus(value: string): value is AgentRegistryStatus {
 }
 
 /**
+ * The thirteen evaluation metrics ROADMAP.md §26 names, as the storage-layer
+ * vocabulary. Duplicated here for the same reason `AGENT_ID_VALUES` is, and the
+ * same drift test applies: `packages/evaluation` asserts this list equals its
+ * own `EVALUATION_METRICS`, so the two cannot diverge without a failure.
+ */
+const AGENT_EVALUATION_METRIC_VALUES = [
+  "task_success",
+  "accuracy",
+  "relevance",
+  "hallucination_rate",
+  "tool_call_correctness",
+  "qualification_accuracy",
+  "personalization_quality",
+  "response_classification_accuracy",
+  "cost",
+  "latency",
+  "failure_rate",
+  "human_override_rate",
+  "business_outcome",
+] as const;
+
+/**
+ * The three judgements a person may record against a measured subject.
+ *
+ * `unobserved` is not a soft pass: it stays in the denominator, so a subject
+ * nobody could judge counts against the agent rather than for it. Absence of a
+ * judgement must never improve a metric.
+ */
+const AGENT_EVALUATION_VERDICT_VALUES = ["met", "unmet", "unobserved"] as const;
+
+const AGENT_EVALUATION_METRIC_SET: ReadonlySet<string> = new Set(AGENT_EVALUATION_METRIC_VALUES);
+const AGENT_EVALUATION_VERDICT_SET: ReadonlySet<string> = new Set(AGENT_EVALUATION_VERDICT_VALUES);
+
+/** Whether a string names one of the thirteen evaluation metrics. */
+function isStoredEvaluationMetric(value: string): boolean {
+  return AGENT_EVALUATION_METRIC_SET.has(value);
+}
+
+/** Whether a string names one of the three recorded judgements. */
+function isStoredEvaluationVerdict(value: string): boolean {
+  return AGENT_EVALUATION_VERDICT_SET.has(value);
+}
+
+/** The metrics whose observation carries a measurement instead of a verdict. */
+const EVALUATION_MEASURED_METRIC_VALUES: readonly string[] = ["cost", "latency"];
+
+/** A declaration version is a three-part dotted number, never free text. */
+const AGENT_VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
+
+/** Subject ids name the thing judged; they are capped so a row stays a fact. */
+const MAX_SUBJECT_LENGTH = 200;
+const MAX_NOTE_LENGTH = 1_000;
+
+/** Cap a run's `runNumber` so an overflowing count refuses rather than wraps. */
+const MAX_RUN_NUMBER = 1_000_000;
+
+/**
  * Phase 2 migration.
  *
  * A store written by Phase 1 has no Business Brain tables and no `market`
@@ -189,7 +248,7 @@ function isStoredAgentStatus(value: string): value is AgentRegistryStatus {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 16;
+export const LATEST_SCHEMA_VERSION = 17;
 
 export interface DbState {
   schemaVersion?: number;
@@ -229,6 +288,8 @@ export interface DbState {
   costEvents?: CostEvent[];
   agentRegistry?: AgentRegistry[];
   agentRegistryEvents?: AgentRegistryEvent[];
+  agentEvaluationRuns?: AgentEvaluationRun[];
+  agentEvaluationObservations?: AgentEvaluationObservation[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -273,6 +334,8 @@ export function emptyState(): CompleteDbState {
     costEvents: [],
     agentRegistry: [],
     agentRegistryEvents: [],
+    agentEvaluationRuns: [],
+    agentEvaluationObservations: [],
   };
 }
 
@@ -512,6 +575,23 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.agentRegistryEvents;
   }
 
+  // Phase 19 adds the evaluation evidence Phase 18's promotion gate refused to
+  // admit without: one row per evaluation round and one append-only judgement
+  // per measured subject. Additive like every step before it: a Phase 18
+  // document gains two empty tables and keeps every registry row and governance
+  // event it already had, so an agent that was `approved` before the upgrade is
+  // still `approved` afterwards — with no evidence, and therefore still
+  // refused. Nothing before it is touched, and the upgrade adds no way to *run*
+  // an agent: it records judgements about work someone already did.
+  if (version >= 17) {
+    state.agentEvaluationRuns = Array.isArray(input.agentEvaluationRuns)
+      ? input.agentEvaluationRuns
+      : base.agentEvaluationRuns;
+    state.agentEvaluationObservations = Array.isArray(input.agentEvaluationObservations)
+      ? input.agentEvaluationObservations
+      : base.agentEvaluationObservations;
+  }
+
   return state;
 }
 
@@ -567,6 +647,8 @@ type RowTable =
   | "costEvents"
   | "agentRegistry"
   | "agentRegistryEvents"
+  | "agentEvaluationRuns"
+  | "agentEvaluationObservations"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -4581,6 +4663,292 @@ export class Store {
     return { ok: true, value: row };
   }
 
+  // --- Phase 19: Agent Evaluation (ROADMAP.md §26) ---
+
+  /**
+   * Open a new evaluation round for one agent **version**.
+   *
+   * The store records the round; it does not decide whether the agent passes.
+   * Everything about the decision — thresholds, minimum samples, the
+   * declaration's own cost ceiling, the promotion gate — belongs to the
+   * `@dealora/evaluation` domain, which reads these rows and never writes to
+   * them.
+   *
+   * `runNumber` is derived, never supplied: it is one past the highest number
+   * already recorded for this `(workspace, agent, version)`. That makes rounds
+   * a total order, makes "the live round" answerable without a clock, and means
+   * a caller cannot reopen or renumber an earlier round.
+   *
+   * `version` is validated here as well as derived upstream, so a row can never
+   * pin evidence to a version string no declaration could produce.
+   */
+  createAgentEvaluationRun(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    agentId: string;
+    version: string;
+  }): Result<AgentEvaluationRun, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    if (!isStoredAgentId(input.agentId)) {
+      return { ok: false, error: toError("INVALID", "unknown agent id") };
+    }
+    const version = typeof input.version === "string" ? input.version.trim() : "";
+    if (!AGENT_VERSION_PATTERN.test(version)) {
+      return { ok: false, error: toError("INVALID", "version must be a three-part number") };
+    }
+    const existing = this.rows("agentEvaluationRuns").filter(
+      (row) =>
+        row.workspaceId === input.workspaceId &&
+        row.agentId === input.agentId &&
+        row.version === version,
+    );
+    const highest = existing.reduce((max, row) => (row.runNumber > max ? row.runNumber : max), 0);
+    if (highest >= MAX_RUN_NUMBER) {
+      return { ok: false, error: toError("CONFLICT", "too many evaluation rounds") };
+    }
+    const row: AgentEvaluationRun = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      agentId: input.agentId,
+      version,
+      runNumber: highest + 1,
+      createdBy: input.userId,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("agentEvaluationRuns", (rows) => (rows as AgentEvaluationRun[]).push(row));
+    return { ok: true, value: row };
+  }
+
+  /**
+   * The live evaluation round for one agent **version**, or `null`.
+   *
+   * "Live" means the highest `runNumber`, not the most recent instant: the same
+   * stored rows therefore always name the same round, with no clock consulted.
+   * A version with no round returns `null`, which the domain reports as *no
+   * evidence* rather than as an empty passing report.
+   */
+  getCurrentAgentEvaluationRun(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    agentId: string;
+    version: string;
+  }): Result<AgentEvaluationRun | null, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    if (!isStoredAgentId(input.agentId)) {
+      return { ok: false, error: toError("INVALID", "unknown agent id") };
+    }
+    const rows = this.rows("agentEvaluationRuns").filter(
+      (row) =>
+        row.workspaceId === input.workspaceId &&
+        row.agentId === input.agentId &&
+        row.version === input.version,
+    );
+    const live = rows.reduce<AgentEvaluationRun | null>(
+      (max, row) => (max === null || row.runNumber > max.runNumber ? row : max),
+      null,
+    );
+    return { ok: true, value: live };
+  }
+
+  /** Every round recorded for one agent, oldest first, across all versions. */
+  listAgentEvaluationRuns(
+    workspaceId: EntityId,
+    userId: EntityId,
+    agentId: string,
+  ): Result<AgentEvaluationRun[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    if (!isStoredAgentId(agentId)) {
+      return { ok: false, error: toError("INVALID", "unknown agent id") };
+    }
+    return {
+      ok: true,
+      value: this.rows("agentEvaluationRuns").filter(
+        (row) => row.workspaceId === workspaceId && row.agentId === agentId,
+      ),
+    };
+  }
+
+  /**
+   * Record one judgement about one subject inside one round.
+   *
+   * Append-only: there is no update and no delete anywhere in this package, so a
+   * judgement a person has made stays exactly as they made it. A changed mind
+   * opens a **new round** (`createAgentEvaluationRun`), which supersedes the
+   * old evidence without rewriting a single row.
+   *
+   * The metric's shape is enforced here and in the schema together: `cost`
+   * carries whole minor units, `latency` carries whole milliseconds, and every
+   * other metric carries one of the three verdicts. Exactly one shape is
+   * representable, so a row can never claim both a measurement and a verdict,
+   * or store a rate, a threshold comparison or a pass.
+   *
+   * A replayed judgement of the same subject, for the same metric in the same
+   * round, returns the original row when it is identical and refuses with
+   * `CONFLICT` when it is not — so a retried request can never add a second
+   * vote and a reused subject can never quietly restate an opinion.
+   */
+  createAgentEvaluationObservation(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    runId: EntityId;
+    metric: string;
+    subjectId: string;
+    verdict: string | null;
+    amountMinor: number | null;
+    durationMs: number | null;
+    note: string | null;
+  }): Result<AgentEvaluationObservation, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    if (!isStoredEvaluationMetric(input.metric)) {
+      return { ok: false, error: toError("INVALID", "unknown evaluation metric") };
+    }
+    const subjectId = typeof input.subjectId === "string" ? input.subjectId.trim() : "";
+    if (subjectId === "" || subjectId.length > MAX_SUBJECT_LENGTH) {
+      return {
+        ok: false,
+        error: toError(
+          "INVALID",
+          `subjectId must be 1 to ${MAX_SUBJECT_LENGTH} characters naming what was judged`,
+        ),
+      };
+    }
+
+    // The run must be a real round in this workspace: evidence cannot be filed
+    // against a run that does not exist, or against another tenant's.
+    const run = this.rows("agentEvaluationRuns").find(
+      (row) => row.id === input.runId && row.workspaceId === input.workspaceId,
+    );
+    if (!run) {
+      return { ok: false, error: toError("NOT_FOUND", "evaluation run not found") };
+    }
+
+    const measured = EVALUATION_MEASURED_METRIC_VALUES.includes(input.metric);
+    let verdict: string | null = null;
+    let amountMinor: number | null = null;
+    let durationMs: number | null = null;
+
+    if (measured) {
+      const raw = input.metric === "cost" ? input.amountMinor : input.durationMs;
+      if (raw === null || !Number.isSafeInteger(raw) || raw < 0) {
+        return {
+          ok: false,
+          error: toError(
+            "INVALID",
+            input.metric === "cost"
+              ? "cost must be a non-negative whole number of minor units"
+              : "latency must be a non-negative whole number of milliseconds",
+          ),
+        };
+      }
+      // A measured metric carries no verdict. Refusing beats normalising: a
+      // caller that sent both meant something, and silently dropping half of
+      // it would store a judgement it never made.
+      if (input.verdict !== null) {
+        return {
+          ok: false,
+          error: toError("INVALID", `${input.metric} is measured, so it takes no verdict`),
+        };
+      }
+      if (input.metric === "cost") amountMinor = raw;
+      else durationMs = raw;
+    } else {
+      // A judged metric carries no measurement, for the same reason.
+      if (input.amountMinor !== null || input.durationMs !== null) {
+        return {
+          ok: false,
+          error: toError("INVALID", `${input.metric} is judged, so it takes no measurement`),
+        };
+      }
+      if (input.verdict === null || !isStoredEvaluationVerdict(input.verdict)) {
+        return { ok: false, error: toError("INVALID", "verdict must be met, unmet or unobserved") };
+      }
+      verdict = input.verdict;
+    }
+
+    const rawNote = typeof input.note === "string" ? input.note.trim() : "";
+    if (rawNote.length > MAX_NOTE_LENGTH) {
+      return {
+        ok: false,
+        error: toError("INVALID", `note must be at most ${MAX_NOTE_LENGTH} characters`),
+      };
+    }
+    const note = rawNote === "" ? null : rawNote;
+
+    const replay = this.rows("agentEvaluationObservations").find(
+      (row) =>
+        row.workspaceId === input.workspaceId &&
+        row.runId === run.id &&
+        row.metric === input.metric &&
+        row.subjectId === subjectId,
+    );
+    if (replay) {
+      const identical =
+        replay.verdict === verdict &&
+        replay.amountMinor === amountMinor &&
+        replay.durationMs === durationMs;
+      if (!identical) {
+        return {
+          ok: false,
+          error: toError(
+            "CONFLICT",
+            "this subject already has a different judgement for this metric in this round",
+          ),
+        };
+      }
+      return { ok: true, value: replay };
+    }
+
+    const row: AgentEvaluationObservation = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      runId: run.id,
+      metric: input.metric,
+      subjectId,
+      verdict,
+      amountMinor,
+      durationMs,
+      note,
+      createdBy: input.userId,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("agentEvaluationObservations", (rows) =>
+      (rows as AgentEvaluationObservation[]).push(row),
+    );
+    return { ok: true, value: row };
+  }
+
+  /**
+   * Every judgement recorded in one round, in the store's insertion order.
+   *
+   * Ordering is the *service's* decision, and it is a total one: the evaluation
+   * domain publishes observations by `(metric, subjectId)` so identical rows
+   * always print identically — no id tiebreak, because ids are random.
+   */
+  listAgentEvaluationObservations(
+    workspaceId: EntityId,
+    userId: EntityId,
+    runId: EntityId,
+  ): Result<AgentEvaluationObservation[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const run = this.rows("agentEvaluationRuns").find(
+      (row) => row.id === runId && row.workspaceId === workspaceId,
+    );
+    if (!run) {
+      return { ok: false, error: toError("NOT_FOUND", "evaluation run not found") };
+    }
+    return {
+      ok: true,
+      value: this.rows("agentEvaluationObservations").filter(
+        (row) => row.workspaceId === workspaceId && row.runId === runId,
+      ),
+    };
+  }
+
   /**
    * The governance trail, optionally narrowed to one agent, in the store's
    * insertion order (oldest first).
@@ -4758,6 +5126,12 @@ export const db = {
   createCostEvent: store.createCostEvent.bind(store),
   getCostEvent: store.getCostEvent.bind(store),
   listCostEvents: store.listCostEvents.bind(store),
+
+  createAgentEvaluationRun: store.createAgentEvaluationRun.bind(store),
+  getCurrentAgentEvaluationRun: store.getCurrentAgentEvaluationRun.bind(store),
+  listAgentEvaluationRuns: store.listAgentEvaluationRuns.bind(store),
+  createAgentEvaluationObservation: store.createAgentEvaluationObservation.bind(store),
+  listAgentEvaluationObservations: store.listAgentEvaluationObservations.bind(store),
 
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),
