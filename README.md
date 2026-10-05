@@ -25,8 +25,8 @@ The repository has completed **Phase 0 — Repository & Engineering Foundation**
 **Phase 9 — Personalization Engine**, **Phase 10 — Approval Engine**,
 **Phase 11 — First Outbound Integration**, **Phase 12 — Conversation
 Engine**, **Phase 13 — Meeting Workflow**, **Phase 14 — Next Best Action**,
-**Phase 15 — Revenue Graph**, **Phase 16 — Cost Engine**, and
-**Phase 17 — Revenue Dashboard**
+**Phase 15 — Revenue Graph**, **Phase 16 — Cost Engine**,
+**Phase 17 — Revenue Dashboard**, and **Phase 18 — Agent System**
 (see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
@@ -247,8 +247,8 @@ event*. The brief is the other half of the honesty story — it references claim
 and evidence by id rather than copying them, and writes every `§22` section it
 has no record for into `gaps` instead of filling it in. Nothing in this phase
 sends an invitation, schedules anything on a timer, or turns a meeting into a
-fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–17
-together by `tests/phases9-17-integration.test.ts`.
+fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–18
+together by `tests/phases9-18-integration.test.ts`.
 
 Phase 14 adds the Next Best Action Engine: it answers *what should happen next?*
 for one account and for a whole workspace, reading stored rows and applying a
@@ -392,9 +392,44 @@ tile numbers, `userId` or `workspaceId` in a request body are ignored because
 every read is workspace-scoped with the session's own identity. Its gate — a
 user can see the loop as outcomes — is covered by `tests/phase17-gate.test.ts`,
 and it end to end after the send, the booking and the cost by
-`tests/phases9-17-integration.test.ts`.
+`tests/phases9-18-integration.test.ts`.
 
-Next is **Phase 18 — Agent System**.
+Phase 18 adds the Agent System: `ROADMAP.md` §25's **twelve agents** — Strategy,
+Market Intelligence, Account Research, Prospect Discovery, Qualification,
+Personalization, Conversation, Follow-up, Meeting, CRM, Analytics, Optimization
+— each declaring all eleven required fields plus `DEALORA_BLUEPRINT.md` §30's
+`owner` and `model`, and each running on one of **seven** lifecycle states.
+
+The phase **declares agents; it executes none.** Every capability the twelve
+name is already implemented by Phases 3–16 as a deterministic engine, so each
+declaration names the phase that *owns* that work and a workspace stores only
+the lifecycle state its people have decided — a declaration is versioned code,
+so the registry table can never drift from it or become a second source of
+truth. `AGENT_TOOLS` maps each of the 18 tools to the phase that executes it, so
+an agent holding `send_message` has still sent nothing: Phase 10 approval and
+Phase 11 suppression decide, and the `write_external` permission is published
+and granted to nobody.
+
+`approved → production` is published but **refused**, naming **Phase 19** as its
+owner, because `ROADMAP.md` §26 gates production on evaluation evidence that
+does not exist yet. `usableStates` is therefore empty and **no agent can be used
+in any state**. All 13 evaluation metrics are declared and owned by Phase 19;
+none is measured here. The 8 memory layers are declared and never opened. The
+event trail records governance decisions only — who moved an agent, when, from
+what state to what — because `ROADMAP.md` §27 (Phase 20) owns run traces.
+
+The phase adds `agent_registry` and `agent_registry_events` (schema v16), both
+workspace-scoped, with `CHECK` constraints pinning their columns to the twelve
+ids and seven states so a refused row is unrepresentable, and
+`UNIQUE(workspace, agent)` keeping the registry a set of decisions rather than a
+log. The status route is the only writer and the target state is the only value
+a request contributes: forged `updatedBy`, `createdAt`, `workspaceId`,
+`actorUserId` and `kind` in a body are ignored. Its gate — twelve agents,
+eleven fields, seven states, and nothing executable — is covered by
+`tests/phase18-gate.test.ts`, and end to end after the send, the booking, the
+cost and the dashboard by `tests/phases9-18-integration.test.ts`.
+
+Next is **Phase 19 — Agent Evaluation**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -426,8 +461,8 @@ packages/       Shared TypeScript packages (built with project references)
   revenuegraph/  Derived revenue graph: nodes, edges, lifecycle, policy (Phase 15)
   cost/          Immutable cost facts, derived totals and metrics, exact money (Phase 16)
   dashboard/     Revenue dashboard derived on read, published refusals, policy (Phase 17)
+  agent/        Twelve agent declarations, seven-state lifecycle, registry and policy (Phase 18)
   api/          Transport handlers and application-service wiring
-agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 12+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
@@ -513,7 +548,10 @@ rows the earlier phases already store. Phase 16 adds no key and no provider:
 recording a cost is a local append to the workspace's own store, and every
 total is derived from those rows without touching the network. Phase 17 adds
 no key and no provider either: reading a dashboard is nine workspace-scoped
-reads and a derivation, with no write, no clock and no network I/O.
+reads and a derivation, with no write, no clock and no network I/O. Phase 18
+adds none as well: it declares agents from a constant table and records one
+lifecycle state per workspace, with no runner, no model client, no provider and
+no network I/O.
 
 ## License
 

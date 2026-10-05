@@ -154,6 +154,51 @@ has to say so:
   phase already computes, it embeds that phase's answer whole instead of
   re-deriving it. Two definitions of a cost or a next step is how a product
   starts disagreeing with itself.
+- **A declared capability is not an executed one.** Phase 18's twelve agents
+  declare what they are and which phase owns each capability; none of them runs
+  anything. If you add a runner, dispatcher, tool invoker or model client, you
+  have crossed a boundary this repository has deliberately held — and an agent
+  holding a tool grant has still earned nothing, because the tool's own phase
+  re-derives authorization.
+- **A lifecycle state is a decision, not a capability.** `approved → production`
+  is refused until Phase 19 records evaluation evidence, so no code may write
+  `production` to reach a feature faster. If a change needs that state, it needs
+  the evidence Phase 19 exists to produce.
+- **A governance event is not a trace.** The registry's event trail records who
+  moved an agent and when. Runs, latency and tool calls belong to `ROADMAP.md`
+  §27 (Phase 20); writing them here would duplicate that phase.
+
+## Phase 18 implementation and testing expectations
+
+The agent registry is real production code with a real table, so it is held to
+the same bar as the phases before it. Specifically:
+
+- **A declaration is versioned code.** Never store a declaration, and never add
+  a stored field that restates one — a workspace stores only the lifecycle state
+  it decided. A test should fail if a row starts describing what an agent *is*.
+- **Vocabulary is closed at both layers.** The twelve ids and seven states are
+  `CHECK` constraints in the schema as well as types in the domain. If you add
+  an agent or a state, change the rule table, the DDL and the drift test in the
+  same commit.
+- **Total ordering, with the tiebreak chosen deliberately.** The registry prints
+  in `AGENT_IDS` order. The event trail sorts newest first with a *stable* sort
+  and no id tiebreak, because ids are generated and same-millisecond decisions
+  would otherwise print in a different order on every run. Do not reintroduce
+  an id tiebreak without a reason the tests can state.
+- **Every read and write is workspace-scoped with the session's identity.** A
+  test must cover the same-workspace success, the cross-workspace denial, a
+  forged workspace id, and a forged attribution field in a body — and the
+  forged-body case is asserted against the stored row, not against the
+  response alone.
+- **A refused transition writes nothing.** When the lifecycle refuses a move, no
+  row and no event may be created, and the agent's prior state must be
+  unchanged. Assert the full row-count snapshot, as Phase 17's dashboard tests
+  do.
+- **The negative space is tested, not asserted in prose.** No runner, no model
+  client, no network, no scheduler, no memory read, and `usableStates` empty:
+  the package test and the gate both check these over the real API, because a
+  future change that quietly adds an execution path would otherwise be invisible
+  until it ran.
 
 ## Commit conventions
 
