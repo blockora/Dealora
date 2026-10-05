@@ -45,6 +45,24 @@
     },
     {
       "path": "../outbound"
+    },
+    {
+      "path": "../conversation"
+    },
+    {
+      "path": "../meeting"
+    },
+    {
+      "path": "../nextaction"
+    },
+    {
+      "path": "../revenuegraph"
+    },
+    {
+      "path": "../cost"
+    },
+    {
+      "path": "../dashboard"
     }
   ]
 }

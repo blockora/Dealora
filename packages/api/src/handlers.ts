@@ -30,6 +30,7 @@ import type { MeetingError, MeetingService } from "@dealora/meeting";
 import type { NextActionError, NextActionService } from "@dealora/nextaction";
 import type { RevenueGraphError, RevenueGraphService } from "@dealora/revenuegraph";
 import type { CostError, CostService } from "@dealora/cost";
+import type { DashboardError, DashboardService } from "@dealora/dashboard";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -495,6 +496,30 @@ function fromCostError(error: CostError): ApiError {
   return mapped;
 }
 
+/**
+ * Map a dashboard domain error onto the transport vocabulary. The mapping is
+ * exhaustive: `UNAVAILABLE` — the only code that means an internal condition —
+ * becomes a generic `SERVER_ERROR`, so storage internals never reach a client.
+ */
+function fromDashboardError(error: DashboardError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+        return "VALIDATION_ERROR";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = [...error.details];
+  return mapped;
+}
+
 export interface HandlerDeps {
   identity: IdentityService;
   brain: BusinessBrainService;
@@ -514,6 +539,7 @@ export interface HandlerDeps {
   nextaction: NextActionService;
   revenuegraph: RevenueGraphService;
   cost: CostService;
+  dashboard: DashboardService;
   resolveSession: SessionResolver;
 }
 
@@ -2939,6 +2965,45 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok(result.value) };
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 17 — Revenue Dashboard
+  // -------------------------------------------------------------------------
+
+  /**
+   * The workspace's whole dashboard, derived from its own rows on this
+   * request.
+   *
+   * The workspace is a route parameter and the caller is the session: the
+   * service re-authorizes that pair against storage, and every tile is
+   * recomputed from the workspace's rows. Nothing a client sends can reach a
+   * number here, because nothing a client sends is read.
+   */
+  const getDashboardHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.dashboard.snapshot(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromDashboardError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * The dashboard's published rule set: all fourteen tiles with their
+   * derivations, the three refusals with their owning phase, and the four
+   * questions the Blueprint asks of a home screen. Readable before a single
+   * row exists.
+   */
+  const getDashboardPolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.dashboard.policy(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromDashboardError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -3086,6 +3151,12 @@ export function createHandlers(deps: HandlerDeps) {
     getExecutionCostHandler,
     getCostMetricsHandler,
     getCostPolicyHandler,
+
+    // -------------------------------------------------------------------------
+    // Phase 17 — Revenue Dashboard
+    // -------------------------------------------------------------------------
+    getDashboardHandler,
+    getDashboardPolicyHandler,
   };
 }
 

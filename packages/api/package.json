@@ -19,6 +19,7 @@
     "@dealora/conversation": "workspace:*",
     "@dealora/core": "workspace:*",
     "@dealora/cost": "workspace:*",
+    "@dealora/dashboard": "workspace:*",
     "@dealora/db": "workspace:*",
     "@dealora/evidence": "workspace:*",
     "@dealora/goal": "workspace:*",

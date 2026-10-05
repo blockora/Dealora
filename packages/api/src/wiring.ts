@@ -55,6 +55,8 @@ import {
   createRevenueGraphService,
 } from "@dealora/revenuegraph";
 import { createCostService } from "@dealora/cost";
+import { createDashboardService } from "@dealora/dashboard";
+import type { DashboardLookup, DashboardReaders } from "@dealora/dashboard";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -106,6 +108,62 @@ export function createDefaultHandlers(options?: {
   };
 
   const brain = createBusinessBrainService();
+
+  /**
+   * The recommendation boundary reads the account's whole revenue position and
+   * nothing else.
+   *
+   * The reader resolves the account through storage with the caller's own
+   * identity and returns nothing for an account that does not exist or belongs
+   * to another workspace, so the engine has no way to probe for a foreign id.
+   * It is given **no** sender, approver, calendar or scheduler: the strongest
+   * thing it can do is produce a sentence, which is the whole point.
+   */
+  const nextaction = createNextActionService(
+    store as never,
+    createAccountStateReader(store as never),
+    createAccountIndexReader(store as never),
+  );
+
+  /**
+   * The cost boundary: it appends one immutable fact per request for a run
+   * that exists in this workspace, and derives every total and metric on
+   * read. Attribution is the session's (`createdBy`) and the server's clock
+   * (`createdAt`) inside storage — the request body contributes the fact's
+   * own fields and nothing else, so a client cannot name who recorded a
+   * cost, when, or what the total should be.
+   */
+  const cost = createCostService(store as never);
+
+  /**
+   * The dashboard's row lookup: every method is the store's own workspace-
+   * scoped list, passed through unchanged. The tenant check lives inside the
+   * store, and each method re-runs it with the caller's own identity, so this
+   * wiring cannot widen a scope — it only names which lists exist.
+   */
+  const dashboardLookup: DashboardLookup = {
+    authorize: store.authorize.bind(store),
+    listRevenueGoals: store.listRevenueGoals.bind(store),
+    listQualifications: store.listQualifications.bind(store),
+    listConversationClassifications: store.listConversationClassifications.bind(store),
+    listMeetings: store.listMeetings.bind(store),
+    listMeetingEvents: store.listMeetingEvents.bind(store),
+    listResearchRequests: store.listResearchRequests.bind(store),
+    listDrafts: store.listDrafts.bind(store),
+    listApprovalRequests: store.listApprovalRequests.bind(store),
+    listOutboundActions: store.listOutboundActions.bind(store),
+  };
+
+  /**
+   * The two answers this phase does not own. Cost is Phase 16's own picture
+   * and next steps are Phase 14's own board, both read through the services'
+   * public methods, so the dashboard can never disagree with either about
+   * what a cost or a next step is.
+   */
+  const dashboardReaders: DashboardReaders = {
+    costMetrics: (workspaceId, userId) => cost.metrics(workspaceId, userId),
+    nextActionBoard: (workspaceId, userId) => nextaction.recommendForWorkspace(workspaceId, userId),
+  };
 
   const deps: HandlerDeps = {
     identity,
@@ -418,11 +476,7 @@ export function createDefaultHandlers(options?: {
      * It is given **no** sender, approver, calendar or scheduler: the strongest
      * thing it can do is produce a sentence, which is the whole point.
      */
-    nextaction: createNextActionService(
-      store as never,
-      createAccountStateReader(store as never),
-      createAccountIndexReader(store as never),
-    ),
+    nextaction,
     /**
      * The revenue graph boundary: it derives nodes and edges from rows the
      * other phases already stored and writes nothing back. The reader resolves
@@ -444,7 +498,13 @@ export function createDefaultHandlers(options?: {
      * own fields and nothing else, so a client cannot name who recorded a
      * cost, when, or what the total should be.
      */
-    cost: createCostService(store as never),
+    cost,
+    /**
+     * The dashboard boundary: read-only, and derived on every request. It is
+     * given the workspace-scoped row lookup and the two owning services'
+     * answers — no sender, approver, scheduler, provider, clock or network.
+     */
+    dashboard: createDashboardService(dashboardLookup, dashboardReaders),
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());

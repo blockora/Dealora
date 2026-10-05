@@ -153,6 +153,37 @@ export type {
 } from "@dealora/cost";
 
 /**
+ * The Revenue Dashboard domain's public surface, re-exported so API consumers
+ * can type a dashboard response without depending on the domain package
+ * directly. The cost and next-action tiles embed Phase 16's and Phase 14's own
+ * types rather than restating them, which is why those appear here too.
+ */
+export type {
+  ActivityCounterDefinition,
+  ActivityCounterKey,
+  DashboardActivityCounter,
+  DashboardApprovalsTile,
+  DashboardCountTile,
+  DashboardError,
+  DashboardErrorCode,
+  DashboardGoal,
+  DashboardGoalTile,
+  DashboardItemAvailability,
+  DashboardItemDefinition,
+  DashboardItemKey,
+  DashboardMeetingsTile,
+  DashboardMeetingStateCount,
+  DashboardMoneyTile,
+  DashboardPolicyView,
+  DashboardQuestion,
+  DashboardRefusal,
+  DashboardTileStatus,
+  RevenueDashboard,
+  WorkflowFailureDefinition,
+  WorkflowFailureSource,
+} from "@dealora/dashboard";
+
+/**
  * The Qualification domain's public surface, re-exported so API consumers can
  * type a qualification response without depending on the domain package
  * directly.
