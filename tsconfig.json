@@ -19,6 +19,7 @@
     { "path": "packages/meeting" },
     { "path": "packages/nextaction" },
     { "path": "packages/revenuegraph" },
+    { "path": "packages/cost" },
     { "path": "packages/api" }
   ]
 }

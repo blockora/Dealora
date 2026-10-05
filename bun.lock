@@ -33,6 +33,7 @@
         "@dealora/brain": "workspace:*",
         "@dealora/conversation": "workspace:*",
         "@dealora/core": "workspace:*",
+        "@dealora/cost": "workspace:*",
         "@dealora/db": "workspace:*",
         "@dealora/evidence": "workspace:*",
         "@dealora/goal": "workspace:*",
@@ -82,6 +83,14 @@
     "packages/core": {
       "name": "@dealora/core",
       "version": "0.1.0",
+    },
+    "packages/cost": {
+      "name": "@dealora/cost",
+      "version": "0.1.0",
+      "dependencies": {
+        "@dealora/core": "workspace:*",
+        "@dealora/db": "workspace:*",
+      },
     },
     "packages/db": {
       "name": "@dealora/db",
@@ -196,6 +205,8 @@
     "@dealora/conversation": ["@dealora/conversation@workspace:packages/conversation"],
 
     "@dealora/core": ["@dealora/core@workspace:packages/core"],
+
+    "@dealora/cost": ["@dealora/cost@workspace:packages/cost"],
 
     "@dealora/db": ["@dealora/db@workspace:packages/db"],
 

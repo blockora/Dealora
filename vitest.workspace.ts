@@ -74,6 +74,10 @@ export default defineConfig({
         replacement: new URL("./packages/revenuegraph/src/index.ts", import.meta.url).pathname,
       },
       {
+        find: "@dealora/cost",
+        replacement: new URL("./packages/cost/src/index.ts", import.meta.url).pathname,
+      },
+      {
         find: "@dealora/api",
         replacement: new URL("./packages/api/src/index.ts", import.meta.url).pathname,
       },
