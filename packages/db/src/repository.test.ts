@@ -5229,13 +5229,13 @@ describe("agent trace runs and events", () => {
       step(fx.run.id, { workspaceId: fx.workspaceId, userId: fx.owner.id }),
     );
     const document = JSON.parse(JSON.stringify(fx.store.db)) as typeof fx.store.db;
-    const v17 = {
-      ...document,
-      schemaVersion: 17,
-      agentTraceRuns: undefined,
-      agentTraceEvents: undefined,
-    };
-    const migrated = migrateState(v17 as unknown as Parameters<typeof migrateState>[0]);
+    // A v17 document genuinely does not carry the two trace tables, so they
+    // are omitted from the object rather than set to `undefined`: `DbState`
+    // declares them optional, so the rest of the document is already a valid
+    // v17 state and needs no assertion to become one.
+    const { agentTraceRuns: _omittedRuns, agentTraceEvents: _omittedEvents, ...before } = document;
+    const v17: DbState = { ...before, schemaVersion: 17 };
+    const migrated = migrateState(v17);
     expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
     // The new tables exist and start empty; nothing before them is rewritten.
     expect(migrated.agentTraceRuns).toEqual([]);
