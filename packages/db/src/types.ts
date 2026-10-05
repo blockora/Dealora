@@ -2090,11 +2090,14 @@ export type CostCategory = "llm" | "search" | "data" | "tool" | "infrastructure"
 export type CostBasis = "estimated" | "measured";
 
 /**
- * The run a cost event is attributed to. Phase 16's closed list covers the
- * runs this repository can actually perform; `workflow` is refused with the
+ * The run a cost event is attributed to. Phase 16's closed list covered the
+ * runs this repository could perform; Phase 20 widens it with exactly one
+ * member, `agent_run`, because `ROADMAP.md` §27 requires a traced production
+ * agent run to report its cost and Phase 16's own rule is that cost belongs on
+ * its facts rather than in a second table. `workflow` is still refused with the
  * phase that owns it rather than published as an unreachable kind.
  */
-export type CostExecutionKind = "research_run" | "outbound_send" | "meeting_booking";
+export type CostExecutionKind = "research_run" | "outbound_send" | "meeting_booking" | "agent_run";
 
 /**
  * An immutable recorded cost fact — `DEALORA_BLUEPRINT.md` §33's "every run
@@ -2264,4 +2267,132 @@ export interface AgentEvaluationRun {
   createdBy: EntityId;
   /** Server-derived: when the round was opened. */
   createdAt: DateTime;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 20 — Agent Trace & Observability (`ROADMAP.md` §27)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a recorded run ended up being, decided by storage from the events it
+ * holds and by nothing else.
+ *
+ * The five values are the whole vocabulary, and the four that are not `open`
+ * are the only terminal ones:
+ *
+ * - `succeeded` — at least one `succeeded` event and **no** `failed` or
+ *   `unknown` one;
+ * - `failed` — at least one `failed` event, which outranks everything else;
+ * - `unknown` — nothing failed, something's outcome was recorded as unknown,
+ *   so a delivery or side effect may or may not have happened;
+ * - `unverified` — closed with no outcome recorded at all, which is why a run
+ *   cannot claim success by being closed.
+ *
+ * `ROADMAP.md` §27's critical rule — *never silently pretend an action
+ * succeeded* — is enforced by the fact that **no caller supplies this value**.
+ * A close request carries a run id and nothing else.
+ */
+export type AgentTraceRunStatus = "open" | "succeeded" | "failed" | "unknown" | "unverified";
+
+/**
+ * The seven steps of the chain `ROADMAP.md` §27 requires a production workflow
+ * to expose, in the order it prints them: agent, decision, tool call, evidence,
+ * result, approval, external action.
+ *
+ * Closed rather than open, and declared once here so the schema, the store and
+ * the domain can never hold three different lists.
+ */
+export type AgentTraceStage =
+  "agent" | "decision" | "tool_call" | "evidence" | "result" | "approval" | "external_action";
+
+/**
+ * What happened at one step.
+ *
+ * `unknown` is the load-bearing member. It exists because a provider that never
+ * answered has not failed — it has left the question open, and reporting that
+ * as either success or failure is the exact dishonesty §27 forbids. Every stage
+ * carries one of the three: a step is never recorded as simply "recorded".
+ */
+export type AgentTraceOutcome = "succeeded" | "failed" | "unknown";
+
+/**
+ * Phase 20 — one traced production agent run.
+ *
+ * A run is a **container for what a recorder reported**, never evidence that
+ * anything executed. It pins the exact `version` copied from the
+ * `@dealora/agent` declaration table when it was opened, so a later
+ * declaration change cannot rewrite what a historical run meant, and it can
+ * only be opened for an agent this workspace has already promoted to
+ * `production` through Phase 19's evaluation gate.
+ *
+ * `status` is derived in storage from the events the run holds. `closedAt` and
+ * `closedBy` are server-derived from the session, and both stay `null` while
+ * the run is `open`.
+ */
+export interface AgentTraceRun {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** One of the twelve agents ROADMAP.md §25 names. */
+  agentId: string;
+  /** The declaration version this run traces, copied server-side. */
+  version: string;
+  status: AgentTraceRunStatus;
+  /** Server-derived: who opened the run. */
+  openedBy: EntityId;
+  /** Server-derived: when the run was opened. */
+  openedAt: DateTime;
+  /** Server-derived: who closed the run. `null` while it is open. */
+  closedBy: EntityId | null;
+  /** Server-derived: when the run was closed. `null` while it is open. */
+  closedAt: DateTime | null;
+}
+
+/**
+ * Phase 20 — one append-only step in a traced run.
+ *
+ * Every field here is either a **recorded fact** (what the recorder reports
+ * happened, including that it did not happen) or a **server-derived ordering
+ * key**. There is deliberately no column for a run status, a pass, a cost
+ * total or a model verdict: the run's status is derived from these rows, the
+ * cost total comes from Phase 16's own facts, and Phase 19's judgements are a
+ * different table that this phase never writes.
+ *
+ * `sequence` and `attempt` are both allocated in storage. A client cannot
+ * choose either, which is what makes the trace a total order even when two
+ * steps land inside the same millisecond.
+ */
+export interface AgentTraceEvent {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** The run this step belongs to; the run pins the exact agent version. */
+  runId: EntityId;
+  /** Server-derived: 1 for the first step, then strictly increasing per run. */
+  sequence: number;
+  /** The recorder's stable key for the logical step; retries reuse it. */
+  stepId: string;
+  /** Server-derived: steps already recorded for this `stepId`, plus one. */
+  attempt: number;
+  /** One of the seven stages ROADMAP.md §27's chain names. */
+  stage: string;
+  /** One of the three outcomes. Never null: a step always says what happened. */
+  outcome: string;
+  /** What the step did, in the recorder's words. Optional, never read by a rule. */
+  detail: string | null;
+  /** `tool_call` steps only: the tool that was invoked. */
+  tool: string | null;
+  /** The record this step concerns — an approval, an evidence row, an action. */
+  referenceId: string | null;
+  /** A failure code, recorded so an error is readable without the detail text. */
+  errorCode: string | null;
+  /** Whole milliseconds this step took. Not reported stays `null`, not `0`. */
+  durationMs: number | null;
+  /** Model usage, when the step used one. Never a client, never a provider. */
+  modelProvider: string | null;
+  modelName: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  /** Server-derived: who recorded the step. */
+  recordedBy: EntityId;
+  /** Server-derived: when it was recorded. Never client-controlled. */
+  recordedAt: DateTime;
 }

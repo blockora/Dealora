@@ -173,6 +173,8 @@ export {
   agentRegistryEventTable,
   agentEvaluationRunTable,
   agentEvaluationObservationTable,
+  agentTraceRunTable,
+  agentTraceEventTable,
   createTableSql,
   slugify,
   capString,

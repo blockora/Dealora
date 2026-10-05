@@ -281,6 +281,34 @@ export const COLUMNS = {
   // server-derived attribution are one concept each, and a Phase 19 parallel
   // column would make two vocabularies for one idea.
 
+  // Phase 20 — Agent Trace & Observability
+  sequence: "sequence",
+  stepId: "step_id",
+  attempt: "attempt",
+  stage: "stage",
+  tool: "tool",
+  referenceId: "reference_id",
+  errorCode: "error_code",
+  modelProvider: "model_provider",
+  modelName: "model_name",
+  inputTokens: "input_tokens",
+  outputTokens: "output_tokens",
+  openedBy: "opened_by",
+  openedAt: "opened_at",
+  closedBy: "closed_by",
+  closedAt: "closed_at",
+  recordedBy: "recorded_by",
+  recordedAt: "recorded_at",
+  // `agentId`, `workspaceId`, `version`, `status`, `durationMs`, `detail`,
+  // `outcome` and `createdAt` are already declared above and are reused here for
+  // one concept each: a traced step names the same seven states the registry
+  // does, its elapsed time is the same whole-millisecond quantity Phase 19's
+  // `latency` metric measures, its `detail` is the same human-authored note, and
+  // `outcome` is the same "what was achieved" column a revenue goal carries — one
+  // concept, one column name, across every phase that touches it. `createdAt` is
+  // the storage-layer write time, and `recordedAt` is the instant the step was
+  // recorded, which is the Phase 19 field under a name this table owns.
+
   // Phase 14 — Next Best Action Engine
   action: "action",
   supportingState: "supporting_state",
@@ -666,6 +694,34 @@ export const agentRegistryEventTable = "agent_registry_events" as const;
 export const agentEvaluationRunTable = "agent_evaluation_runs" as const;
 export const agentEvaluationObservationTable = "agent_evaluation_observations" as const;
 
+/**
+ * Phase 20 — Agent Trace & Observability (`ROADMAP.md` §27).
+ *
+ * `agent_trace_runs` is one row per traced production agent run. Its `status`
+ * is **derived in storage from the events the run holds** and is never supplied
+ * by a caller — that is the schema-level half of §27's critical rule, *never
+ * silently pretend an action succeeded*. The five-value CHECK makes a forged
+ * status unrepresentable, and the `closed_at`/`closed_by` pair is constrained to
+ * agree with it, so a closed run always names who closed it and an open one
+ * never pretends to.
+ *
+ * `agent_trace_events` is the append-only step trail. `sequence` and `attempt`
+ * are both server-derived and UNIQUE within the run: sequence is what orders
+ * steps even when two of them share a millisecond, and `(run_id, step_id,
+ * attempt)` is what makes a replayed request return the same step instead of
+ * adding a second one — while a genuinely retried step is a new attempt of the
+ * same `step_id`, which is how `ROADMAP.md` §27's "retries" becomes readable
+ * rather than a separate claim.
+ *
+ * There is deliberately **no** column for a run outcome, a pass, a cost total,
+ * a token price or an evaluation verdict. Cost comes from Phase 16's own
+ * `cost_events` rows (widened with the `agent_run` execution kind), and Phase 19
+ * judgements live in their own table that this phase never writes — a trace is
+ * not an evaluation result and is never converted into one.
+ */
+export const agentTraceRunTable = "agent_trace_runs" as const;
+export const agentTraceEventTable = "agent_trace_events" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -706,6 +762,8 @@ export const tables = [
   agentRegistryEventTable,
   agentEvaluationRunTable,
   agentEvaluationObservationTable,
+  agentTraceRunTable,
+  agentTraceEventTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -932,6 +990,25 @@ export const indexes = {
     `${COLUMN(agentEvaluationObservationTable, COLUMNS.metric)} NOT NULL`,
     `${COLUMN(agentEvaluationObservationTable, COLUMNS.subjectId)} NOT NULL`,
     `${COLUMN(agentEvaluationObservationTable, COLUMNS.createdBy)} NOT NULL`,
+  ],
+  agentTraceRuns: [
+    `${COLUMN(agentTraceRunTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(agentTraceRunTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(agentTraceRunTable, COLUMNS.agentId)} NOT NULL`,
+    `${COLUMN(agentTraceRunTable, COLUMNS.version)} NOT NULL`,
+    `${COLUMN(agentTraceRunTable, COLUMNS.status)} NOT NULL`,
+  ],
+  agentTraceEvents: [
+    `${COLUMN(agentTraceEventTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(agentTraceEventTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(agentTraceEventTable, COLUMNS.runId)} NOT NULL`,
+    `${COLUMN(agentTraceEventTable, COLUMNS.sequence)} NOT NULL`,
+    `${COLUMN(agentTraceEventTable, COLUMNS.stepId)} NOT NULL`,
+    `${COLUMN(agentTraceEventTable, COLUMNS.attempt)} NOT NULL`,
+    `${COLUMN(agentTraceEventTable, COLUMNS.stage)} NOT NULL`,
+    `${COLUMN(agentTraceEventTable, COLUMNS.outcome)} NOT NULL`,
+    `${COLUMN(agentTraceEventTable, COLUMNS.recordedBy)} NOT NULL`,
+    `UNIQUE(${COLUMN(agentTraceEventTable, COLUMNS.runId)}, ${COLUMN(agentTraceEventTable, COLUMNS.sequence)})`,
   ],
 };
 
@@ -1720,7 +1797,7 @@ ${COLUMN(nextBestActionTable, COLUMNS.approvalRequired)} CHECK (${COLUMN(nextBes
     `${COLUMN(costEventTable, COLUMNS.id)} PRIMARY KEY,
 ${COLUMN(costEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(costEventTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
-${COLUMN(costEventTable, COLUMNS.executionKind)} CHECK (${COLUMN(costEventTable, COLUMNS.executionKind)} IN ('research_run','outbound_send','meeting_booking')),
+${COLUMN(costEventTable, COLUMNS.executionKind)} CHECK (${COLUMN(costEventTable, COLUMNS.executionKind)} IN ('research_run','outbound_send','meeting_booking','agent_run')),
 ${COLUMN(costEventTable, COLUMNS.category)} CHECK (${COLUMN(costEventTable, COLUMNS.category)} IN ('llm','search','data','tool','infrastructure','execution')),
 ${COLUMN(costEventTable, COLUMNS.basis)} CHECK (${COLUMN(costEventTable, COLUMNS.basis)} IN ('estimated','measured')),
 ${COLUMN(costEventTable, COLUMNS.amountMinor)} CHECK (${COLUMN(costEventTable, COLUMNS.amountMinor)} >= 0),
@@ -1816,6 +1893,73 @@ ${COLUMN(agentEvaluationObservationTable, COLUMNS.verdict)} CHECK (
 ),
 ${COLUMN(agentEvaluationObservationTable, COLUMNS.createdAt)} CHECK (${COLUMN(agentEvaluationObservationTable, COLUMNS.createdAt)} IS NOT NULL),
 UNIQUE("${COLUMNS.workspaceId}", "${COLUMNS.runId}", "${COLUMNS.metric}", "${COLUMN(agentEvaluationObservationTable, COLUMNS.subjectId)}")`,
+  ),
+  createTableSql(
+    agentTraceRunTable,
+    [
+      COLUMN(agentTraceRunTable, COLUMNS.id),
+      COLUMN(agentTraceRunTable, COLUMNS.workspaceId),
+      COLUMN(agentTraceRunTable, COLUMNS.agentId),
+      COLUMN(agentTraceRunTable, COLUMNS.version),
+      COLUMN(agentTraceRunTable, COLUMNS.status),
+      COLUMN(agentTraceRunTable, COLUMNS.openedBy),
+      COLUMN(agentTraceRunTable, COLUMNS.openedAt),
+      COLUMN(agentTraceRunTable, COLUMNS.closedBy),
+      COLUMN(agentTraceRunTable, COLUMNS.closedAt),
+    ],
+    `${COLUMN(agentTraceRunTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(agentTraceRunTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentTraceRunTable, COLUMNS.openedBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentTraceRunTable, COLUMNS.agentId)} CHECK (${COLUMN(agentTraceRunTable, COLUMNS.agentId)} IN ('strategy','market_intelligence','account_research','prospect_discovery','qualification','personalization','conversation','follow_up','meeting','crm','analytics','optimization')),
+${COLUMN(agentTraceRunTable, COLUMNS.version)} CHECK (${COLUMN(agentTraceRunTable, COLUMNS.version)} ~ '^\\d+\\.\\d+\\.\\d+$'),
+${COLUMN(agentTraceRunTable, COLUMNS.status)} CHECK (${COLUMN(agentTraceRunTable, COLUMNS.status)} IN ('open','succeeded','failed','unknown','unverified')),
+${COLUMN(agentTraceRunTable, COLUMNS.openedAt)} CHECK (${COLUMN(agentTraceRunTable, COLUMNS.openedAt)} IS NOT NULL),
+${COLUMN(agentTraceRunTable, COLUMNS.closedAt)} CHECK (
+  (${COLUMN(agentTraceRunTable, COLUMNS.status)} = 'open' AND ${COLUMN(agentTraceRunTable, COLUMNS.closedAt)} IS NULL AND ${COLUMN(agentTraceRunTable, COLUMNS.closedBy)} IS NULL)
+  OR (${COLUMN(agentTraceRunTable, COLUMNS.status)} <> 'open' AND ${COLUMN(agentTraceRunTable, COLUMNS.closedAt)} IS NOT NULL AND ${COLUMN(agentTraceRunTable, COLUMNS.closedBy)} IS NOT NULL)
+)`,
+  ),
+  createTableSql(
+    agentTraceEventTable,
+    [
+      COLUMN(agentTraceEventTable, COLUMNS.id),
+      COLUMN(agentTraceEventTable, COLUMNS.workspaceId),
+      COLUMN(agentTraceEventTable, COLUMNS.runId),
+      COLUMN(agentTraceEventTable, COLUMNS.sequence),
+      COLUMN(agentTraceEventTable, COLUMNS.stepId),
+      COLUMN(agentTraceEventTable, COLUMNS.attempt),
+      COLUMN(agentTraceEventTable, COLUMNS.stage),
+      COLUMN(agentTraceEventTable, COLUMNS.outcome),
+      COLUMN(agentTraceEventTable, COLUMNS.detail),
+      COLUMN(agentTraceEventTable, COLUMNS.tool),
+      COLUMN(agentTraceEventTable, COLUMNS.referenceId),
+      COLUMN(agentTraceEventTable, COLUMNS.errorCode),
+      COLUMN(agentTraceEventTable, COLUMNS.durationMs),
+      COLUMN(agentTraceEventTable, COLUMNS.modelProvider),
+      COLUMN(agentTraceEventTable, COLUMNS.modelName),
+      COLUMN(agentTraceEventTable, COLUMNS.inputTokens),
+      COLUMN(agentTraceEventTable, COLUMNS.outputTokens),
+      COLUMN(agentTraceEventTable, COLUMNS.recordedBy),
+      COLUMN(agentTraceEventTable, COLUMNS.recordedAt),
+    ],
+    `${COLUMN(agentTraceEventTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(agentTraceEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentTraceEventTable, COLUMNS.runId)} REFERENCES "${agentTraceRunTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentTraceEventTable, COLUMNS.recordedBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentTraceEventTable, COLUMNS.stage)} CHECK (${COLUMN(agentTraceEventTable, COLUMNS.stage)} IN ('agent','decision','tool_call','evidence','result','approval','external_action')),
+${COLUMN(agentTraceEventTable, COLUMNS.outcome)} CHECK (${COLUMN(agentTraceEventTable, COLUMNS.outcome)} IN ('succeeded','failed','unknown')),
+${COLUMN(agentTraceEventTable, COLUMNS.sequence)} CHECK (${COLUMN(agentTraceEventTable, COLUMNS.sequence)} > 0),
+${COLUMN(agentTraceEventTable, COLUMNS.attempt)} CHECK (${COLUMN(agentTraceEventTable, COLUMNS.attempt)} > 0),
+${COLUMN(agentTraceEventTable, COLUMNS.stepId)} CHECK (length(${COLUMN(agentTraceEventTable, COLUMNS.stepId)}) > 0),
+${COLUMN(agentTraceEventTable, COLUMNS.tool)} CHECK (${COLUMN(agentTraceEventTable, COLUMNS.tool)} IS NULL OR ${COLUMN(agentTraceEventTable, COLUMNS.stage)} = 'tool_call'),
+${COLUMN(agentTraceEventTable, COLUMNS.errorCode)} CHECK (${COLUMN(agentTraceEventTable, COLUMNS.errorCode)} IS NULL OR ${COLUMN(agentTraceEventTable, COLUMNS.outcome)} = 'failed'),
+${COLUMN(agentTraceEventTable, COLUMNS.durationMs)} CHECK (${COLUMN(agentTraceEventTable, COLUMNS.durationMs)} IS NULL OR ${COLUMN(agentTraceEventTable, COLUMNS.durationMs)} >= 0),
+${COLUMN(agentTraceEventTable, COLUMNS.inputTokens)} CHECK (${COLUMN(agentTraceEventTable, COLUMNS.inputTokens)} IS NULL OR ${COLUMN(agentTraceEventTable, COLUMNS.inputTokens)} >= 0),
+${COLUMN(agentTraceEventTable, COLUMNS.outputTokens)} CHECK (${COLUMN(agentTraceEventTable, COLUMNS.outputTokens)} IS NULL OR ${COLUMN(agentTraceEventTable, COLUMNS.outputTokens)} >= 0),
+${COLUMN(agentTraceEventTable, COLUMNS.modelName)} CHECK (${COLUMN(agentTraceEventTable, COLUMNS.modelName)} IS NULL OR ${COLUMN(agentTraceEventTable, COLUMNS.inputTokens)} IS NOT NULL OR ${COLUMN(agentTraceEventTable, COLUMNS.outputTokens)} IS NOT NULL),
+${COLUMN(agentTraceEventTable, COLUMNS.recordedAt)} CHECK (${COLUMN(agentTraceEventTable, COLUMNS.recordedAt)} IS NOT NULL),
+UNIQUE(${COLUMN(agentTraceEventTable, COLUMNS.runId)}, ${COLUMN(agentTraceEventTable, COLUMNS.sequence)}),
+UNIQUE(${COLUMN(agentTraceEventTable, COLUMNS.runId)}, ${COLUMN(agentTraceEventTable, COLUMNS.stepId)}, ${COLUMN(agentTraceEventTable, COLUMNS.attempt)})`,
   ),
 ].join("\n\n");
 

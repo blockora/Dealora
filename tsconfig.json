@@ -23,6 +23,7 @@
     { "path": "packages/dashboard" },
     { "path": "packages/agent" },
     { "path": "packages/evaluation" },
+    { "path": "packages/trace" },
     { "path": "packages/api" }
   ]
 }

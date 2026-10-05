@@ -53,6 +53,11 @@ import type {
   AgentRegistryStatus,
   AgentEvaluationObservation,
   AgentEvaluationRun,
+  AgentTraceEvent,
+  AgentTraceRun,
+  AgentTraceRunStatus,
+  AgentTraceStage,
+  AgentTraceOutcome,
   NextBestAction,
   NextBestActionKind,
   NextBestActionRiskLevel,
@@ -239,6 +244,133 @@ const MAX_NOTE_LENGTH = 1_000;
 const MAX_RUN_NUMBER = 1_000_000;
 
 /**
+ * The seven steps of ROADMAP.md §27's chain, duplicated here for the same
+ * reason `AGENT_ID_VALUES` is: storage must not depend on a domain package,
+ * and the drift test in `packages/trace` asserts these equal the domain's
+ * `TRACE_STAGES` so the two cannot diverge without a failure.
+ */
+const AGENT_TRACE_STAGE_VALUES: readonly AgentTraceStage[] = [
+  "agent",
+  "decision",
+  "tool_call",
+  "evidence",
+  "result",
+  "approval",
+  "external_action",
+];
+
+/** The three recorded outcomes, of which `unknown` is the honest one. */
+const AGENT_TRACE_OUTCOME_VALUES: readonly AgentTraceOutcome[] = ["succeeded", "failed", "unknown"];
+
+const AGENT_TRACE_STAGE_SET: ReadonlySet<string> = new Set(AGENT_TRACE_STAGE_VALUES);
+const AGENT_TRACE_OUTCOME_SET: ReadonlySet<string> = new Set(AGENT_TRACE_OUTCOME_VALUES);
+
+/** The eighteen tools `ROADMAP.md` §25's declarations name. */
+const AGENT_TOOL_VALUES: readonly string[] = [
+  "read_business_context",
+  "read_revenue_goal",
+  "read_accounts",
+  "create_account",
+  "request_research",
+  "read_evidence",
+  "write_evidence",
+  "request_qualification",
+  "render_draft",
+  "request_approval",
+  "send_message",
+  "record_inbound_message",
+  "classify_reply",
+  "recommend_meeting",
+  "book_meeting",
+  "read_next_best_action",
+  "read_revenue_graph",
+  "record_cost",
+];
+
+const AGENT_TOOL_SET: ReadonlySet<string> = new Set(AGENT_TOOL_VALUES);
+
+/** Whether a string names one of the eighteen declared tools. */
+function isStoredAgentTool(value: string): boolean {
+  return AGENT_TOOL_SET.has(value);
+}
+
+/** Whether a string names one of the seven trace stages. */
+function isStoredTraceStage(value: string): value is AgentTraceStage {
+  return AGENT_TRACE_STAGE_SET.has(value);
+}
+
+/** Whether a string names one of the three trace outcomes. */
+function isStoredTraceOutcome(value: string): value is AgentTraceOutcome {
+  return AGENT_TRACE_OUTCOME_SET.has(value);
+}
+
+/**
+ * A trace run's status, derived from the outcomes its own events carry.
+ *
+ * This is the storage-layer copy of `ROADMAP.md` §27's critical rule, and it
+ * is deliberately here rather than in the domain: the row this writes is the
+ * one every later read trusts, so the value that lands in it must not depend on
+ * a caller — including the domain service. `packages/trace` holds the same rule
+ * as a pure function and cross-checks the stored status against it on read, so
+ * the two are stated twice on purpose and disagreement is a refusal rather
+ * than a silent preference for whichever ran last.
+ *
+ * Order matters and is the whole rule: a single failure outranks everything,
+ * then an unknown, then a success, and only then a run with no outcome at all —
+ * which is why closing an empty trace can never report success.
+ */
+export function deriveStoredTraceStatus(outcomes: readonly string[]): AgentTraceRunStatus {
+  if (outcomes.length === 0) return "unverified";
+  let hasUnknown = false;
+  let hasSucceeded = false;
+  for (const outcome of outcomes) {
+    if (outcome === "failed") return "failed";
+    if (outcome === "unknown") hasUnknown = true;
+    else if (outcome === "succeeded") hasSucceeded = true;
+  }
+  if (hasUnknown) return "unknown";
+  if (hasSucceeded) return "succeeded";
+  return "unverified";
+}
+
+/** Cap a trace `stepId`, `referenceId` and `detail` so a row stays a fact. */
+const MAX_STEP_LENGTH = 200;
+const MAX_REFERENCE_LENGTH = 200;
+const MAX_TRACE_DETAIL_LENGTH = 1_000;
+const MAX_ERROR_CODE_LENGTH = 120;
+const MAX_MODEL_NAME_LENGTH = 200;
+
+/**
+ * Cap a sequence or attempt so an overflowing allocation refuses rather than
+ * wraps back to `1` and collides with the run's first step.
+ */
+const MAX_TRACE_SEQUENCE = 1_000_000_000;
+
+/**
+ * Read one optional text field, normalising blank to `null`.
+ *
+ * `ok: false` when the value is not an optional string or is over the cap, so
+ * a caller that sends a number where a note belongs is refused rather than
+ * coerced into `"[object Object]"` — a trace that misreports its own content
+ * is worse than one that refuses to accept it.
+ */
+function readOptionalText(
+  value: string | null,
+  max: number,
+): { ok: true; value: string | null } | { ok: false } {
+  if (value === null || value === undefined) return { ok: true, value: null };
+  if (typeof value !== "string") return { ok: false };
+  const trimmed = value.trim();
+  if (trimmed.length > max) return { ok: false };
+  return { ok: true, value: trimmed === "" ? null : trimmed };
+}
+
+/** Whether an optional count is absent, or a whole non-negative number. */
+function isOptionalCount(value: number | null): boolean {
+  return value === null || (Number.isSafeInteger(value) && value >= 0);
+}
+
+/**
  * Phase 2 migration.
  *
  * A store written by Phase 1 has no Business Brain tables and no `market`
@@ -248,7 +380,7 @@ const MAX_RUN_NUMBER = 1_000_000;
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 17;
+export const LATEST_SCHEMA_VERSION = 18;
 
 export interface DbState {
   schemaVersion?: number;
@@ -290,6 +422,8 @@ export interface DbState {
   agentRegistryEvents?: AgentRegistryEvent[];
   agentEvaluationRuns?: AgentEvaluationRun[];
   agentEvaluationObservations?: AgentEvaluationObservation[];
+  agentTraceRuns?: AgentTraceRun[];
+  agentTraceEvents?: AgentTraceEvent[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -336,6 +470,8 @@ export function emptyState(): CompleteDbState {
     agentRegistryEvents: [],
     agentEvaluationRuns: [],
     agentEvaluationObservations: [],
+    agentTraceRuns: [],
+    agentTraceEvents: [],
   };
 }
 
@@ -592,6 +728,24 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.agentEvaluationObservations;
   }
 
+  // Phase 20 adds the execution trace ROADMAP.md §27 requires a production
+  // workflow to expose: one row per traced agent run and one append-only row
+  // per recorded step. Additive like every step before it: a Phase 19 document
+  // gains two empty tables and keeps every evaluation round and judgement it
+  // already had, so an agent promoted to `production` before the upgrade is
+  // still `production` afterwards — with an empty trace history, and therefore
+  // no new capability. Nothing before it is touched, no row is rewritten, and
+  // the upgrade adds no way to *run* an agent: it records what a recorder
+  // reported, and refuses to report a success nobody recorded.
+  if (version >= 18) {
+    state.agentTraceRuns = Array.isArray(input.agentTraceRuns)
+      ? input.agentTraceRuns
+      : base.agentTraceRuns;
+    state.agentTraceEvents = Array.isArray(input.agentTraceEvents)
+      ? input.agentTraceEvents
+      : base.agentTraceEvents;
+  }
+
   return state;
 }
 
@@ -649,6 +803,8 @@ type RowTable =
   | "agentRegistryEvents"
   | "agentEvaluationRuns"
   | "agentEvaluationObservations"
+  | "agentTraceRuns"
+  | "agentTraceEvents"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -679,6 +835,7 @@ const COST_EXECUTION_KINDS: readonly CostExecutionKind[] = [
   "research_run",
   "outbound_send",
   "meeting_booking",
+  "agent_run",
 ];
 /** The currencies this repository accepts — one per workspace, never mixed. */
 const COST_CURRENCIES = ["USD", "EUR", "GBP", "JPY"] as const;
@@ -4441,6 +4598,8 @@ export class Store {
           return this.findById("outboundActions", event.executionId);
         case "meeting_booking":
           return this.findById("meetings", event.executionId);
+        case "agent_run":
+          return this.findById("agentTraceRuns", event.executionId);
       }
     })();
     if (subject === null || subject.workspaceId !== input.workspaceId) {
@@ -4975,6 +5134,375 @@ export class Store {
       ),
     };
   }
+
+  // -------------------------------------------------------------------------
+  // Phase 20 — Agent Trace & Observability (`ROADMAP.md` §27)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Open one traced run for an agent's current declared version.
+   *
+   * The version is copied in by the caller **from the `@dealora/agent`
+   * declaration table**, never from a request body, so a run can only ever be
+   * about a version that exists. That pinning is what keeps a historical trace
+   * readable after the declaration moves on: a later version opens its own run
+   * rather than rewriting what this one meant.
+   *
+   * Two runs for the same agent are two workflow invocations, not a duplicate,
+   * so there is no idempotency key here by design — deduplicating them would
+   * discard a real second execution. Replay protection lives one level down,
+   * on `(run, step, attempt)`, where a repeated *request* is the thing that
+   * must not be counted twice.
+   */
+  createAgentTraceRun(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    agentId: string;
+    version: string;
+  }): Result<AgentTraceRun, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    if (!isStoredAgentId(input.agentId)) {
+      return { ok: false, error: toError("INVALID", "unknown agent id") };
+    }
+    if (!AGENT_VERSION_PATTERN.test(input.version)) {
+      return { ok: false, error: toError("INVALID", "version must be a dotted number") };
+    }
+    const row: AgentTraceRun = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      agentId: input.agentId,
+      version: input.version,
+      // `open` is not a claim about anything: a run that has recorded no
+      // outcome yet claims nothing, which is the honest starting state.
+      status: "open",
+      openedBy: input.userId,
+      openedAt: toDateTime(now()),
+      closedBy: null,
+      closedAt: null,
+    };
+    this.mutate("agentTraceRuns", (rows) => (rows as AgentTraceRun[]).push(row));
+    return { ok: true, value: row };
+  }
+
+  /** One traced run in this workspace, or `null` when it does not exist here. */
+  getAgentTraceRun(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    runId: EntityId;
+  }): Result<AgentTraceRun | null, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("agentTraceRuns").find(
+      (row) => row.id === input.runId && row.workspaceId === input.workspaceId,
+    );
+    return { ok: true, value: found ?? null };
+  }
+
+  /**
+   * Every traced run for one agent, or for the whole workspace when no agent is
+   * named, in the store's insertion order.
+   *
+   * Ordering is the *service's* decision and it publishes by `(agent, sequence
+   * of runs)` — a total order over `(agentId, id)`, because a trace run has no
+   * run number and its id is random.
+   */
+  listAgentTraceRuns(
+    workspaceId: EntityId,
+    userId: EntityId,
+    agentId?: string,
+  ): Result<AgentTraceRun[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    if (agentId !== undefined && !isStoredAgentId(agentId)) {
+      return { ok: false, error: toError("INVALID", "unknown agent id") };
+    }
+    return {
+      ok: true,
+      value: this.rows("agentTraceRuns").filter(
+        (row) =>
+          row.workspaceId === workspaceId && (agentId === undefined || row.agentId === agentId),
+      ),
+    };
+  }
+
+  /**
+   * Close a run, deriving its status from the events it already holds.
+   *
+   * **The caller supplies nothing but the run id.** There is no status argument,
+   * no `succeeded` flag and no completion time to pass, so the only way to
+   * report a successful run is to have actually recorded a `succeeded` outcome
+   * that no `failed` or `unknown` outcome contradicts. Closing an empty trace
+   * lands on `unverified`, which is precisely `ROADMAP.md` §27's critical rule:
+   * a run can never be made to look successful by asking for it.
+   *
+   * Closing is idempotent in the sense that matters — a second close returns
+   * the same row — while the events remain append-only and are never touched.
+   */
+  closeAgentTraceRun(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    runId: EntityId;
+  }): Result<AgentTraceRun, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const run = this.rows("agentTraceRuns").find(
+      (row) => row.id === input.runId && row.workspaceId === input.workspaceId,
+    );
+    if (!run) {
+      return { ok: false, error: toError("NOT_FOUND", "agent trace run not found") };
+    }
+    if (run.status !== "open") {
+      // A closed run is terminal: its status is a derived fact about the events
+      // it holds, and re-deriving it later could silently rewrite what a reader
+      // already saw. The row is returned unchanged instead.
+      return { ok: true, value: run };
+    }
+    const outcomes = this.rows("agentTraceEvents")
+      .filter((row) => row.workspaceId === input.workspaceId && row.runId === run.id)
+      .map((row) => row.outcome);
+    const closed: AgentTraceRun = {
+      ...run,
+      status: deriveStoredTraceStatus(outcomes),
+      closedBy: input.userId,
+      closedAt: toDateTime(now()),
+    };
+    // Replaced in place, because `mutate` ignores what its callback returns and
+    // a `.map()` here would have built a new array the store never keeps.
+    this.mutate("agentTraceRuns", (rows) => {
+      const typed = rows as AgentTraceRun[];
+      typed.splice(
+        typed.findIndex((row) => row.id === closed.id),
+        1,
+        closed,
+      );
+    });
+    return { ok: true, value: closed };
+  }
+
+  /**
+   * Record one step in one traced run.
+   *
+   * Four things are decided here rather than anywhere a caller can reach:
+   *
+   * - **Ownership.** The run must exist in this workspace, so a step cannot be
+   *   filed against another tenant's run or a run that never existed.
+   * - **Terminal state.** A closed run accepts nothing further, so the status a
+   *   reader already saw cannot grow a contradicting step afterwards.
+   * - **`sequence`.** The next integer after the run's highest, which is what
+   *   orders steps that share a millisecond — the reason this phase cannot use
+   *   `recordedAt` as its ordering key the way Phase 18's governance trail can.
+   * - **`attempt`.** One more than the number of steps already recorded for the
+   *   same `stepId`, so `ROADMAP.md` §27's *retries* are a second attempt at one
+   *   step rather than a separate invented concept.
+   *
+   * Replay and retry are told apart by the content, and the difference is the
+   * contract: an **identical resend** of a step's latest attempt returns that
+   * row unchanged, so a retried request cannot append a duplicate, while
+   * **different content** for the same `stepId` becomes the next attempt —
+   * because that is what `ROADMAP.md` §27's *retries* are, and refusing it would
+   * refuse the behaviour §70 asks a trace to show.
+   */
+  createAgentTraceEvent(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    runId: EntityId;
+    stepId: string;
+    stage: string;
+    outcome: string;
+    detail: string | null;
+    tool: string | null;
+    referenceId: string | null;
+    errorCode: string | null;
+    durationMs: number | null;
+    modelProvider: string | null;
+    modelName: string | null;
+    inputTokens: number | null;
+    outputTokens: number | null;
+  }): Result<AgentTraceEvent, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+
+    const stepId = typeof input.stepId === "string" ? input.stepId.trim() : "";
+    if (stepId === "" || stepId.length > MAX_STEP_LENGTH) {
+      return {
+        ok: false,
+        error: toError("INVALID", `stepId must be 1 to ${MAX_STEP_LENGTH} characters`),
+      };
+    }
+    if (!isStoredTraceStage(input.stage)) {
+      return { ok: false, error: toError("INVALID", "unknown trace stage") };
+    }
+    if (!isStoredTraceOutcome(input.outcome)) {
+      return {
+        ok: false,
+        error: toError("INVALID", "outcome must be succeeded, failed or unknown"),
+      };
+    }
+    if (input.tool !== null && !isStoredAgentTool(input.tool)) {
+      return { ok: false, error: toError("INVALID", "unknown agent tool") };
+    }
+    if (input.tool !== null && input.stage !== "tool_call") {
+      return {
+        ok: false,
+        error: toError("INVALID", "only a tool_call step may name a tool"),
+      };
+    }
+
+    const run = this.rows("agentTraceRuns").find(
+      (row) => row.id === input.runId && row.workspaceId === input.workspaceId,
+    );
+    if (!run) {
+      return { ok: false, error: toError("NOT_FOUND", "agent trace run not found") };
+    }
+    if (run.status !== "open") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this run is already closed as ${run.status}`),
+      };
+    }
+
+    const detail = readOptionalText(input.detail, MAX_TRACE_DETAIL_LENGTH);
+    const referenceId = readOptionalText(input.referenceId, MAX_REFERENCE_LENGTH);
+    const errorCode = readOptionalText(input.errorCode, MAX_ERROR_CODE_LENGTH);
+    const modelProvider = readOptionalText(input.modelProvider, MAX_MODEL_NAME_LENGTH);
+    const modelName = readOptionalText(input.modelName, MAX_MODEL_NAME_LENGTH);
+    if (!detail.ok || !referenceId.ok || !errorCode.ok || !modelProvider.ok || !modelName.ok) {
+      return {
+        ok: false,
+        error: toError(
+          "INVALID",
+          `detail, referenceId, errorCode, modelProvider and modelName must be text within their caps`,
+        ),
+      };
+    }
+    if (errorCode.value !== null && input.outcome !== "failed") {
+      // A failure code on a step that did not fail would read, in a trace, as
+      // exactly the sort of mixed signal BLUEPRINT.md §70 exists to prevent.
+      return {
+        ok: false,
+        error: toError("INVALID", "an errorCode may only be recorded on a failed step"),
+      };
+    }
+    if ((input.inputTokens !== null || input.outputTokens !== null) && modelName.value === null) {
+      // Tokens without the model that consumed them cannot be interpreted, so
+      // the shape is refused rather than stored half-populated.
+      return {
+        ok: false,
+        error: toError("INVALID", "token usage must name the model that reported it"),
+      };
+    }
+    if (!isOptionalCount(input.inputTokens) || !isOptionalCount(input.outputTokens)) {
+      return {
+        ok: false,
+        error: toError("INVALID", "token counts must be whole non-negative numbers"),
+      };
+    }
+    if (input.durationMs !== null && !isOptionalCount(input.durationMs)) {
+      return {
+        ok: false,
+        error: toError("INVALID", "durationMs must be a whole non-negative number of milliseconds"),
+      };
+    }
+
+    const existing = this.rows("agentTraceEvents").filter(
+      (row) => row.workspaceId === input.workspaceId && row.runId === run.id,
+    );
+
+    // The attempt number is the number of attempts already on record, plus one.
+    // It is derived from stored rows rather than taken from the request, which
+    // is what makes "this is attempt 2" a fact about the trace instead of a
+    // claim the caller can inflate.
+    const priorAttempts = existing.filter((row) => row.stepId === stepId).length + 1;
+    const latest = existing.find(
+      (row) => row.stepId === stepId && row.attempt === priorAttempts - 1,
+    );
+    // Two cases, and the difference between them is the whole contract:
+    //
+    // - **Identical resend of the latest attempt → the same row.** A retried
+    //   HTTP request adds nothing to the record and must not append a second
+    //   copy of a step that already happened.
+    // - **Different content for the same `stepId` → a new attempt.** That is
+    //   not a correction to be refused; it is `ROADMAP.md` §27's *retries*, and
+    //   `DEALORA_BLUEPRINT.md` §70's chain (tool failure → retry → alternative
+    //   tool → graceful degradation → escalation) is made of exactly these. The
+    //   earlier attempts stay on the record, because a trace whose history can
+    //   be edited is not a trace.
+    if (latest !== undefined) {
+      const identical =
+        latest.stage === input.stage &&
+        latest.outcome === input.outcome &&
+        latest.detail === detail.value &&
+        latest.tool === input.tool &&
+        latest.referenceId === referenceId.value &&
+        latest.errorCode === errorCode.value &&
+        latest.durationMs === input.durationMs &&
+        latest.modelProvider === modelProvider.value &&
+        latest.modelName === modelName.value &&
+        latest.inputTokens === input.inputTokens &&
+        latest.outputTokens === input.outputTokens;
+      if (identical) return { ok: true, value: latest };
+    }
+
+    const highest = existing.reduce((max, row) => (row.sequence > max ? row.sequence : max), 0);
+    const sequence = highest + 1;
+    if (sequence > MAX_TRACE_SEQUENCE) {
+      return { ok: false, error: toError("CONFLICT", "this run has too many recorded steps") };
+    }
+
+    const row: AgentTraceEvent = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      runId: run.id,
+      sequence,
+      stepId,
+      attempt: priorAttempts,
+      stage: input.stage,
+      outcome: input.outcome,
+      detail: detail.value,
+      tool: input.tool,
+      referenceId: referenceId.value,
+      errorCode: errorCode.value,
+      durationMs: input.durationMs,
+      modelProvider: modelProvider.value,
+      modelName: modelName.value,
+      inputTokens: input.inputTokens,
+      outputTokens: input.outputTokens,
+      recordedBy: input.userId,
+      recordedAt: toDateTime(now()),
+    };
+    this.mutate("agentTraceEvents", (rows) => (rows as AgentTraceEvent[]).push(row));
+    return { ok: true, value: row };
+  }
+
+  /**
+   * Every step recorded in one run, in the store's insertion order.
+   *
+   * Ordering is the *service's* decision, and it publishes by `sequence` —
+   * server-derived and unique per run — rather than by `recordedAt`, because
+   * two steps recorded inside the same millisecond are ordinary and a
+   * timestamp-only order would be ambiguous between them.
+   */
+  listAgentTraceEvents(
+    workspaceId: EntityId,
+    userId: EntityId,
+    runId: EntityId,
+  ): Result<AgentTraceEvent[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const run = this.rows("agentTraceRuns").find(
+      (row) => row.id === runId && row.workspaceId === workspaceId,
+    );
+    if (!run) {
+      return { ok: false, error: toError("NOT_FOUND", "agent trace run not found") };
+    }
+    return {
+      ok: true,
+      value: this.rows("agentTraceEvents").filter(
+        (row) => row.workspaceId === workspaceId && row.runId === run.id,
+      ),
+    };
+  }
 }
 
 /** Default single-process store for local runs. */
@@ -5132,6 +5660,13 @@ export const db = {
   listAgentEvaluationRuns: store.listAgentEvaluationRuns.bind(store),
   createAgentEvaluationObservation: store.createAgentEvaluationObservation.bind(store),
   listAgentEvaluationObservations: store.listAgentEvaluationObservations.bind(store),
+
+  createAgentTraceRun: store.createAgentTraceRun.bind(store),
+  getAgentTraceRun: store.getAgentTraceRun.bind(store),
+  listAgentTraceRuns: store.listAgentTraceRuns.bind(store),
+  closeAgentTraceRun: store.closeAgentTraceRun.bind(store),
+  createAgentTraceEvent: store.createAgentTraceEvent.bind(store),
+  listAgentTraceEvents: store.listAgentTraceEvents.bind(store),
 
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),
