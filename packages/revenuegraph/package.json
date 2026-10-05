@@ -1,0 +1,19 @@
+{
+  "name": "@dealora/revenuegraph",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Revenue Graph (Phase 15): derives, from stored revenue-workflow rows, the relationship graph between a company, its people, signals, evidence, opportunity, conversations and meetings.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./types": "./dist/types.js"
+  },
+  "dependencies": {
+    "@dealora/core": "workspace:*",
+    "@dealora/db": "workspace:*"
+  },
+  "devDependencies": {}
+}
