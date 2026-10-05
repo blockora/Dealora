@@ -211,6 +211,23 @@ export type {
 } from "@dealora/agent";
 
 /**
+ * The Agent Evaluation domain's public surface, re-exported so API consumers
+ * can type an evaluation response without depending on the domain package
+ * directly.
+ */
+export type {
+  EvaluationGateDecision,
+  EvaluationMetricResult,
+  EvaluationMetricRule,
+  EvaluationObservationView,
+  EvaluationPolicyView,
+  EvaluationReport,
+  EvaluationRunView,
+  EvaluationStatus,
+  EvaluationVerdict,
+} from "@dealora/evaluation";
+
+/**
  * The Qualification domain's public surface, re-exported so API consumers can
  * type a qualification response without depending on the domain package
  * directly.

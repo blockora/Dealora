@@ -65,6 +65,8 @@ import { createCostService } from "@dealora/cost";
 import { createDashboardService } from "@dealora/dashboard";
 import { createAgentService } from "@dealora/agent";
 import type { AgentService } from "@dealora/agent";
+import { createEvaluationService, createProductionGate } from "@dealora/evaluation";
+import type { EvaluationService } from "@dealora/evaluation";
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
 import type { RevenueGoal } from "@dealora/db";
@@ -271,6 +273,63 @@ function agentService(store: Store) {
 }
 
 /**
+ * Wire the Agent Registry the way `createDefaultHandlers` does: the real store
+ * behind the workspace-scoped lookup, and Phase 19's production gate resolved
+ * from the evaluation boundary. A route test therefore exercises the real gate
+ * over real stored judgements, and cannot pass against a registry that refuses
+ * every promotion regardless of the evidence.
+ */
+function gatedAgentService(store: Store, evaluation: EvaluationService) {
+  return createAgentService(
+    {
+      authorize: store.authorize.bind(store),
+      listAgentRegistry: store.listAgentRegistry.bind(store),
+      getAgentRegistry: store.getAgentRegistry.bind(store),
+      listAgentRegistryEvents: store.listAgentRegistryEvents.bind(store),
+      setAgentStatus: store.setAgentStatus.bind(store),
+    },
+    createProductionGate(evaluation),
+  );
+}
+
+/**
+ * Wire Agent Evaluation the way the production wiring does: the real store
+ * behind the workspace-scoped lookup, and nothing else. A route test therefore
+ * measures real stored judgements through the real thresholds, and cannot pass
+ * against a stand-in that always says the evidence is there.
+ */
+function evaluationService(store: Store) {
+  return createEvaluationService({
+    authorize: store.authorize.bind(store),
+    createAgentEvaluationRun: store.createAgentEvaluationRun.bind(store),
+    getCurrentAgentEvaluationRun: store.getCurrentAgentEvaluationRun.bind(store),
+    listAgentEvaluationRuns: store.listAgentEvaluationRuns.bind(store),
+    createAgentEvaluationObservation: store.createAgentEvaluationObservation.bind(store),
+    listAgentEvaluationObservations: store.listAgentEvaluationObservations.bind(store),
+  });
+}
+
+/**
+ * An evaluation boundary whose every call fails, so a route's internal-error
+ * mapping can be exercised without disturbing the rest of the fixture.
+ */
+function brokenEvaluationService(): EvaluationService {
+  const failure = () =>
+    ({
+      ok: false,
+      error: { code: "UNAVAILABLE", message: "storage is down" },
+    }) as const;
+  return createEvaluationService({
+    authorize: failure,
+    createAgentEvaluationRun: failure,
+    getCurrentAgentEvaluationRun: failure,
+    listAgentEvaluationRuns: failure,
+    createAgentEvaluationObservation: failure,
+    listAgentEvaluationObservations: failure,
+  });
+}
+
+/**
  * Wire the Personalization service the way the production wiring does.
  *
  * The readers are the same narrow ones `createDefaultHandlers` builds: the
@@ -327,6 +386,12 @@ function fixture(options?: {
    * service. Defaults to the real store-backed registry.
    */
   agentOverride?: AgentService;
+  /**
+   * Replaces the evaluation boundary with one whose storage fails, so the
+   * promotion gate's own error path can be exercised. Defaults to the real
+   * store-backed evaluation service.
+   */
+  evaluationOverride?: EvaluationService;
 }): {
   handlers: ReturnType<typeof createHandlers>;
   tokenA: string;
@@ -339,6 +404,11 @@ function fixture(options?: {
 } {
   const store = new Store(emptyState());
   const sessions = new Map<string, string>();
+  // One evaluation boundary, exactly as `createDefaultHandlers` builds it, so
+  // the registry's promotion gate and the evaluation routes read the same
+  // service — and an `evaluationOverride` breaks both at once, as it would in
+  // production.
+  const evaluation = options?.evaluationOverride ?? evaluationService(store);
 
   const userAResult = store.createUser({
     email: "a@example.com",
@@ -428,7 +498,8 @@ function fixture(options?: {
     revenuegraph: revenueGraphService(store),
     cost: costService(store),
     dashboard: dashboardService(store),
-    agent: options?.agentOverride ?? agentService(store),
+    agent: options?.agentOverride ?? gatedAgentService(store, evaluation),
+    evaluation,
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -916,6 +987,7 @@ describe("API Revenue Goal routes", () => {
       cost: costService(store),
       dashboard: dashboardService(store),
       agent: agentService(store),
+      evaluation: evaluationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1257,6 +1329,7 @@ describe("API Revenue Plan routes", () => {
       cost: costService(store),
       dashboard: dashboardService(store),
       agent: agentService(store),
+      evaluation: evaluationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1479,6 +1552,7 @@ describe("API Business Brain routes", () => {
       cost: costService(failingStore),
       dashboard: dashboardService(failingStore),
       agent: agentService(failingStore),
+      evaluation: evaluationService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1826,6 +1900,7 @@ describe("API Account & Contact routes", () => {
       cost: costService(store),
       dashboard: dashboardService(store),
       agent: agentService(store),
+      evaluation: evaluationService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -2140,6 +2215,7 @@ describe("API Research routes", () => {
       cost: costService(store),
       dashboard: dashboardService(store),
       agent: agentService(store),
+      evaluation: evaluationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -2198,6 +2274,7 @@ describe("API Research routes", () => {
       cost: costService(store),
       dashboard: dashboardService(store),
       agent: agentService(store),
+      evaluation: evaluationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3344,6 +3421,7 @@ describe("API Qualification routes", () => {
       cost: costService(store),
       dashboard: dashboardService(store),
       agent: agentService(store),
+      evaluation: evaluationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -3650,6 +3728,7 @@ describe("API Next Best Action routes", () => {
       cost: costService(failingStore),
       dashboard: dashboardService(failingStore),
       agent: agentService(failingStore),
+      evaluation: evaluationService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -5448,5 +5527,557 @@ describe("API Agent System routes", () => {
     if (!isOk(rows) || !isOk(events)) throw new Error("read failed");
     expect(rows.value).toEqual([]);
     expect(events.value).toEqual([]);
+  });
+});
+
+describe("Phase 19 — agent evaluation routes", () => {
+  const agentParams = (workspaceId: string): Record<string, string> => ({ workspaceId });
+  const oneAgent = (workspaceId: string, agentId: string): Record<string, string> => ({
+    workspaceId,
+    agentId,
+  });
+
+  interface AgentRegistryEntry {
+    status: string;
+    usable: boolean;
+    declaration: { agentId: string; version: string };
+  }
+
+  interface MetricResult {
+    metric: string;
+    kind: string;
+    threshold: number;
+    minimumSample: number;
+    sampleSize: number;
+    measured: number | null;
+    status: string;
+    reason: string;
+    counts: { met: number; unmet: number; unobserved: number } | null;
+    cost: { totalMinor: number; worstMinor: number; overSpend: boolean } | null;
+    latency: { worstMs: number; ceilingMs: number } | null;
+  }
+
+  interface ReportData {
+    ruleVersion: string;
+    agentId: string;
+    agentVersion: string;
+    run: { runNumber: number; observationCount: number } | null;
+    metrics: MetricResult[];
+    status: string;
+    gate: { satisfied: boolean; reason: string };
+  }
+
+  interface TrailData {
+    runs: { runNumber: number; live: boolean; observationCount: number; agentVersion: string }[];
+    observations: { metric: string; subjectId: string; verdict: string | null }[];
+  }
+
+  /** Open a round and record a full, passing evaluation for `analytics`. */
+  async function pass(
+    h: ReturnType<typeof createHandlers>,
+    token: string,
+    workspaceId: string,
+    verdicts: readonly ("met" | "unmet" | "unobserved")[] = ["met", "met", "met", "met", "met"],
+  ) {
+    await dataOf(
+      h.openAgentEvaluationRunHandler(
+        request({ token, params: oneAgent(workspaceId, "analytics") }),
+      ),
+    );
+    for (const metric of ["task_success", "accuracy", "relevance"]) {
+      for (const [index, verdict] of verdicts.entries()) {
+        await dataOf(
+          h.recordAgentEvaluationHandler(
+            request({
+              token,
+              params: oneAgent(workspaceId, "analytics"),
+              body: { metric, subjectId: `${metric}-${index}`, verdict },
+            }),
+          ),
+        );
+      }
+    }
+    await dataOf(
+      h.recordAgentEvaluationHandler(
+        request({
+          token,
+          params: oneAgent(workspaceId, "analytics"),
+          body: { metric: "cost", subjectId: "run-cost", amountMinor: 500 },
+        }),
+      ),
+    );
+    await dataOf(
+      h.recordAgentEvaluationHandler(
+        request({
+          token,
+          params: oneAgent(workspaceId, "analytics"),
+          body: { metric: "latency", subjectId: "run-latency", durationMs: 1_200 },
+        }),
+      ),
+    );
+  }
+
+  async function reportOf(
+    h: ReturnType<typeof createHandlers>,
+    token: string,
+    workspaceId: string,
+    agentId = "analytics",
+  ) {
+    return (await dataOf(
+      h.getAgentEvaluationHandler(request({ token, params: oneAgent(workspaceId, agentId) })),
+    )) as ReportData;
+  }
+
+  it("publishes the bar before anything is measured", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const policy = (await dataOf(
+      handlers.getAgentEvaluationPolicyHandler(
+        request({ token: tokenA, params: agentParams(workspaceA) }),
+      ),
+    )) as {
+      ruleVersion: string;
+      metrics: { metric: string; threshold: number; minimumSample: number; rationale: string }[];
+      verdicts: string[];
+      measuredMetrics: { metric: string; unit: string }[];
+      gateRule: string;
+      neverDoes: string[];
+    };
+    expect(policy.ruleVersion).toBe("evaluation-1.0.0");
+    expect(policy.metrics).toHaveLength(13);
+    expect(policy.metrics.map((metric) => metric.metric).sort()).toEqual(
+      [
+        "accuracy",
+        "business_outcome",
+        "cost",
+        "failure_rate",
+        "hallucination_rate",
+        "human_override_rate",
+        "latency",
+        "personalization_quality",
+        "qualification_accuracy",
+        "relevance",
+        "response_classification_accuracy",
+        "task_success",
+        "tool_call_correctness",
+      ].sort(),
+    );
+    expect(policy.verdicts).toEqual(["met", "unmet", "unobserved"]);
+    expect(policy.measuredMetrics).toEqual([
+      { metric: "cost", unit: "minor_units" },
+      { metric: "latency", unit: "milliseconds" },
+    ]);
+    expect(policy.gateRule).toContain("production agents require evaluation evidence");
+    expect(policy.neverDoes.join(" ")).toContain("Never executes an agent");
+    expect(policy.neverDoes.join(" ")).toContain("Never converts absent evidence");
+  });
+
+  it("reports every declared metric as unmeasured when nothing is recorded", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const report = await reportOf(handlers, tokenA, workspaceA);
+    expect(report.run).toBeNull();
+    expect(report.agentVersion).toBe("1.0.0");
+    expect(report.metrics.map((metric) => metric.metric)).toEqual([
+      "task_success",
+      "accuracy",
+      "relevance",
+      "cost",
+      "latency",
+    ]);
+    expect(report.metrics.every((metric) => metric.status === "insufficient_evidence")).toBe(true);
+    expect(report.metrics.every((metric) => metric.measured === null)).toBe(true);
+    expect(report.status).toBe("insufficient_evidence");
+    expect(report.gate.satisfied).toBe(false);
+  });
+
+  it("measures a complete evaluation and opens the gate", async () => {
+    const { handlers, tokenA, workspaceA, store } = fixture();
+    await pass(handlers, tokenA, workspaceA);
+    const report = await reportOf(handlers, tokenA, workspaceA);
+    expect(report.status).toBe("met");
+    expect(report.gate.satisfied).toBe(true);
+    expect(report.metrics.map((metric) => metric.measured)).toEqual([
+      10_000, 10_000, 10_000, 500, 1_200,
+    ]);
+    expect(report.metrics[3]?.cost?.totalMinor).toBe(500);
+    expect(report.metrics[4]?.latency?.worstMs).toBe(1_200);
+    expect(report.run?.observationCount).toBe(17);
+    // The rows really landed in the store, attributed to the session.
+    expect(store.db.agentEvaluationObservations).toHaveLength(17);
+    expect(store.db.agentEvaluationRuns).toHaveLength(1);
+    expect(store.db.agentEvaluationRuns[0]?.createdBy).toBeDefined();
+  });
+
+  it("ignores every field a client forges about the outcome", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await pass(handlers, tokenA, workspaceA);
+    const clean = JSON.stringify(await reportOf(handlers, tokenA, workspaceA));
+    const forged = JSON.stringify(
+      await dataOf(
+        handlers.getAgentEvaluationHandler(
+          request({
+            token: tokenA,
+            params: oneAgent(workspaceA, "analytics"),
+            body: {
+              status: "production",
+              agentVersion: "9.9.9",
+              gate: { satisfied: true },
+              status_: "met",
+              workspaceId: "ws-somewhere-else",
+              createdBy: "attacker",
+              recordedAt: "1999-01-01T00:00:00.000Z",
+            },
+          }),
+        ),
+      ),
+    );
+    expect(forged).toBe(clean);
+
+    // And a forged body on the write route cannot mark an agent evaluated.
+    await dataOf(
+      handlers.recordAgentEvaluationHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "analytics"),
+          body: {
+            metric: "task_success",
+            subjectId: "forged",
+            verdict: "met",
+            agentVersion: "9.9.9",
+            rate: 10_000,
+            passed: true,
+            status: "production",
+            createdBy: "attacker",
+            createdAt: "1999-01-01T00:00:00.000Z",
+          },
+        }),
+      ),
+    );
+    const after = await reportOf(handlers, tokenA, workspaceA);
+    // The judgement landed; none of the forged fields did.
+    expect(after.metrics[0]?.sampleSize).toBe(6);
+    expect(after.agentVersion).toBe("1.0.0");
+  });
+
+  it("refuses a body that tries to be an evaluation outcome", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await dataOf(
+      handlers.openAgentEvaluationRunHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "analytics") }),
+      ),
+    );
+    const forged = await errorOf(
+      handlers.recordAgentEvaluationHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "analytics"),
+          body: { metric: "task_success", subjectId: "s-1", verdict: "passed" },
+        }),
+      ),
+    );
+    expect(forged.code).toBe("VALIDATION_ERROR");
+    expect(forged.details?.[0]?.field).toBe("verdict");
+
+    const unknownMetric = await errorOf(
+      handlers.recordAgentEvaluationHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "analytics"),
+          body: { metric: "vibes", subjectId: "s-1", verdict: "met" },
+        }),
+      ),
+    );
+    expect(unknownMetric.code).toBe("VALIDATION_ERROR");
+
+    // A cost judgement with no measurement, and a measured metric with a verdict.
+    const noQuantity = await errorOf(
+      handlers.recordAgentEvaluationHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "analytics"),
+          body: { metric: "cost", subjectId: "s-2" },
+        }),
+      ),
+    );
+    expect(noQuantity.code).toBe("VALIDATION_ERROR");
+    expect(noQuantity.details?.[0]?.field).toBe("amountMinor");
+
+    const bothShapes = await errorOf(
+      handlers.recordAgentEvaluationHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "analytics"),
+          body: { metric: "latency", subjectId: "s-3", durationMs: 10, verdict: "met" },
+        }),
+      ),
+    );
+    expect(bothShapes.code).toBe("VALIDATION_ERROR");
+    expect(bothShapes.message).toContain("measured, not judged");
+  });
+
+  it("replays an identical judgement and conflicts with a restated one", async () => {
+    const { handlers, tokenA, workspaceA, store } = fixture();
+    await dataOf(
+      handlers.openAgentEvaluationRunHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "analytics") }),
+      ),
+    );
+    const body = {
+      token: tokenA,
+      params: oneAgent(workspaceA, "analytics"),
+      body: { metric: "task_success", subjectId: "s-1", verdict: "met" },
+    };
+    const first = (await dataOf(handlers.recordAgentEvaluationHandler(request(body)))) as {
+      observation: { id: string };
+    };
+    const replay = (await dataOf(handlers.recordAgentEvaluationHandler(request(body)))) as {
+      observation: { id: string };
+    };
+    expect(replay.observation.id).toBe(first.observation.id);
+    expect(store.db.agentEvaluationObservations).toHaveLength(1);
+
+    const restated = await errorOf(
+      handlers.recordAgentEvaluationHandler(
+        request({
+          ...body,
+          body: { metric: "task_success", subjectId: "s-1", verdict: "unmet" },
+        }),
+      ),
+    );
+    expect(restated.code).toBe("CONFLICT");
+    expect(store.db.agentEvaluationObservations).toHaveLength(1);
+  });
+
+  it("supersedes an earlier round rather than accumulating it", async () => {
+    const { handlers, tokenA, workspaceA, store } = fixture();
+    await pass(handlers, tokenA, workspaceA);
+    expect((await reportOf(handlers, tokenA, workspaceA)).gate.satisfied).toBe(true);
+
+    await dataOf(
+      handlers.openAgentEvaluationRunHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "analytics") }),
+      ),
+    );
+    const after = await reportOf(handlers, tokenA, workspaceA);
+    expect(after.run?.runNumber).toBe(2);
+    expect(after.status).toBe("insufficient_evidence");
+    expect(after.gate.satisfied).toBe(false);
+    // Nothing was edited or deleted; the first round's rows are all still there.
+    expect(store.db.agentEvaluationObservations).toHaveLength(17);
+
+    const trail = (await dataOf(
+      handlers.listAgentEvaluationTrailHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "analytics") }),
+      ),
+    )) as TrailData;
+    expect(trail.runs.map((run) => run.runNumber)).toEqual([2, 1]);
+    expect(trail.runs.map((run) => run.live)).toEqual([true, false]);
+    expect(trail.runs[1]?.observationCount).toBe(17);
+  });
+
+  it("gates production on the stored evidence and nothing else", async () => {
+    const { handlers, tokenA, workspaceA, store } = fixture();
+    for (const status of ["testing", "approved"]) {
+      await dataOf(
+        handlers.changeAgentStatusHandler(
+          request({ token: tokenA, params: oneAgent(workspaceA, "analytics"), body: { status } }),
+        ),
+      );
+    }
+
+    // No evidence: refused, and nothing is written.
+    const refused = await errorOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "analytics"),
+          body: { status: "production" },
+        }),
+      ),
+    );
+    expect(refused.code).toBe("VALIDATION_ERROR");
+    expect(refused.message).toContain("evaluation evidence");
+    expect(refused.details?.[0]?.message).toContain("Phase 19");
+    expect(store.db.agentRegistry).toHaveLength(1);
+    expect(store.db.agentRegistry[0]?.status).toBe("approved");
+
+    // Failing evidence: still refused.
+    await pass(handlers, tokenA, workspaceA, ["met", "met", "met", "met", "unmet"]);
+    const failing = await errorOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "analytics"),
+          body: { status: "production" },
+        }),
+      ),
+    );
+    expect(failing.code).toBe("VALIDATION_ERROR");
+    expect(failing.message).toContain("accuracy unmet");
+
+    // Complete, passing evidence: the transition is permitted — and grants a
+    // governance state and no capability.
+    await pass(handlers, tokenA, workspaceA);
+    const promoted = (await dataOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "analytics"),
+          body: { status: "production" },
+        }),
+      ),
+    )) as { agent: AgentRegistryEntry };
+    expect(promoted.agent.status).toBe("production");
+    expect(promoted.agent.usable).toBe(false);
+  });
+
+  it("isolates evidence by tenant", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB } = fixture();
+    await pass(handlers, tokenA, workspaceA);
+
+    const stolenRead = await errorOf(
+      handlers.getAgentEvaluationHandler(
+        request({ token: tokenB, params: oneAgent(workspaceA, "analytics") }),
+      ),
+    );
+    expect(stolenRead.code).toBe("UNAUTHORIZED");
+
+    const stolenWrite = await errorOf(
+      handlers.recordAgentEvaluationHandler(
+        request({
+          token: tokenB,
+          params: oneAgent(workspaceA, "analytics"),
+          body: { metric: "task_success", subjectId: "s-1", verdict: "met" },
+        }),
+      ),
+    );
+    expect(stolenWrite.code).toBe("UNAUTHORIZED");
+
+    const stolenTrail = await errorOf(
+      handlers.listAgentEvaluationTrailHandler(
+        request({ token: tokenB, params: oneAgent(workspaceA, "analytics") }),
+      ),
+    );
+    expect(stolenTrail.code).toBe("UNAUTHORIZED");
+
+    // B's own workspace sees a complete, empty evaluation.
+    const theirs = await reportOf(handlers, tokenB, workspaceB);
+    expect(theirs.run).toBeNull();
+    expect(theirs.gate.satisfied).toBe(false);
+
+    const anonymous = await errorOf(
+      handlers.getAgentEvaluationHandler(request({ params: oneAgent(workspaceA, "analytics") })),
+    );
+    expect(anonymous.code).toBe("UNAUTHENTICATED");
+
+    const missingWorkspace = await errorOf(
+      handlers.getAgentEvaluationHandler(
+        request({ token: tokenA, params: oneAgent("ws-nope", "analytics") }),
+      ),
+    );
+    expect(missingWorkspace.code).toBe("NOT_FOUND");
+  });
+
+  it("refuses a promotion to an agent whose evidence belongs to another tenant", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB } = fixture();
+    await pass(handlers, tokenA, workspaceA);
+    for (const status of ["testing", "approved"]) {
+      await dataOf(
+        handlers.changeAgentStatusHandler(
+          request({ token: tokenB, params: oneAgent(workspaceB, "analytics"), body: { status } }),
+        ),
+      );
+    }
+    // B is approved but has no evidence of its own, even though A's is perfect.
+    const refused = await errorOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenB,
+          params: oneAgent(workspaceB, "analytics"),
+          body: { status: "production" },
+        }),
+      ),
+    );
+    expect(refused.code).toBe("VALIDATION_ERROR");
+    expect(refused.message).toContain("evaluation evidence");
+  });
+
+  it("requires a workspace route parameter and a known agent", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const noWorkspace = await errorOf(
+      handlers.getAgentEvaluationHandler(request({ token: tokenA })),
+    );
+    expect(noWorkspace.code).toBe("VALIDATION_ERROR");
+    expect(noWorkspace.message).toContain("workspaceId");
+
+    const unknownAgent = await errorOf(
+      handlers.getAgentEvaluationHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "sales_agent") }),
+      ),
+    );
+    expect(unknownAgent.code).toBe("VALIDATION_ERROR");
+    expect(unknownAgent.details?.[0]?.field).toBe("agentId");
+  });
+
+  it("fails closed when the evidence cannot be read", async () => {
+    // One broken evaluation boundary breaks the routes *and* the gate the
+    // registry consults, because production wiring builds both from it.
+    const fx = fixture({ evaluationOverride: brokenEvaluationService() });
+    for (const status of ["testing", "approved"]) {
+      await dataOf(
+        fx.handlers.changeAgentStatusHandler(
+          request({
+            token: fx.tokenA,
+            params: oneAgent(fx.workspaceA, "analytics"),
+            body: { status },
+          }),
+        ),
+      );
+    }
+    const refused = await errorOf(
+      fx.handlers.changeAgentStatusHandler(
+        request({
+          token: fx.tokenA,
+          params: oneAgent(fx.workspaceA, "analytics"),
+          body: { status: "production" },
+        }),
+      ),
+    );
+    // An outage in the evidence store must deny the promotion.
+    expect(refused.code).toBe("VALIDATION_ERROR");
+    expect(refused.message).toContain("could not be read");
+    expect(fx.store.db.agentRegistry[0]?.status).toBe("approved");
+  });
+
+  it("maps an evaluation storage failure onto the transport vocabulary", async () => {
+    const broken = fixture({ evaluationOverride: brokenEvaluationService() });
+    const error = await errorOf(
+      broken.handlers.getAgentEvaluationHandler(
+        request({ token: broken.tokenA, params: oneAgent(broken.workspaceA, "analytics") }),
+      ),
+    );
+    expect(error.code).toBe("SERVER_ERROR");
+    expect(error.message).toBe("unexpected failure");
+  });
+
+  it("is byte-identical on every read and records no trace of a run", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await pass(handlers, tokenA, workspaceA);
+    const first = JSON.stringify(await reportOf(handlers, tokenA, workspaceA));
+    const second = JSON.stringify(await reportOf(handlers, tokenA, workspaceA));
+    expect(first).toBe(second);
+
+    const trail = (await dataOf(
+      handlers.listAgentEvaluationTrailHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "analytics") }),
+      ),
+    )) as TrailData;
+    const printed = JSON.stringify(trail);
+    // ROADMAP.md §27 (Phase 20) owns run traces; this phase writes none.
+    expect(printed.toLowerCase()).not.toContain("trace");
+    expect(printed.toLowerCase()).not.toContain("token");
+    expect(printed.toLowerCase()).not.toContain("tool_call");
+    expect(
+      trail.observations.every((row) => row.verdict !== null || row.metric !== "task_success"),
+    ).toBe(true);
   });
 });

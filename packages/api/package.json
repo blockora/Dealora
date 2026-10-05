@@ -23,6 +23,7 @@
     "@dealora/dashboard": "workspace:*",
     "@dealora/db": "workspace:*",
     "@dealora/evidence": "workspace:*",
+    "@dealora/evaluation": "workspace:*",
     "@dealora/goal": "workspace:*",
     "@dealora/meeting": "workspace:*",
     "@dealora/nextaction": "workspace:*",

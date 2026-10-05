@@ -66,6 +66,9 @@
     },
     {
       "path": "../agent"
+    },
+    {
+      "path": "../evaluation"
     }
   ]
 }

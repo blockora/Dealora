@@ -32,6 +32,7 @@ import type { RevenueGraphError, RevenueGraphService } from "@dealora/revenuegra
 import type { CostError, CostService } from "@dealora/cost";
 import type { DashboardError, DashboardService } from "@dealora/dashboard";
 import type { AgentError, AgentService } from "@dealora/agent";
+import type { EvaluationError, EvaluationService } from "@dealora/evaluation";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -551,6 +552,37 @@ function fromAgentError(error: AgentError): ApiError {
   return mapped;
 }
 
+/**
+ * Map an evaluation domain error onto the transport vocabulary.
+ *
+ * Exhaustive, like every other mapper here. `UNAVAILABLE` — the only code that
+ * means an internal condition — becomes a generic `SERVER_ERROR`, so storage
+ * internals never reach a client. `CONFLICT` keeps its meaning: a replayed
+ * judgement of the same subject with a different value, or a judgement offered
+ * before a round exists, is a conflict with recorded state rather than a
+ * malformed request.
+ */
+function fromEvaluationError(error: EvaluationError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+        return "VALIDATION_ERROR";
+      case "CONFLICT":
+        return "CONFLICT";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = [...error.details];
+  return mapped;
+}
+
 export interface HandlerDeps {
   identity: IdentityService;
   brain: BusinessBrainService;
@@ -572,6 +604,7 @@ export interface HandlerDeps {
   cost: CostService;
   dashboard: DashboardService;
   agent: AgentService;
+  evaluation: EvaluationService;
   resolveSession: SessionResolver;
 }
 
@@ -3134,6 +3167,122 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok(result.value) };
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 19 — Agent Evaluation
+  // -------------------------------------------------------------------------
+
+  /**
+   * Open a new evaluation round for one agent.
+   *
+   * A round pins the agent's **declared version**, which the service reads from
+   * the declaration table — the request contributes nothing at all, so there is
+   * no version to forge. Opening a round is how a changed opinion is expressed:
+   * judgements are never edited, so the previous round's evidence stays exactly
+   * as recorded and simply stops being the live round.
+   */
+  const openAgentEvaluationRunHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const agentId = param(req, "agentId");
+      if (isApiError(agentId)) return { ok: false, error: agentId };
+
+      const result = deps.evaluation.openRun(workspaceId, actor.userId, agentId);
+      if (!result.ok) return { ok: false, error: fromEvaluationError(result.error) };
+      return { ok: true, value: ok({ run: result.value }) };
+    });
+
+  /**
+   * Record one judged observation.
+   *
+   * This is the only write in the phase, and its body is deliberately small: a
+   * metric, a subject, and then either a `verdict` **or** a measured
+   * `amountMinor` / `durationMs`. Nothing in the body can name the workspace,
+   * the actor, the timestamp, the agent version, a rate, a total, a threshold,
+   * a pass or an agent status — every one of those is derived server-side from
+   * stored rows, so there is no request that can declare an agent evaluated.
+   *
+   * A replay of the same subject, metric and judgement returns the original
+   * record rather than adding a second vote; a different judgement for a
+   * subject already judged in this round is a `CONFLICT`, because judgements
+   * are append-only and a changed mind opens a new round.
+   */
+  const recordAgentEvaluationHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const agentId = param(req, "agentId");
+      if (isApiError(agentId)) return { ok: false, error: agentId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.evaluation.recordObservation(workspaceId, actor.userId, agentId, {
+        metric: typeof body.metric === "string" ? body.metric : "",
+        subjectId: typeof body.subjectId === "string" ? body.subjectId : "",
+        ...(typeof body.verdict === "string" ? { verdict: body.verdict } : {}),
+        ...(typeof body.amountMinor === "number" ? { amountMinor: body.amountMinor } : {}),
+        ...(typeof body.durationMs === "number" ? { durationMs: body.durationMs } : {}),
+        ...(typeof body.note === "string" ? { note: body.note } : {}),
+      });
+      if (!result.ok) return { ok: false, error: fromEvaluationError(result.error) };
+      return { ok: true, value: ok({ observation: result.value }) };
+    });
+
+  /**
+   * The whole evaluation for one agent version, derived on read.
+   *
+   * Read-only. An agent nobody has measured still returns every metric it
+   * declares, each as `insufficient_evidence` with no value — never an empty
+   * list and never a zero, because "not measured" and "measured as zero" are
+   * different claims.
+   */
+  const getAgentEvaluationHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const agentId = param(req, "agentId");
+      if (isApiError(agentId)) return { ok: false, error: agentId };
+
+      const result = deps.evaluation.report(workspaceId, actor.userId, agentId);
+      if (!result.ok) return { ok: false, error: fromEvaluationError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * The provenance trail: every round for this agent, and the judgements in the
+   * live one — who judged what, about which agent version, and when.
+   *
+   * This is a record of human judgements about work already done. It is not a
+   * trace of an agent run: `ROADMAP.md` §27 (Phase 20) owns execution traces,
+   * token usage and tool-call trails, and nothing here carries any of them.
+   */
+  const listAgentEvaluationTrailHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const agentId = param(req, "agentId");
+      if (isApiError(agentId)) return { ok: false, error: agentId };
+
+      const result = deps.evaluation.trail(workspaceId, actor.userId, agentId);
+      if (!result.ok) return { ok: false, error: fromEvaluationError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * The published bar: ROADMAP.md §26's thirteen metrics with their thresholds,
+   * minimum samples and rationale, the three judgements, and the promotion
+   * gate. Readable before a workspace has measured anything.
+   */
+  const getAgentEvaluationPolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.evaluation.policy(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromEvaluationError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -3296,6 +3445,11 @@ export function createHandlers(deps: HandlerDeps) {
     changeAgentStatusHandler,
     listAgentEventsHandler,
     getAgentPolicyHandler,
+    openAgentEvaluationRunHandler,
+    recordAgentEvaluationHandler,
+    getAgentEvaluationHandler,
+    listAgentEvaluationTrailHandler,
+    getAgentEvaluationPolicyHandler,
   };
 }
 

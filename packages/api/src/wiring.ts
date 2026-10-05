@@ -59,6 +59,8 @@ import { createDashboardService } from "@dealora/dashboard";
 import type { DashboardLookup, DashboardReaders } from "@dealora/dashboard";
 import { createAgentService } from "@dealora/agent";
 import type { AgentRegistryLookup } from "@dealora/agent";
+import { createEvaluationService, createProductionGate } from "@dealora/evaluation";
+import type { EvaluationLookup } from "@dealora/evaluation";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -186,6 +188,35 @@ export function createDefaultHandlers(options?: {
     listAgentRegistryEvents: store.listAgentRegistryEvents.bind(store),
     setAgentStatus: store.setAgentStatus.bind(store),
   };
+
+  /**
+   * The evaluation boundary: the store's own workspace-scoped evaluation reads
+   * and writes, passed through unchanged. It is given no model, no provider, no
+   * runner and no network — a judgement describes work a person did elsewhere,
+   * and recording one performs nothing.
+   */
+  const evaluationLookup: EvaluationLookup = {
+    authorize: store.authorize.bind(store),
+    createAgentEvaluationRun: store.createAgentEvaluationRun.bind(store),
+    getCurrentAgentEvaluationRun: store.getCurrentAgentEvaluationRun.bind(store),
+    listAgentEvaluationRuns: store.listAgentEvaluationRuns.bind(store),
+    createAgentEvaluationObservation: store.createAgentEvaluationObservation.bind(store),
+    listAgentEvaluationObservations: store.listAgentEvaluationObservations.bind(store),
+  };
+
+  const evaluation = createEvaluationService(evaluationLookup);
+
+  /**
+   * Phase 19's answer to ROADMAP.md §26's gate, wired into the registry so
+   * `approved → production` is decided from stored judgements rather than
+   * refused outright.
+   *
+   * The resolver is a function, not a boolean, and it is asked fresh with the
+   * caller's own workspace, session and the agent's declared version at the
+   * moment of the transition. A storage failure resolves to `satisfied: false`,
+   * so an outage denies promotion rather than admitting an unmeasured agent.
+   */
+  const productionGate = createProductionGate(evaluation);
 
   const deps: HandlerDeps = {
     identity,
@@ -532,7 +563,13 @@ export function createDefaultHandlers(options?: {
      * records governance events, and it is given nothing with which to
      * execute an agent, call a model, reach a network or send a message.
      */
-    agent: createAgentService(agentLookup),
+    agent: createAgentService(agentLookup, productionGate),
+    /**
+     * The evaluation boundary: it measures the thirteen metrics Phase 18
+     * declared and decides the promotion gate from recorded judgements. It is
+     * given no runner, dispatcher, tool invoker or model client.
+     */
+    evaluation,
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());
