@@ -9,11 +9,12 @@ import { StaticResearchProvider } from "@dealora/research";
 import type { ResearchProvider } from "@dealora/research";
 import { SandboxEmailProvider } from "@dealora/outbound";
 import { SandboxCalendarProvider } from "@dealora/meeting";
+import { declarationFor } from "@dealora/agent";
 
 /**
- * Phases 9–18 integration — one document, one decision, one effect, one response,
+ * Phases 9–19 integration — one document, one decision, one effect, one response,
  * one booking, one recommendation, one graph, one cost, one dashboard, one
- * agent registry.
+ * agent registry, one evaluation.
  *
  * Phase 12 added the ability to *read* what came back, Phase 13 the ability to
  * *book* what was read, Phase 14 the ability to *advise* what happens next,
@@ -59,6 +60,11 @@ import { SandboxCalendarProvider } from "@dealora/meeting";
  *     declared agents, the lifecycle decisions this workspace has made about
  *     them, and — the point of the phase — nothing executed, nothing sent and
  *     no production promotion available until Phase 19 measures (Phase 18).
+ * 15. The agents this journey actually exercised are then **evaluated**: real
+ *     judgements recorded against the journey's own executions, real metrics
+ *     derived from them, and `ROADMAP.md` §26's gate refusing a promotion until
+ *     every declared metric is met — and granting a governance state and no
+ *     capability when it finally is (Phase 19).
  *
  * The research provider is a **declared test double**, the email provider is the
  * **sandbox**, and the calendar is a **sandbox** too: nothing here retrieves,
@@ -482,6 +488,8 @@ function rowCounts(): {
   costs: number;
   registry: number;
   registryEvents: number;
+  evaluationRuns: number;
+  evaluationObservations: number;
 } {
   const db = defaultStore.db;
   return {
@@ -493,6 +501,8 @@ function rowCounts(): {
     costs: db.costEvents?.length ?? 0,
     registry: db.agentRegistry?.length ?? 0,
     registryEvents: db.agentRegistryEvents?.length ?? 0,
+    evaluationRuns: db.agentEvaluationRuns?.length ?? 0,
+    evaluationObservations: db.agentEvaluationObservations?.length ?? 0,
   };
 }
 
@@ -527,7 +537,7 @@ afterAll(() => {
   defaultStore.destroy();
 });
 
-describe("phases 9-18 integration — document, decision, effect, response, booking, next step, graph, cost, dashboard, agents", () => {
+describe("phases 9-19 integration — document, decision, effect, response, booking, next step, graph, cost, dashboard, agents, evaluation", () => {
   it("carries one evidence-backed document through one decision to one delivery and one response", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({
@@ -1732,7 +1742,7 @@ interface IntegrationAgentPolicy {
   neverDoes: string[];
 }
 
-describe("phases 9-18 integration — the agent registry over a real journey", () => {
+describe("phases 9-19 integration — the agent registry over a real journey", () => {
   it("declares the twelve agents and their lifecycle over the state the journey produced, without touching it", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({
@@ -1922,3 +1932,300 @@ class FailingProvider {
     });
   }
 }
+
+describe("phases 9-19 integration — agent evaluation over a real journey", () => {
+  /** The evaluation surface, typed the way the routes return it. */
+  interface IntegrationMetric {
+    metric: string;
+    kind: string;
+    threshold: number;
+    minimumSample: number;
+    sampleSize: number;
+    measured: number | null;
+    status: string;
+    counts: { met: number; unmet: number; unobserved: number } | null;
+    cost: { totalMinor: number; worstMinor: number; maxSpendMinor: number } | null;
+    latency: { worstMs: number; ceilingMs: number } | null;
+  }
+
+  interface IntegrationReport {
+    ruleVersion: string;
+    agentId: string;
+    agentVersion: string;
+    run: { runNumber: number; observationCount: number } | null;
+    metrics: IntegrationMetric[];
+    status: string;
+    gate: { satisfied: boolean; reason: string };
+  }
+
+  interface IntegrationEvaluationTrail {
+    runs: {
+      agentVersion: string;
+      runNumber: number;
+      observationCount: number;
+      live: boolean;
+    }[];
+    observations: { metric: string; subjectId: string; recordedAt: string }[];
+  }
+
+  /**
+   * Judge the executions this journey performed for `agentId`.
+   *
+   * Every subject id names an id the journey actually produced — the sent
+   * action, the draft, the account — so the evidence is about real work rather
+   * than about the words "task 1" and "task 2".
+   */
+  async function judgeJourney(
+    handlers: Handlers,
+    token: string,
+    workspaceId: string,
+    agentId: string,
+    trip: Journey,
+    verdicts: Readonly<Record<string, readonly ("met" | "unmet")[]>>,
+  ): Promise<void> {
+    await dataOf(handlers.openAgentEvaluationRunHandler(request(token, { workspaceId, agentId })));
+    for (const [metric, judgements] of Object.entries(verdicts)) {
+      for (const [index, verdict] of judgements.entries()) {
+        await dataOf(
+          handlers.recordAgentEvaluationHandler(
+            request(
+              token,
+              { workspaceId, agentId },
+              { metric, subjectId: `${metric}:${trip.sentActionId}:${index}`, verdict },
+            ),
+          ),
+        );
+      }
+    }
+    await dataOf(
+      handlers.recordAgentEvaluationHandler(
+        request(
+          token,
+          { workspaceId, agentId },
+          { metric: "cost", subjectId: `send:${trip.sentActionId}`, amountMinor: 250 },
+        ),
+      ),
+    );
+  }
+
+  /** Walk an agent to `approved` through the real route. */
+  async function approveAgent(
+    handlers: Handlers,
+    token: string,
+    workspaceId: string,
+    agentId: string,
+  ): Promise<void> {
+    for (const status of ["testing", "approved"]) {
+      await dataOf(
+        handlers.changeAgentStatusHandler(request(token, { workspaceId, agentId }, { status })),
+      );
+    }
+  }
+
+  it("measures the journey's own executions and refuses promotion until it does", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+    });
+    const { token, workspaceId } = tenant("Nineteen Evaluation");
+    const recipient = unique("p19evaluation") + "@northwind.example";
+    const trip = await journey(handlers, token, workspaceId, recipient);
+
+    // The journey classified a reply, so the conversation agent is the one
+    // being evaluated; and it is walked to `approved` first.
+    await approveAgent(handlers, token, workspaceId, "conversation");
+
+    // Before anything is measured, §26's gate refuses and writes nothing.
+    const beforeEvaluation = rowCounts();
+    const refused = await errorOf(
+      handlers.changeAgentStatusHandler(
+        request(token, { workspaceId, agentId: "conversation" }, { status: "production" }),
+      ),
+    );
+    expect(refused.code).toBe("VALIDATION_ERROR");
+    expect(refused.message).toContain("evaluation evidence");
+    expect(rowCounts()).toEqual(beforeEvaluation);
+
+    // One of five classifications was misread: 4/5 is exactly 8000 basis
+    // points, and `response_classification_accuracy` demands 9000.
+    await judgeJourney(handlers, token, workspaceId, "conversation", trip, {
+      response_classification_accuracy: ["met", "met", "met", "met", "unmet"],
+      accuracy: ["met", "met", "met", "met", "met"],
+      relevance: ["met", "met", "met", "met", "met"],
+      tool_call_correctness: ["met", "met", "met", "met", "met"],
+    });
+
+    const report = (await dataOf(
+      handlers.getAgentEvaluationHandler(request(token, { workspaceId, agentId: "conversation" })),
+    )) as IntegrationReport;
+    expect(report.agentVersion).toBe("1.0.0");
+    expect(report.ruleVersion).toBe("evaluation-1.0.0");
+    // Exactly the metrics this agent's declaration names, in declaration order.
+    expect(report.metrics.map((metric) => metric.metric)).toEqual(
+      declarationFor("conversation")?.evaluationMetrics,
+    );
+    const byMetric = new Map(report.metrics.map((metric) => [metric.metric, metric]));
+    expect(byMetric.get("response_classification_accuracy")?.measured).toBe(8_000);
+    expect(byMetric.get("response_classification_accuracy")?.status).toBe("unmet");
+    expect(byMetric.get("accuracy")?.measured).toBe(10_000);
+    expect(byMetric.get("cost")?.cost?.totalMinor).toBe(250);
+    expect(byMetric.get("cost")?.status).toBe("met");
+
+    // §26's gate still refuses, naming the metric rather than just denying.
+    const stillRefused = await errorOf(
+      handlers.changeAgentStatusHandler(
+        request(token, { workspaceId, agentId: "conversation" }, { status: "production" }),
+      ),
+    );
+    expect(stillRefused.code).toBe("VALIDATION_ERROR");
+    expect(stillRefused.message).toContain("response_classification_accuracy unmet");
+    const events = defaultStore.db.agentRegistryEvents?.filter(
+      (event) => event.workspaceId === workspaceId,
+    );
+    expect(events).toHaveLength(2);
+
+    // A fresh round with every classification read correctly closes the gap.
+    const perfect = ["met", "met", "met", "met", "met"] as const;
+    await judgeJourney(handlers, token, workspaceId, "conversation", trip, {
+      response_classification_accuracy: perfect,
+      accuracy: perfect,
+      relevance: perfect,
+      tool_call_correctness: perfect,
+    });
+
+    const passing = (await dataOf(
+      handlers.getAgentEvaluationHandler(request(token, { workspaceId, agentId: "conversation" })),
+    )) as IntegrationReport;
+    expect(passing.run?.runNumber).toBe(2);
+    expect(passing.status).toBe("met");
+    expect(passing.gate.satisfied).toBe(true);
+
+    // The transition is now permitted — and grants a governance state and no
+    // capability. Nothing became usable, so the send and booking paths above
+    // are exactly as strict as they were before any agent existed.
+    const promoted = (await dataOf(
+      handlers.changeAgentStatusHandler(
+        request(token, { workspaceId, agentId: "conversation" }, { status: "production" }),
+      ),
+    )) as { agent: IntegrationAgent };
+    expect(promoted.agent.status).toBe("production");
+    expect(promoted.agent.usable).toBe(false);
+    const registry = (await dataOf(
+      handlers.getAgentRegistryHandler(request(token, { workspaceId })),
+    )) as IntegrationRegistry;
+    expect(registry.agents.every((entry) => entry.usable === false)).toBe(true);
+
+    // The journey itself is untouched by the evaluation: one outbound action,
+    // still `sent`, never re-sent and never re-rendered.
+    const actions = defaultStore.db.outboundActions?.filter(
+      (action) => action.workspaceId === workspaceId,
+    );
+    expect(actions).toHaveLength(1);
+    expect(actions?.[0]?.status).toBe("sent");
+    const drafts = defaultStore.db.personalizedDrafts?.filter(
+      (draft) => draft.workspaceId === workspaceId,
+    );
+    expect(drafts).toHaveLength(1);
+    expect(drafts?.[0]?.version).toBe(trip.draftVersion);
+
+    // Another agent the journey exercised is measured independently: evidence
+    // is per (workspace, agent, version), never shared.
+    const other = (await dataOf(
+      handlers.getAgentEvaluationHandler(
+        request(token, { workspaceId, agentId: "account_research" }),
+      ),
+    )) as IntegrationReport;
+    expect(other.run).toBeNull();
+    expect(other.status).toBe("insufficient_evidence");
+    expect(other.gate.satisfied).toBe(false);
+  });
+
+  it("keeps the evaluation per tenant and the provenance per round, per tenant", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+    });
+    const a = tenant("Nineteen Tenant A");
+    const b = tenant("Nineteen Tenant B");
+    const trip = await journey(
+      handlers,
+      a.token,
+      a.workspaceId,
+      unique("p19a") + "@northwind.example",
+    );
+    const perfect = ["met", "met", "met", "met", "met"] as const;
+
+    await judgeJourney(handlers, a.token, a.workspaceId, "conversation", trip, {
+      response_classification_accuracy: perfect,
+      accuracy: perfect,
+      relevance: perfect,
+      tool_call_correctness: perfect,
+    });
+
+    const trail = (await dataOf(
+      handlers.listAgentEvaluationTrailHandler(
+        request(a.token, { workspaceId: a.workspaceId, agentId: "conversation" }),
+      ),
+    )) as IntegrationEvaluationTrail;
+    expect(trail.runs).toHaveLength(1);
+    expect(trail.runs[0]?.live).toBe(true);
+    expect(trail.runs[0]?.agentVersion).toBe("1.0.0");
+    expect(trail.runs[0]?.observationCount).toBe(trail.observations.length);
+    expect(trail.observations.length).toBe(21);
+    // Judgements, never a run trace: §27 (Phase 20) still owns those.
+    expect(JSON.stringify(trail).toLowerCase()).not.toContain("trace");
+
+    // B sees a complete, empty evaluation and cannot read A's.
+    const theirs = (await dataOf(
+      handlers.getAgentEvaluationHandler(
+        request(b.token, { workspaceId: b.workspaceId, agentId: "conversation" }),
+      ),
+    )) as IntegrationReport;
+    expect(theirs.run).toBeNull();
+    expect(theirs.status).toBe("insufficient_evidence");
+    expect(
+      (
+        await errorOf(
+          handlers.listAgentEvaluationTrailHandler(
+            request(b.token, { workspaceId: a.workspaceId, agentId: "conversation" }),
+          ),
+        )
+      ).code,
+    ).toBe("UNAUTHORIZED");
+
+    // A second round supersedes rather than edits: the first round's
+    // judgements survive untouched and simply stop being current.
+    const rowsBefore = defaultStore.db.agentEvaluationObservations?.filter(
+      (row) => row.workspaceId === a.workspaceId,
+    ).length;
+    await dataOf(
+      handlers.openAgentEvaluationRunHandler(
+        request(a.token, { workspaceId: a.workspaceId, agentId: "conversation" }),
+      ),
+    );
+    const superseded = (await dataOf(
+      handlers.listAgentEvaluationTrailHandler(
+        request(a.token, { workspaceId: a.workspaceId, agentId: "conversation" }),
+      ),
+    )) as IntegrationEvaluationTrail;
+    expect(superseded.runs.map((run) => run.runNumber)).toEqual([2, 1]);
+    expect(superseded.runs.map((run) => run.live)).toEqual([true, false]);
+    expect(superseded.runs[1]?.observationCount).toBe(21);
+    expect(superseded.observations).toEqual([]);
+    expect(
+      defaultStore.db.agentEvaluationObservations?.filter(
+        (row) => row.workspaceId === a.workspaceId,
+      ).length,
+    ).toBe(rowsBefore);
+    const afterRounds = (await dataOf(
+      handlers.getAgentEvaluationHandler(
+        request(a.token, { workspaceId: a.workspaceId, agentId: "conversation" }),
+      ),
+    )) as IntegrationReport;
+    expect(afterRounds.run?.runNumber).toBe(2);
+    expect(afterRounds.status).toBe("insufficient_evidence");
+    expect(afterRounds.gate.satisfied).toBe(false);
+  });
+});
