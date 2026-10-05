@@ -79,11 +79,21 @@ export const COST_BASES: readonly CostBasisDefinition[] = [
   },
 ];
 
-/** The execution kinds this repository can actually perform today. */
+/**
+ * The execution kinds this repository can actually perform today.
+ *
+ * Phase 16 published the first three. Phase 20 adds exactly one — `agent_run` —
+ * because `ROADMAP.md` §27 requires a traced production agent run to report its
+ * cost, and Phase 16's own rule is that cost belongs on its facts rather than in
+ * a second table. The kind is published here rather than in Phase 20 so there is
+ * still one list of what a cost may be attributed to, and so the storage
+ * existence gate resolves it through the same route as the other three.
+ */
 export const COST_EXECUTION_KINDS: readonly CostExecutionKind[] = [
   "research_run",
   "outbound_send",
   "meeting_booking",
+  "agent_run",
 ];
 
 /**

@@ -58,6 +58,12 @@ export interface CostLookup {
   getResearchRequest(id: string, userId: string): StorageResult<{ workspaceId: string }>;
   getOutboundAction(id: string, userId: string): StorageResult<{ workspaceId: string }>;
   getMeeting(id: string, userId: string): StorageResult<{ workspaceId: string }>;
+  /** Phase 20's execution kind: a traced production agent run. */
+  getAgentTraceRun(input: {
+    workspaceId: string;
+    userId: string;
+    runId: string;
+  }): StorageResult<{ workspaceId: string } | null>;
 
   listAccounts(workspaceId: string, userId: string): StorageResult<readonly { id: string }[]>;
 
@@ -96,6 +102,22 @@ export function createCostService(lookup: CostLookup): CostService {
             return lookup.getOutboundAction(executionId, userId);
           case "meeting_booking":
             return lookup.getMeeting(executionId, userId);
+          case "agent_run": {
+            // Phase 20's traced run. A run that does not exist is refused here
+            // with the same NOT_FOUND every other kind returns, so this branch
+            // cannot be used to discover another tenant's run ids.
+            const traced = lookup.getAgentTraceRun({
+              workspaceId,
+              userId,
+              runId: executionId,
+            });
+            if (!traced.ok)
+              return { ok: false, error: { code: "NOT_FOUND", message: "execution not found" } };
+            if (traced.value === null) {
+              return { ok: false, error: { code: "NOT_FOUND", message: "execution not found" } };
+            }
+            return { ok: true, value: traced.value };
+          }
           default:
             return { ok: false, error: { code: "NOT_FOUND", message: "execution not found" } };
         }
