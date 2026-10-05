@@ -55,12 +55,15 @@ import {
   createRevenueGraphService,
 } from "@dealora/revenuegraph";
 import { createCostService } from "@dealora/cost";
+import type { CostLookup } from "@dealora/cost";
 import { createDashboardService } from "@dealora/dashboard";
 import type { DashboardLookup, DashboardReaders } from "@dealora/dashboard";
 import { createAgentService } from "@dealora/agent";
 import type { AgentRegistryLookup } from "@dealora/agent";
 import { createEvaluationService, createProductionGate } from "@dealora/evaluation";
 import type { EvaluationLookup } from "@dealora/evaluation";
+import { createTraceService } from "@dealora/trace";
+import type { TraceLookup } from "@dealora/trace";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -137,7 +140,28 @@ export function createDefaultHandlers(options?: {
    * own fields and nothing else, so a client cannot name who recorded a
    * cost, when, or what the total should be.
    */
-  const cost = createCostService(store as never);
+  const costLookup: CostLookup = {
+    authorize: store.authorize.bind(store),
+    createCostEvent: store.createCostEvent.bind(store),
+    getCostEvent: store.getCostEvent.bind(store),
+    listCostEvents: store.listCostEvents.bind(store),
+    getResearchRequest: store.getResearchRequest.bind(store),
+    getOutboundAction: store.getOutboundAction.bind(store),
+    getMeeting: store.getMeeting.bind(store),
+    /**
+     * Phase 20's `agent_run` execution kind, resolved through the store's own
+     * workspace-scoped read. The gate in `@dealora/cost` compares the returned
+     * run's workspace against the requesting one, so a cost can never be filed
+     * against another tenant's traced run — and the store here filters by the
+     * same pair a second time.
+     */
+    getAgentTraceRun: (input) => store.getAgentTraceRun(input),
+    listAccounts: store.listAccounts.bind(store),
+    listQualifications: store.listQualifications.bind(store),
+    listMeetings: store.listMeetings.bind(store),
+  };
+
+  const cost = createCostService(costLookup);
 
   /**
    * The dashboard's row lookup: every method is the store's own workspace-
@@ -217,6 +241,44 @@ export function createDefaultHandlers(options?: {
    * so an outage denies promotion rather than admitting an unmeasured agent.
    */
   const productionGate = createProductionGate(evaluation);
+
+  /**
+   * The trace boundary: it appends the steps a recorder reports and derives a
+   * run's outcome from them.
+   *
+   * Two of its lookups reach into other phases and both are read-only:
+   * `listAgentRunCostFacts` returns Phase 16's own immutable `cost_events` rows
+   * under the `agent_run` execution kind, so the trace totals cost with the Cost
+   * Engine's published derivation instead of a second arithmetic; and
+   * `getAgentRegistryState` reads Phase 18's lifecycle state, which is how the
+   * trace requires `production` without being able to grant it.
+   *
+   * It is given **no runner, dispatcher, tool invoker, model client, provider,
+   * queue or scheduler**. Recording that a tool was invoked performs no
+   * invocation, and the strongest thing this boundary can produce is a record
+   * of something somebody reported.
+   */
+  const traceLookup: TraceLookup = {
+    authorize: store.authorize.bind(store),
+    createAgentTraceRun: store.createAgentTraceRun.bind(store),
+    getAgentTraceRun: store.getAgentTraceRun.bind(store),
+    listAgentTraceRuns: store.listAgentTraceRuns.bind(store),
+    closeAgentTraceRun: store.closeAgentTraceRun.bind(store),
+    createAgentTraceEvent: store.createAgentTraceEvent.bind(store),
+    listAgentTraceEvents: store.listAgentTraceEvents.bind(store),
+    // Phase 16's own facts, narrowed to this run by the Cost Engine's existing
+    // filter rather than by any aggregation of our own.
+    listAgentRunCostFacts: (workspaceId, userId, runId) =>
+      store.listCostEvents(workspaceId, userId, { executionKind: "agent_run", executionId: runId }),
+    getAgentRegistryState: (workspaceId, userId, agentId) => {
+      const found = store.getAgentRegistry(workspaceId, userId, agentId);
+      return found.ok
+        ? { ok: true, value: found.value === null ? null : found.value.status }
+        : found;
+    },
+  };
+
+  const trace = createTraceService(traceLookup);
 
   const deps: HandlerDeps = {
     identity,
@@ -570,6 +632,13 @@ export function createDefaultHandlers(options?: {
      * given no runner, dispatcher, tool invoker or model client.
      */
     evaluation,
+    /**
+     * The trace boundary: it records the seven-stage chain `ROADMAP.md` §27
+     * requires a production workflow to expose and derives the run's outcome
+     * from what was recorded. It is given no runner, no dispatcher, no tool
+     * invoker, no model client and no network.
+     */
+    trace,
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());

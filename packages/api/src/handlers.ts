@@ -33,6 +33,7 @@ import type { CostError, CostService } from "@dealora/cost";
 import type { DashboardError, DashboardService } from "@dealora/dashboard";
 import type { AgentError, AgentService } from "@dealora/agent";
 import type { EvaluationError, EvaluationService } from "@dealora/evaluation";
+import { TraceService, type TraceError } from "@dealora/trace";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -583,6 +584,43 @@ function fromEvaluationError(error: EvaluationError): ApiError {
   return mapped;
 }
 
+/**
+ * Map a trace domain error onto the transport vocabulary.
+ *
+ * Exhaustive, like every other mapper here. `UNAVAILABLE` becomes a generic
+ * `SERVER_ERROR`, so storage internals never reach a client — including the
+ * cross-check that refuses to report a run whose stored status disagrees with
+ * its recorded outcomes, which is deliberately opaque: saying more would tell a
+ * caller which internal invariant tripped.
+ *
+ * `CONFLICT` is the code that matters most here, because it is what carries
+ * `ROADMAP.md` §27's critical rule to the wire: recording a step on a closed
+ * run, replaying an attempt with different content, and opening a run for an
+ * agent that is not in `production` all surface as a conflict with recorded
+ * state. None of them is a malformed request, and none can be turned into a
+ * success by retrying differently.
+ */
+function fromTraceError(error: TraceError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+        return "VALIDATION_ERROR";
+      case "CONFLICT":
+        return "CONFLICT";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = [...error.details];
+  return mapped;
+}
+
 export interface HandlerDeps {
   identity: IdentityService;
   brain: BusinessBrainService;
@@ -605,6 +643,7 @@ export interface HandlerDeps {
   dashboard: DashboardService;
   agent: AgentService;
   evaluation: EvaluationService;
+  trace: TraceService;
   resolveSession: SessionResolver;
 }
 
@@ -3283,6 +3322,173 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok(result.value) };
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 20 — Agent Trace & Observability
+  // -------------------------------------------------------------------------
+
+  /**
+   * Open a traced run for one agent.
+   *
+   * The request names an agent and nothing else. The agent **version** is read
+   * from `@dealora/agent`'s declaration table, and the agent's `production`
+   * state is re-read from the Phase 18 registry at this moment — so a body
+   * containing `version`, `status`, `workspaceId`, `actorUserId` or `startedAt`
+   * is ignored in full, and a run cannot be opened for an agent this workspace
+   * has not promoted.
+   *
+   * Opening a run records no execution. It creates the container steps will be
+   * appended to; a run with no steps reads as `open`, which asserts nothing.
+   */
+  const openAgentTraceRunHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const agentId = param(req, "agentId");
+      if (isApiError(agentId)) return { ok: false, error: agentId };
+
+      const result = deps.trace.openRun(workspaceId, actor.userId, agentId);
+      if (!result.ok) return { ok: false, error: fromTraceError(result.error) };
+      return { ok: true, value: ok({ run: result.value }) };
+    });
+
+  /**
+   * Record one step in one traced run.
+   *
+   * The body is the whole vocabulary of what a recorder may report: a
+   * `stepId`, a `stage`, an `outcome` for that step, and optional facts about
+   * it. There is no field in it — and no field on the route — that can name the
+   * run's status, a sequence number, an attempt number, the agent version, the
+   * workspace, the actor or a timestamp: all seven are derived server-side, and
+   * `ROADMAP.md` §27's critical rule is therefore unreachable from a request.
+   *
+   * Re-sending the same `stepId` is how a **retry** is traced — storage counts
+   * the attempts already recorded and allocates the next one — and re-sending
+   * the identical attempt returns the original step rather than appending a
+   * second one.
+   */
+  const recordAgentTraceStepHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const runId = param(req, "runId");
+      if (isApiError(runId)) return { ok: false, error: runId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.trace.recordStep(workspaceId, actor.userId, runId, {
+        stepId: typeof body.stepId === "string" ? body.stepId : "",
+        stage: typeof body.stage === "string" ? body.stage : "",
+        outcome: typeof body.outcome === "string" ? body.outcome : "",
+        ...(typeof body.detail === "string" ? { detail: body.detail } : {}),
+        ...(typeof body.tool === "string" ? { tool: body.tool } : {}),
+        ...(typeof body.referenceId === "string" ? { referenceId: body.referenceId } : {}),
+        ...(typeof body.errorCode === "string" ? { errorCode: body.errorCode } : {}),
+        ...(typeof body.durationMs === "number" ? { durationMs: body.durationMs } : {}),
+        ...(typeof body.modelProvider === "string" ? { modelProvider: body.modelProvider } : {}),
+        ...(typeof body.modelName === "string" ? { modelName: body.modelName } : {}),
+        ...(typeof body.inputTokens === "number" ? { inputTokens: body.inputTokens } : {}),
+        ...(typeof body.outputTokens === "number" ? { outputTokens: body.outputTokens } : {}),
+      });
+      if (!result.ok) return { ok: false, error: fromTraceError(result.error) };
+      return { ok: true, value: ok({ step: result.value }) };
+    });
+
+  /**
+   * Close a traced run.
+   *
+   * **The body is not read**, and that is the point. A close carries a run id
+   * and nothing else: there is no `status`, no `succeeded` flag and no
+   * completion timestamp on the wire, so the outcome the caller gets back is
+   * whatever the recorded steps prove. `ROADMAP.md` §27's critical rule holds
+   * at the transport layer, not only in the domain.
+   */
+  const closeAgentTraceRunHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const runId = param(req, "runId");
+      if (isApiError(runId)) return { ok: false, error: runId };
+
+      const result = deps.trace.closeRun(workspaceId, actor.userId, runId);
+      if (!result.ok) return { ok: false, error: fromTraceError(result.error) };
+      return { ok: true, value: ok({ run: result.value }) };
+    });
+
+  /**
+   * One whole run: its chain, its derived status, its usage and its cost.
+   *
+   * Read-only and derived on every request. `status` and `derivedStatus` are
+   * printed as separate fields so a reader can see that the recorded verdict and
+   * the evidence behind it agree; cost is `null` when no Phase 16 fact exists
+   * for the run, never a zero.
+   */
+  const getAgentTraceHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const runId = param(req, "runId");
+      if (isApiError(runId)) return { ok: false, error: runId };
+
+      const result = deps.trace.trace(workspaceId, actor.userId, runId);
+      if (!result.ok) return { ok: false, error: fromTraceError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * The recorded step trail for one run, oldest first.
+   *
+   * Ordered by the sequence storage allocated, not by timestamp — two steps
+   * recorded in the same millisecond are ordinary and a timestamp-only order
+   * would be ambiguous between them. An empty run returns an empty list rather
+   * than a refusal: "this run recorded nothing yet" is a real answer.
+   */
+  const listAgentTraceStepsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const runId = param(req, "runId");
+      if (isApiError(runId)) return { ok: false, error: runId };
+
+      const result = deps.trace.steps(workspaceId, actor.userId, runId);
+      if (!result.ok) return { ok: false, error: fromTraceError(result.error) };
+      return { ok: true, value: ok({ steps: result.value }) };
+    });
+
+  /**
+   * Every traced run, optionally narrowed to one agent.
+   *
+   * Read-only. A workspace that has traced nothing gets an empty list, which
+   * is a real state rather than a missing page.
+   */
+  const listAgentTraceRunsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const requested = req.query.agentId;
+      const agentId =
+        typeof requested === "string" && requested.trim() !== "" ? requested : undefined;
+
+      const result = deps.trace.runs(workspaceId, actor.userId, agentId);
+      if (!result.ok) return { ok: false, error: fromTraceError(result.error) };
+      return { ok: true, value: ok({ runs: result.value }) };
+    });
+
+  /**
+   * The published bar: the seven stages, the three outcomes, the five run
+   * statuses, the nine tracked dimensions, the eighteen tools, and the negative
+   * space — including what this phase does not execute. Readable before a
+   * workspace has traced anything.
+   */
+  const getAgentTracePolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.trace.policy(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromTraceError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -3450,6 +3656,14 @@ export function createHandlers(deps: HandlerDeps) {
     getAgentEvaluationHandler,
     listAgentEvaluationTrailHandler,
     getAgentEvaluationPolicyHandler,
+
+    openAgentTraceRunHandler,
+    recordAgentTraceStepHandler,
+    closeAgentTraceRunHandler,
+    getAgentTraceHandler,
+    listAgentTraceStepsHandler,
+    listAgentTraceRunsHandler,
+    getAgentTracePolicyHandler,
   };
 }
 

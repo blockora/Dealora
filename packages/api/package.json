@@ -32,7 +32,8 @@
     "@dealora/plan": "workspace:*",
     "@dealora/qualification": "workspace:*",
     "@dealora/research": "workspace:*",
-    "@dealora/revenuegraph": "workspace:*"
+    "@dealora/revenuegraph": "workspace:*",
+    "@dealora/trace": "workspace:*"
   },
   "devDependencies": {}
 }

@@ -228,6 +228,28 @@ export type {
 } from "@dealora/evaluation";
 
 /**
+ * The Agent Trace & Observability domain's public surface, re-exported so API
+ * consumers can type a trace response without depending on the domain package
+ * directly.
+ *
+ * Note what is *not* here, and what that means for a caller: there is no
+ * execution type, because there is no execution. `TraceRunStatus` is the run's
+ * **derived** outcome — it is never accepted as input anywhere in this surface,
+ * which is how `ROADMAP.md` §27's critical rule holds at the transport layer.
+ */
+export type {
+  TraceEventView,
+  TraceOutcome,
+  TracePolicyView,
+  TraceRunStatus,
+  TraceRunSummary,
+  TraceStage,
+  TraceStageCounts,
+  TraceUsageSummary,
+  TraceView,
+} from "@dealora/trace";
+
+/**
  * The Qualification domain's public surface, re-exported so API consumers can
  * type a qualification response without depending on the domain package
  * directly.
