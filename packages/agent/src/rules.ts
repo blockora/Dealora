@@ -348,7 +348,16 @@ export const AGENT_EVALUATION_METRICS: readonly AgentEvaluationMetricView[] = [
   },
 ];
 
-/** The eleven declaration fields `ROADMAP.md` §25 requires, in roadmap order. */
+/**
+ * The twelve fields `ROADMAP.md` §25 requires of every production agent, in
+ * roadmap order.
+ *
+ * Eleven of them are declaration fields and live in `rules.ts` as code. The
+ * twelfth, `status`, is the per-workspace lifecycle state and is deliberately
+ * **not** here — a workspace's decision is stored, never declared. Listing it
+ * here is what lets the policy route report the whole requirement set, and what
+ * lets a test check that none of the twelve is missing.
+ */
 export const AGENT_REQUIRED_FIELDS = [
   "agentId",
   "version",

@@ -10,7 +10,7 @@
 agents** — Strategy, Market Intelligence, Account Research, Prospect Discovery,
 Qualification, Personalization, Conversation, Follow-up, Meeting, CRM,
 Analytics, Optimization — requires that *every production agent* declare
-eleven fields (Agent ID, Version, Purpose, Inputs, Outputs, Tools, Permissions,
+twelve fields (Agent ID, Version, Purpose, Inputs, Outputs, Tools, Permissions,
 Memory Access, Approval Requirements, Cost Limits, Evaluation Metrics, Status),
 and defines **seven** lifecycle states: Draft, Testing, Approved, Production,
 Paused, Disabled, Archived.
@@ -58,8 +58,9 @@ workspace has decided about them. It executes nothing.**
 
 ### The rule table (`rules.ts`)
 
-Twelve declarations, each with all eleven §25 fields plus §30's `owner` and
-`model`. Closed vocabularies everywhere:
+Twelve declarations, each carrying **eleven** of §25's twelve fields — the
+twelfth, `Status`, is per-workspace and lives in the registry row rather than
+in the code — plus §30's `owner` and `model`. Closed vocabularies everywhere:
 
 - **12 agent ids** in `AGENT_IDS`, which is also the registry's **total order** —
   every listing prints in roadmap order, so there is never a question about

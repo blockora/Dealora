@@ -72,7 +72,7 @@ describe("agent vocabulary", () => {
   it("declares every agent with every required field", () => {
     expect(AGENT_DECLARATIONS).toHaveLength(12);
     for (const declaration of AGENT_DECLARATIONS) {
-      // ROADMAP.md §25 requires all eleven; a missing one must fail here
+      // ROADMAP.md §25 requires all twelve; a missing one must fail here
       // rather than ship as an agent nobody can review. `status` is the state
       // the registry stores, so it is asserted below rather than here.
       expect(declaration.agentId).toBeTruthy();

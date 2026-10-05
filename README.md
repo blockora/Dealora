@@ -397,7 +397,8 @@ and it end to end after the send, the booking and the cost by
 Phase 18 adds the Agent System: `ROADMAP.md` §25's **twelve agents** — Strategy,
 Market Intelligence, Account Research, Prospect Discovery, Qualification,
 Personalization, Conversation, Follow-up, Meeting, CRM, Analytics, Optimization
-— each declaring all eleven required fields plus `DEALORA_BLUEPRINT.md` §30's
+— each declaring all twelve required fields (eleven in the declaration, plus
+the per-workspace `Status`) alongside `DEALORA_BLUEPRINT.md` §30's
 `owner` and `model`, and each running on one of **seven** lifecycle states.
 
 The phase **declares agents; it executes none.** Every capability the twelve
@@ -425,7 +426,7 @@ ids and seven states so a refused row is unrepresentable, and
 log. The status route is the only writer and the target state is the only value
 a request contributes: forged `updatedBy`, `createdAt`, `workspaceId`,
 `actorUserId` and `kind` in a body are ignored. Its gate — twelve agents,
-eleven fields, seven states, and nothing executable — is covered by
+twelve fields, seven states, and nothing executable — is covered by
 `tests/phase18-gate.test.ts`, and end to end after the send, the booking, the
 cost and the dashboard by `tests/phases9-18-integration.test.ts`.
 

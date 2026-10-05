@@ -10,7 +10,7 @@ import { AGENT_IDS, AGENT_STATE_ORDER, AGENT_TOOLS } from "@dealora/agent";
 /**
  * Phase 18 gate — ROADMAP.md §25 (Agent System).
  *
- * §25 asks for twelve named agents, eleven required declaration fields each,
+ * §25 asks for twelve named agents, twelve required fields each,
  * and a seven-value lifecycle. This gate drives the **real** API over the
  * **real** store and checks the phase's integrity story:
  *
@@ -188,7 +188,7 @@ describe("Phase 18 gate — Agent System (ROADMAP.md §25)", () => {
       "optimization",
     ]);
 
-    // §25's eleven required fields, checked one by one on the wire — including
+    // §25's twelve required fields, checked one by one on the wire — including
     // Status, which §25 lists and which is the one field the workspace decides.
     for (const entry of registry.agents) {
       const declaration = entry.declaration;
