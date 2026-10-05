@@ -11,14 +11,15 @@ import { SandboxEmailProvider } from "@dealora/outbound";
 import { SandboxCalendarProvider } from "@dealora/meeting";
 
 /**
- * Phases 9–13 integration — one document, one decision, one effect, one response,
- * one booking.
+ * Phases 9–15 integration — one document, one decision, one effect, one response,
+ * one booking, one recommendation, one graph.
  *
- * Phase 12 added the ability to *read* what came back, and Phase 13 adds the
- * ability to *book* what was read. Neither may change what the phases before them
- * guarantee, and that is exactly what this file proves: the same journey is
- * walked end to end, and then the seams are probed with the Phase 13 surface in
- * play.
+ * Phase 12 added the ability to *read* what came back, Phase 13 the ability to
+ * *book* what was read, Phase 14 the ability to *advise* what happens next, and
+ * Phase 15 the ability to *trace* everything that happened as one graph. None of
+ * them may change what the phases before them guarantee, and that is exactly what
+ * this file proves: the same journey is walked end to end, and then the seams are
+ * probed with each newer surface in play.
  *
  * What is asserted here, in order:
  *
@@ -38,6 +39,11 @@ import { SandboxCalendarProvider } from "@dealora/meeting";
  *     approval, no evidence.
  *  9. An opt-out stops a booking as well as a send, through the same Phase 11
  *     list, and the whole booking surface stays per tenant.
+ * 10. A next-step recommendation reads the whole loop without writing to it,
+ *     and the advice stays per tenant (Phase 14).
+ * 11. The whole loop reads back as one derived graph per tenant: every stage of
+ *     the revenue loop, all twelve relationships, and not one stored row
+ *     (Phase 15).
  *
  * The research provider is a **declared test double**, the email provider is the
  * **sandbox**, and the calendar is a **sandbox** too: nothing here retrieves,
@@ -430,11 +436,38 @@ function rowCounts(): {
   };
 }
 
+/** The seven node kinds a completed loop publishes, sorted. */
+const GRAPH_NODES = [
+  "company",
+  "conversation",
+  "evidence",
+  "meeting",
+  "opportunity",
+  "person",
+  "signal",
+];
+
+/** The twelve edge kinds one completed loop must produce, sorted. */
+const GRAPH_EDGES = [
+  "company_has_conversation",
+  "company_has_evidence",
+  "company_has_meeting",
+  "company_has_opportunity",
+  "company_has_person",
+  "company_has_signal",
+  "conversation_led_to_meeting",
+  "evidence_supports_opportunity",
+  "opportunity_led_to_conversation",
+  "person_had_conversation",
+  "person_joined_meeting",
+  "signal_became_evidence",
+];
+
 afterAll(() => {
   defaultStore.destroy();
 });
 
-describe("phases 9-14 integration — document, decision, effect, response, booking, next step", () => {
+describe("phases 9-15 integration — document, decision, effect, response, booking, next step, graph", () => {
   it("carries one evidence-backed document through one decision to one delivery and one response", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({
@@ -1103,6 +1136,128 @@ describe("phases 9-14 integration — document, decision, effect, response, book
     // watching which error comes back.
     const foreign = await errorOf(
       handlers.recommendNextActionHandler(
+        request(mine.token, { workspaceId: mine.workspaceId }, { accountId: "acct-not-mine" }),
+      ),
+    );
+    expect(foreign.code).toBe("NOT_FOUND");
+  });
+
+  it("reads the whole loop back as one graph, per tenant", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+      calendarProviders: [new SandboxCalendarProvider()],
+    });
+    const mine = tenant("Graph Mine");
+    const theirs = tenant("Graph Theirs");
+
+    // My loop runs all the way to a booked meeting — the full revenue loop.
+    const sent = await journey(
+      handlers,
+      mine.token,
+      mine.workspaceId,
+      unique("p15mine") + "@northwind.example",
+    );
+    const positive = (await dataOf(
+      handlers.createInboundMessageHandler(
+        request(
+          mine.token,
+          { workspaceId: mine.workspaceId, outboundActionId: sent.sentActionId },
+          { body: "Happy to chat, book a call." },
+        ),
+      ),
+    )) as { classification: { id: string; intent: string } };
+    expect(positive.classification.intent).toBe("positive_intent");
+    const proposed = (await dataOf(
+      handlers.recommendMeetingHandler(
+        request(
+          mine.token,
+          { workspaceId: mine.workspaceId },
+          {
+            classificationId: positive.classification.id,
+            title: "Intro call",
+            startsAt: "2026-11-02T10:00:00.000Z",
+            endsAt: "2026-11-02T10:30:00.000Z",
+            durationMinutes: 30,
+          },
+        ),
+      ),
+    )) as { meeting: { id: string } };
+    await dataOf(
+      handlers.decideMeetingHandler(
+        request(
+          mine.token,
+          { workspaceId: mine.workspaceId, id: proposed.meeting.id },
+          { decision: "approve" },
+        ),
+      ),
+    );
+    await dataOf(
+      handlers.bookMeetingHandler(
+        request(mine.token, { workspaceId: mine.workspaceId, id: proposed.meeting.id }),
+      ),
+    );
+
+    // Their loop stops at a message that genuinely went out.
+    await journey(
+      handlers,
+      theirs.token,
+      theirs.workspaceId,
+      unique("p15theirs") + "@northwind.example",
+    );
+
+    // Reading the graph writes nothing at all.
+    const before = rowCounts();
+    const graph = (await dataOf(
+      handlers.getRevenueGraphHandler(request(mine.token, { workspaceId: mine.workspaceId })),
+    )) as {
+      ruleVersion: string;
+      accountCount: number;
+      nodes: { id: string; kind: string }[];
+      edges: { kind: string; from: string; to: string }[];
+    };
+    expect(rowCounts()).toEqual(before);
+
+    // One graph, every stage of the loop, all twelve relationships — derived
+    // from the exact rows the phases above actually wrote, never stored.
+    expect(graph.ruleVersion).toBe("revenue-graph-1.0.0");
+    expect(graph.accountCount).toBe(1);
+    expect([...new Set(graph.nodes.map((node) => node.kind))].sort()).toEqual(GRAPH_NODES);
+    expect([...new Set(graph.edges.map((edge) => edge.kind))].sort()).toEqual(GRAPH_EDGES);
+
+    // The trace of one opportunity is the same rows, walked from the account
+    // that holds them: the frontier is the furthest stage the loop reached.
+    const trace = (await dataOf(
+      handlers.traceOpportunityHandler(
+        request(mine.token, { workspaceId: mine.workspaceId }, { accountId: sent.accountId }),
+      ),
+    )) as {
+      lifecycle: { frontier: string; opportunity: string | null };
+      edges: { kind: string }[];
+    };
+    expect(trace.lifecycle.frontier).toBe("meeting");
+    expect(trace.lifecycle.opportunity).toBe(sent.qualificationId);
+    expect([...new Set(trace.edges.map((edge) => edge.kind))].sort()).toEqual(GRAPH_EDGES);
+
+    // Per tenant: their graph is their own loop, and never mentions my account.
+    const theirGraph = (await dataOf(
+      handlers.getRevenueGraphHandler(request(theirs.token, { workspaceId: theirs.workspaceId })),
+    )) as { accountCount: number; nodes: { id: string }[] };
+    expect(theirGraph.accountCount).toBe(1);
+    expect(theirGraph.nodes.some((node) => node.id === sent.accountId)).toBe(false);
+
+    // Crossing workspaces is refused at the workspace guard, before the graph
+    // is ever derived, and a foreign account id inside my own workspace reads
+    // as absent rather than forbidden.
+    const crossed = await errorOf(
+      handlers.traceOpportunityHandler(
+        request(mine.token, { workspaceId: theirs.workspaceId }, { accountId: sent.accountId }),
+      ),
+    );
+    expect(crossed.code).toBe("UNAUTHORIZED");
+    const foreign = await errorOf(
+      handlers.traceOpportunityHandler(
         request(mine.token, { workspaceId: mine.workspaceId }, { accountId: "acct-not-mine" }),
       ),
     );
