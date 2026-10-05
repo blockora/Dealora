@@ -15,14 +15,19 @@
  *    the only reader is the declaration table in `rules.ts`. An agent holding
  *    the `send_message` tool has still sent nothing: Phase 10 approval and
  *    Phase 11 suppression are untouched by anything written here.
- * 2. **It cannot promote.** `approved → production` is refused inside
- *    `decideTransition` and answers with Phase 19 as the owning phase. The
+ * 2. **It cannot promote without evidence.** `approved → production` is gated.
+ *    When the application has wired Phase 19's evaluation boundary, the gate is
+ *    asked — with this workspace, this session, this agent and the version read
+ *    from the declaration table — and the transition is refused unless the
+ *    stored judgements meet every published threshold. When nothing is wired,
+ *    the answer is the Phase 18 refusal: no gate means no promotion. The
  *    refusal is a domain error, so no caller can route around it by reaching for
  *    the store directly — the store takes the same table through this service.
  * 3. **It never trusts the caller.** The request carries an agent id and a
  *    target state and nothing else. The actor, the timestamp, the prior state
  *    and the workspace are resolved server-side; a client cannot set them, and
- *    cannot name an agent outside the twelve.
+ *    cannot name an agent outside the twelve. A gate answer is never among the
+ *    inputs either.
  */
 
 import { err, ok } from "@dealora/core";
@@ -34,13 +39,21 @@ import {
   deriveRegistryView,
   sortRegistryEvents,
 } from "./engine.js";
-import { agentError, declarationFor, isAgentId, isAgentState } from "./rules.js";
+import {
+  AGENT_GATED_TRANSITIONS,
+  agentError,
+  declarationFor,
+  isAgentId,
+  isAgentState,
+} from "./rules.js";
 import type {
   AgentError,
   AgentPolicyView,
   AgentRegistryEvent,
   AgentRegistryRepository,
   AgentRegistryView,
+  AgentState,
+  ProductionGateResolver,
   StorageResult,
 } from "./types.js";
 
@@ -77,8 +90,23 @@ function text(value: unknown): string | null {
   return trimmed === "" ? null : trimmed;
 }
 
+/** Whether this edge exists only while an external gate says it may. */
+function isGatedTransition(from: AgentState, to: AgentState): boolean {
+  return AGENT_GATED_TRANSITIONS.some((entry) => entry.from === from && entry.to === to);
+}
+
 export class AgentService {
-  constructor(private readonly repo: AgentRegistryRepository) {}
+  /**
+   * @param repo Workspace-scoped registry reads and writes.
+   * @param gate Phase 19's evaluation boundary. Optional **only** in the sense
+   *   that omitting it makes the registry stricter, never more permissive:
+   *   with no gate, `approved → production` is refused with the published
+   *   Phase 18 wording, so an unwired deployment cannot promote anything.
+   */
+  constructor(
+    private readonly repo: AgentRegistryRepository,
+    private readonly gate?: ProductionGateResolver,
+  ) {}
 
   /** Authorize the caller against the workspace using server-side identity. */
   private guard(workspaceId: string, userId: string): Result<true, AgentError> {
@@ -182,7 +210,8 @@ export class AgentService {
         ]),
       );
     }
-    if (!declarationFor(agentId)) {
+    const declaration = declarationFor(agentId);
+    if (!declaration) {
       return err(agentError("NOT_FOUND", "agent not found"));
     }
 
@@ -197,7 +226,17 @@ export class AgentService {
       return this.describe(workspaceId, userId, agentId);
     }
 
-    const decision = decideTransition(from, status);
+    // The gate is consulted only for a gated edge, and always with the caller's
+    // own workspace and session plus the version read from the declaration
+    // table — never from the request. An unwired gate yields `undefined`, which
+    // `decideTransition` treats as a refusal.
+    const decision = decideTransition(
+      from,
+      status,
+      this.gate !== undefined && isGatedTransition(from, status)
+        ? this.gate({ workspaceId, userId, agentId, version: declaration.version })
+        : undefined,
+    );
     if (!decision.allowed) {
       return err(
         agentError(

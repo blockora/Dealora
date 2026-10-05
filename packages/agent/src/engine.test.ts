@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   AGENT_DECLARATIONS,
+  AGENT_GATED_TRANSITIONS,
   AGENT_IDS,
   AGENT_MEMORY_LAYERS,
   AGENT_PERMISSIONS,
@@ -427,5 +428,73 @@ describe("storage vocabulary stays in step with the domain", () => {
     for (const state of AGENT_STATE_ORDER) {
       expect(SCHEMA).toContain(`'${state}'`);
     }
+  });
+});
+
+describe("the Phase 19 evaluation gate", () => {
+  const satisfied = { satisfied: true, reason: "every declared metric is met" };
+  const unsatisfied = {
+    satisfied: false,
+    reason: "task_success is unmet (measured 6000 basis points).",
+  };
+
+  it("publishes exactly one gated transition, owned by Phase 19", () => {
+    expect(AGENT_GATED_TRANSITIONS).toHaveLength(1);
+    const gated = AGENT_GATED_TRANSITIONS[0];
+    expect(gated?.from).toBe("approved");
+    expect(gated?.to).toBe("production");
+    expect(gated?.owningPhase).toBe("Phase 19");
+    expect(gated?.requirement).toContain("exact declared agent version");
+    // The edge is still published, so the lifecycle stays legible.
+    expect(
+      AGENT_TRANSITIONS.some((entry) => entry.from === "approved" && entry.to === "production"),
+    ).toBe(true);
+  });
+
+  it("fails closed with no gate at all, which is the Phase 18 answer", () => {
+    const decision = decideTransition("approved", "production");
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) throw new Error("promotion must be refused without evidence");
+    expect(decision.owningPhase).toBe("Phase 19");
+    expect(decision.reason).toContain("evaluation evidence");
+    expect(decision.reason).toContain("no Phase 19 evaluation boundary wired to this registry");
+    expect(transitionAllowed("approved", "production")).toBe(false);
+  });
+
+  it("refuses when the gate says the evidence is not there, and quotes it", () => {
+    const decision = decideTransition("approved", "production", unsatisfied);
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) throw new Error("promotion must be refused without evidence");
+    expect(decision.owningPhase).toBe("Phase 19");
+    expect(decision.reason).toContain("evaluation evidence");
+    // The gate's own reason travels with the refusal, so a caller knows what
+    // is missing rather than only that something is.
+    expect(decision.reason).toContain("task_success is unmet");
+  });
+
+  it("permits the transition only when the gate is satisfied", () => {
+    const decision = decideTransition("approved", "production", satisfied);
+    expect(decision.allowed).toBe(true);
+    if (!decision.allowed) throw new Error("satisfied evidence must permit promotion");
+    expect(decision.reason).toContain("§26");
+    expect(transitionAllowed("approved", "production", satisfied)).toBe(true);
+  });
+
+  it("consults the gate for the gated edge only", () => {
+    // A satisfied gate must not invent transitions. `draft → production` is
+    // still absent from the table, so it stays refused with no owning phase.
+    const decision = decideTransition("draft", "production", satisfied);
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) throw new Error("a gate must not add an unpublished edge");
+    expect(decision.owningPhase).toBeNull();
+    expect(decision.reason).toContain("does not allow");
+  });
+
+  it("grants a governance state and not a capability", () => {
+    // Passing the gate moves the registry row and nothing else: `production`
+    // is still not a state in which an agent may be used.
+    expect(transitionAllowed("approved", "production", satisfied)).toBe(true);
+    expect(isUsable("production")).toBe(false);
+    expect([...MEETABLE_AGENT_STATES]).toEqual([]);
   });
 });

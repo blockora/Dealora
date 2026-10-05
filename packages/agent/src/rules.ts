@@ -125,7 +125,8 @@ export const AGENT_TRANSITIONS: readonly AgentTransitionView[] = [
   {
     from: "approved",
     to: "production",
-    reason: "Refused in Phase 18: ROADMAP.md §26 requires Phase 19 evaluation evidence first.",
+    reason:
+      "ROADMAP.md §26's gate, decided by Phase 19: evaluation evidence must meet every threshold this agent declares, for this exact agent version, in this workspace.",
   },
   {
     from: "approved",
@@ -168,19 +169,40 @@ export const AGENT_TRANSITIONS: readonly AgentTransitionView[] = [
   { from: "disabled", to: "archived", reason: "An agent can be retired after being disabled." },
 ];
 
-/** The transitions this phase refuses, and the phase that will own them. */
-export const AGENT_REFUSED_TRANSITIONS: readonly {
+/**
+ * Transitions that exist only while an external gate says they may.
+ *
+ * Phase 18 published `approved → production` and refused it outright, naming
+ * Phase 19 as the phase that would own it. Phase 19 now owns it, and ownership
+ * means the refusal became a **condition** rather than a disappearance: the edge
+ * is still in `AGENT_TRANSITIONS`, `decideTransition` still refuses it by
+ * default, and it is granted only when a `ProductionGateOutcome` says the
+ * evidence is there.
+ *
+ * Failing closed is the whole design. `decideTransition` is called with no gate
+ * by anything that has not been wired to `@dealora/evaluation` — a test, an
+ * alternate wiring, a future caller — and the answer is still the Phase 18
+ * refusal, with the same words. There is no default that permits a promotion.
+ *
+ * Note what the gate does **not** grant: it moves a governance state and
+ * nothing else. `MEETABLE_AGENT_STATES` is still empty, so an agent in
+ * `production` is still unusable, because no agent in this repository runs.
+ */
+export const AGENT_GATED_TRANSITIONS: readonly {
   readonly from: AgentState;
   readonly to: AgentState;
   readonly owningPhase: string;
-  readonly reason: string;
+  readonly requirement: string;
+  readonly refusalReason: string;
 }[] = [
   {
     from: "approved",
     to: "production",
     owningPhase: "Phase 19",
-    reason:
-      "ROADMAP.md §26: production agents require evaluation evidence. Phase 18 declares the metrics; it does not measure them, so no agent can reach production yet.",
+    requirement:
+      "Phase 19 evaluation evidence meeting every published threshold against every metric this agent's declaration names, for this exact declared agent version, in this workspace.",
+    refusalReason:
+      "ROADMAP.md §26: production agents require evaluation evidence. Phase 19 gate not satisfied: this deployment has no Phase 19 evaluation boundary wired to this registry, so no evidence can be consulted.",
   },
 ];
 
@@ -375,7 +397,7 @@ export const AGENT_REQUIRED_FIELDS = [
 
 /** Why the lifecycle stops where it does, in one sentence per boundary. */
 export const AGENT_PROMOTION_RULE =
-  "An agent may reach `production` only after Phase 19 records evaluation evidence against every metric this registry declares. Phase 18 declares those metrics and refuses the transition, so `production` is published vocabulary and an unreachable state.";
+  "An agent may reach `production` only after Phase 19 records evaluation evidence against every metric this registry declares, for that exact agent version, in that workspace. Phase 19 measures those metrics and answers the gate; the registry refuses the transition when it has not been told the evidence is there, and `production` remains published vocabulary that nothing can *use* until a later phase adds a runner.";
 
 /** What this registry refuses to do, in its own words. */
 export const AGENT_NEVER_DOES: readonly string[] = [
@@ -384,7 +406,8 @@ export const AGENT_NEVER_DOES: readonly string[] = [
   "Never sends anything: outbound stays behind Phase 10 approval and Phase 11 suppression.",
   "Never writes evidence without provenance: Phase 7 remains the only evidence boundary.",
   "Never fabricates a capability, an evaluation result or a trace: Phase 19 measures, Phase 20 traces.",
-  "Never promotes an agent to production without Phase 19 evidence.",
+  "Never promotes an agent to production without Phase 19 evidence, and never accepts that evidence from a caller: it is read from stored judgements for the exact agent version.",
+  "Never treats a production-eligible agent as a usable one: passing the Phase 19 gate grants a lifecycle state, not a capability.",
   "Never reads or writes another workspace's registry.",
   "Never reads or writes agent memory: layers are declared, access is Phase 20+.",
   "Never schedules itself or runs on a timer.",

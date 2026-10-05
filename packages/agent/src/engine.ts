@@ -17,12 +17,12 @@
 import {
   AGENT_DECLARATIONS,
   AGENT_EVALUATION_METRICS,
+  AGENT_GATED_TRANSITIONS,
   AGENT_IDS,
   AGENT_MEMORY_LAYERS,
   AGENT_NEVER_DOES,
   AGENT_PERMISSIONS,
   AGENT_PROMOTION_RULE,
-  AGENT_REFUSED_TRANSITIONS,
   AGENT_REQUIRED_FIELDS,
   AGENT_RULE_VERSION,
   AGENT_STATE_ORDER,
@@ -39,6 +39,7 @@ import type {
   AgentRegistryRow,
   AgentRegistryView,
   AgentState,
+  ProductionGateOutcome,
   RegisteredAgent,
 } from "./types.js";
 
@@ -62,20 +63,32 @@ export type TransitionDecision = TransitionAllowed | TransitionRefusal;
  *
  * Three outcomes, checked in this order so the answer is always specific:
  *
- * 1. **Refused by this phase.** `approved → production` is a published edge but
- *    is refused here, naming Phase 19. This check comes first on purpose: a
- *    caller must never be told "that pair is not in the table" for the one pair
- *    whose absence is a decision rather than an oversight.
+ * 1. **Gated.** `approved → production` is a published edge that exists only
+ *    while an external gate says it may, and Phase 19 owns that gate. The check
+ *    comes first on purpose: a caller must never be told "that pair is not in
+ *    the table" for the one pair whose absence is a decision rather than an
+ *    oversight. The gate is **fail-closed**: with no gate supplied — an
+ *    unwired deployment, a unit test, a future caller — the answer is the
+ *    Phase 18 refusal, verbatim, naming Phase 19.
  * 2. **Same state.** A no-op transition is allowed and performs no write, so a
  *    repeated request is idempotent rather than an error.
  * 3. **In the table.** Everything else is decided by `AGENT_TRANSITIONS`; an
  *    absent pair is refused with the ordered states quoted, because the legal
  *    alternatives are what a caller needs to know.
+ *
+ * A satisfied gate does not skip step 3: the edge still has to be published,
+ * so a gate can never introduce a transition the lifecycle does not have.
  */
-export function decideTransition(from: AgentState, to: AgentState): TransitionDecision {
-  const refused = AGENT_REFUSED_TRANSITIONS.find((entry) => entry.from === from && entry.to === to);
-  if (refused) {
-    return { allowed: false, reason: refused.reason, owningPhase: refused.owningPhase };
+export function decideTransition(
+  from: AgentState,
+  to: AgentState,
+  gate?: ProductionGateOutcome,
+): TransitionDecision {
+  const gated = AGENT_GATED_TRANSITIONS.find((entry) => entry.from === from && entry.to === to);
+  if (gated && !(gate !== undefined && gate.satisfied)) {
+    const detail =
+      gate === undefined ? gated.refusalReason : `${gated.refusalReason} ${gate.reason}`;
+    return { allowed: false, reason: detail, owningPhase: gated.owningPhase };
   }
   if (from === to) {
     return { allowed: true, reason: "The agent is already in this state; nothing changes." };
@@ -92,8 +105,12 @@ export function decideTransition(from: AgentState, to: AgentState): TransitionDe
 }
 
 /** Whether one transition would be permitted, for callers that need no reason. */
-export function transitionAllowed(from: AgentState, to: AgentState): boolean {
-  return decideTransition(from, to).allowed;
+export function transitionAllowed(
+  from: AgentState,
+  to: AgentState,
+  gate?: ProductionGateOutcome,
+): boolean {
+  return decideTransition(from, to, gate).allowed;
 }
 
 /**

@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import { AgentService } from "./service.js";
+import { declarationFor } from "./rules.js";
 import type {
   AgentRegistryEvent,
   AgentRegistryRepository,
   AgentRegistryRow,
+  ProductionGateOutcome,
+  ProductionGateQuery,
+  ProductionGateResolver,
   StorageResult,
 } from "./types.js";
 
@@ -467,5 +471,103 @@ describe("AgentService policy", () => {
       if (result.ok) throw new Error("policy must be authorized");
       expect(result.error.code).toBe(code);
     }
+  });
+});
+
+describe("AgentService with the Phase 19 gate wired", () => {
+  /** A gate that answers, and records what it was asked. */
+  function gateFixture(answer: ProductionGateOutcome): {
+    repo: FakeRepository;
+    service: AgentService;
+    queries: ProductionGateQuery[];
+    workspaceId: string;
+    userId: string;
+  } {
+    const repo = new FakeRepository();
+    repo.members.set("ws-a", new Set(["user-a"]));
+    const queries: ProductionGateQuery[] = [];
+    const gate: ProductionGateResolver = (query) => {
+      queries.push(query);
+      return answer;
+    };
+    return {
+      repo,
+      service: new AgentService(repo, gate),
+      queries,
+      workspaceId: "ws-a",
+      userId: "user-a",
+    };
+  }
+
+  function toApproved(fx: { service: AgentService; workspaceId: string; userId: string }) {
+    fx.service.changeStatus(fx.workspaceId, fx.userId, "analytics", "testing");
+    fx.service.changeStatus(fx.workspaceId, fx.userId, "analytics", "approved");
+  }
+
+  it("promotes only when the gate says the evidence is there", () => {
+    const fx = gateFixture({ satisfied: true, reason: "every declared metric is met" });
+    toApproved(fx);
+    const promoted = fx.service.changeStatus(fx.workspaceId, fx.userId, "analytics", "production");
+    expect(promoted.ok).toBe(true);
+    if (!promoted.ok) throw new Error("satisfied evidence must permit promotion");
+    expect(promoted.value.status).toBe("production");
+    // A governance state and nothing more: the agent is still not usable.
+    expect(promoted.value.usable).toBe(false);
+    expect(fx.repo.writes).toBe(3);
+  });
+
+  it("refuses when the gate says it is not, and quotes what is missing", () => {
+    const fx = gateFixture({
+      satisfied: false,
+      reason: "1 of 5 declared metrics are not met: accuracy insufficient_evidence.",
+    });
+    toApproved(fx);
+    const before = fx.repo.writes;
+    const refused = fx.service.changeStatus(fx.workspaceId, fx.userId, "analytics", "production");
+    expect(refused.ok).toBe(false);
+    if (refused.ok) throw new Error("an unsatisfied gate must refuse promotion");
+    expect(refused.error.code).toBe("VALIDATION_ERROR");
+    expect(refused.error.message).toContain("evaluation evidence");
+    expect(refused.error.message).toContain("accuracy insufficient_evidence");
+    expect(refused.error.details?.[0]?.message).toContain("Phase 19");
+    // A refused promotion writes nothing at all.
+    expect(fx.repo.writes).toBe(before);
+    expect(fx.repo.rows[0]?.status).toBe("approved");
+    expect(fx.repo.events).toHaveLength(2);
+  });
+
+  it("asks the gate with its own workspace, session and declared version", () => {
+    const fx = gateFixture({ satisfied: false, reason: "no evidence" });
+    toApproved(fx);
+    fx.service.changeStatus(fx.workspaceId, fx.userId, "analytics", "production");
+    expect(fx.queries).toHaveLength(1);
+    const asked = fx.queries[0];
+    expect(asked?.workspaceId).toBe("ws-a");
+    expect(asked?.userId).toBe("user-a");
+    expect(asked?.agentId).toBe("analytics");
+    // Read from the declaration table, never from a request.
+    expect(asked?.version).toBe(declarationFor("analytics")?.version);
+  });
+
+  it("does not ask the gate about transitions it has no opinion on", () => {
+    const fx = gateFixture({ satisfied: false, reason: "no evidence" });
+    fx.service.changeStatus(fx.workspaceId, fx.userId, "analytics", "testing");
+    fx.service.changeStatus(fx.workspaceId, fx.userId, "analytics", "paused");
+    expect(fx.queries).toHaveLength(0);
+  });
+
+  it("keeps a production agent on the operational brake", () => {
+    const fx = gateFixture({ satisfied: true, reason: "every declared metric is met" });
+    toApproved(fx);
+    fx.service.changeStatus(fx.workspaceId, fx.userId, "analytics", "production");
+    const paused = fx.service.changeStatus(fx.workspaceId, fx.userId, "analytics", "paused");
+    expect(paused.ok).toBe(true);
+    if (!paused.ok) throw new Error("pausing a production agent must work");
+    expect(paused.value.status).toBe("paused");
+    // Resuming goes back to testing, never straight to production.
+    const resumed = fx.service.changeStatus(fx.workspaceId, fx.userId, "analytics", "testing");
+    if (resumed.ok) expect(resumed.value.status).toBe("testing");
+    const shortcut = fx.service.changeStatus(fx.workspaceId, fx.userId, "analytics", "production");
+    expect(shortcut.ok).toBe(false);
   });
 });

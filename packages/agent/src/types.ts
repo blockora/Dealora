@@ -96,6 +96,35 @@ export type AgentState =
 export type AgentUsableState = "production";
 
 /**
+ * What an external gate says about one promotion.
+ *
+ * Declared here, structurally, rather than imported: `@dealora/agent` must not
+ * depend on `@dealora/evaluation`, which depends on this package. The
+ * dependency runs one way, and the only thing crossing it is this answer.
+ *
+ * `satisfied` is a conclusion somebody reached from stored evidence. Nothing in
+ * this package trusts a caller to produce one: `decideTransition` is given the
+ * gate by the wiring, and a missing gate is a refusal.
+ */
+export interface ProductionGateOutcome {
+  readonly satisfied: boolean;
+  /** Why it says so — required, because a bare boolean is not reviewable. */
+  readonly reason: string;
+}
+
+/** Everything the gate is asked about, all of it resolved server-side. */
+export interface ProductionGateQuery {
+  readonly workspaceId: string;
+  readonly userId: string;
+  readonly agentId: AgentId;
+  /** The declaration's version, read from this package's own table. */
+  readonly version: string;
+}
+
+/** Answers `ProductionGateQuery`. Wired in by the application, never by a caller. */
+export type ProductionGateResolver = (query: ProductionGateQuery) => ProductionGateOutcome;
+
+/**
  * The tools an agent may be granted, as a closed vocabulary.
  *
  * A tool is a *name for a capability some other phase already owns*. The

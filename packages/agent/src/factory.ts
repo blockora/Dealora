@@ -19,6 +19,7 @@ import type {
   AgentRegistryEvent,
   AgentRegistryRepository,
   AgentRegistryRow,
+  ProductionGateResolver,
   StorageResult,
 } from "./types.js";
 
@@ -48,14 +49,22 @@ export interface AgentRegistryLookup {
 }
 
 /**
- * Wire the registry to storage.
+ * Wire the registry to storage, and optionally to Phase 19's evaluation gate.
  *
  * Everything is passed through unchanged: the lifecycle rules live in
- * `rules.ts` and the derivations in `engine.ts`, and this function's whole job
+ * `rules.ts`, the derivations in `engine.ts`, and this function's whole job
  * is to prove — by its types — that the service can reach nothing except
  * workspace-scoped registry rows and the governance trail.
+ *
+ * `gate` is optional because omitting it is the *safer* configuration, not a
+ * wider one: with no resolver, `approved → production` is refused with the
+ * published wording. A deployment that has not wired `@dealora/evaluation`
+ * therefore cannot promote an agent by omission, only by measuring it.
  */
-export function createAgentService(lookup: AgentRegistryLookup): AgentService {
+export function createAgentService(
+  lookup: AgentRegistryLookup,
+  gate?: ProductionGateResolver,
+): AgentService {
   const repo: AgentRegistryRepository = { ...lookup };
-  return new AgentService(repo);
+  return new AgentService(repo, gate);
 }
