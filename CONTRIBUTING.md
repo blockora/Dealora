@@ -144,6 +144,16 @@ has to say so:
   a body, it is a defect.
 - **No mass surface.** One channel, no scheduler, no queue, no retry loop, no
   campaign or bulk concept. If a change adds one, it needs a new ADR.
+- **A report is derived, never stored, and never estimates.** Phases 15 and 17
+  read rows other phases wrote instead of keeping their own copy. A new
+  reporting surface must do the same, and a metric with no backing row reports
+  `no_data` with its owning phase rather than a zero — "nothing records this
+  yet" and "this is worth nothing" are different claims, and only the first one
+  is true here.
+- **One owner per word.** If a later phase needs a number or an advice another
+  phase already computes, it embeds that phase's answer whole instead of
+  re-deriving it. Two definitions of a cost or a next step is how a product
+  starts disagreeing with itself.
 
 ## Commit conventions
 

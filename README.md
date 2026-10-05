@@ -25,7 +25,8 @@ The repository has completed **Phase 0 — Repository & Engineering Foundation**
 **Phase 9 — Personalization Engine**, **Phase 10 — Approval Engine**,
 **Phase 11 — First Outbound Integration**, **Phase 12 — Conversation
 Engine**, **Phase 13 — Meeting Workflow**, **Phase 14 — Next Best Action**,
-**Phase 15 — Revenue Graph**, and **Phase 16 — Cost Engine**
+**Phase 15 — Revenue Graph**, **Phase 16 — Cost Engine**, and
+**Phase 17 — Revenue Dashboard**
 (see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
@@ -246,8 +247,8 @@ event*. The brief is the other half of the honesty story — it references claim
 and evidence by id rather than copying them, and writes every `§22` section it
 has no record for into `gaps` instead of filling it in. Nothing in this phase
 sends an invitation, schedules anything on a timer, or turns a meeting into a
-fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–16
-together by `tests/phases9-16-integration.test.ts`.
+fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–17
+together by `tests/phases9-17-integration.test.ts`.
 
 Phase 14 adds the Next Best Action Engine: it answers *what should happen next?*
 for one account and for a whole workspace, reading stored rows and applying a
@@ -343,7 +344,57 @@ show estimated or measured cost, for every run kind this repository can
 perform, with `workflow` refused by name until Phase 24 — is covered by
 `tests/phase16-gate.test.ts`.
 
-Next is **Phase 17 — Revenue Dashboard**.
+Phase 17 adds the Revenue Dashboard: `ROADMAP.md` §24's twelve tiles plus the
+two `DEALORA_BLUEPRINT.md` §35 asks of the same home screen — **hot
+conversations** and **next best actions** — all **derived on read** from the
+rows Phases 3 and 5–16 already store. The phase adds **no table, no schema
+version and no migration**: a stored dashboard would be a second copy of facts
+eight other phases own, and it would go stale the moment any of them moved.
+
+The distinction the phase exists to make is the one §24 names in a single line:
+a user can see the revenue workflow as **business outcomes, not just technical
+activity**. So the outcome tiles and the activity tile are computed from
+deliberately different sources, and the gap between them is the honest signal.
+**Qualified Prospects** counts accounts whose *newest* qualification is
+`qualified` — the same rule Phases 15 and 16 already use, so the word means one
+thing across three phases — while **Opportunities** additionally requires that
+the account's loop reached a calendar, because a meeting that never got booked
+is a recommendation, not an outcome. **Agent Activity** then reports the work
+itself: accounts researched, prospects ever qualified, drafts rendered, replies
+classified. Account-based counts are over sets, so double counting is impossible
+by construction, and a `contested` qualification removes the opportunity from the
+very next read rather than leaving a stale "qualified" claim behind.
+
+The decision that shaped the phase is what a tile says when **no row can
+produce it**. A dashboard that printed **$0 pipeline** would be claiming the
+workspace has none, when the truth is that nothing records pipeline value yet
+— "we have not booked this" and "this is worth nothing" are different
+claims. So **Direct Revenue, Pipeline Created and Customers** report
+`status: "no_data"` with a reason and an owning phase (**Phase 23**, where
+`ROADMAP.md` §30 puts CRM integrations), never a fabricated zero, estimate or
+forecast. The Revenue Goal is *conditional* rather than refused: it answers
+`no_data` unless there is an **active** goal, because a draft or paused goal is
+not what a workspace is working toward.
+
+Two tiles are deliberately **not** re-derived. The cost tile is Phase 16's own
+`WorkspaceCostMetrics` and the next-step tile is Phase 14's own board, both read
+through those services' boundaries and embedded whole, so the product keeps
+exactly one definition of every cost number and one opinion on what to do next;
+"positive conversation" is likewise read from Phase 13's `MEETABLE_INTENTS`
+rather than copied. The whole rule set — all fourteen tiles with their
+derivations, the three refusals, and the Blueprint's four questions as an exact
+partition, so no tile is orphaned and none is claimed twice — is readable
+through a policy route before a single row exists. Ordering is a declared closed
+order or the store's own, with `createdAt` then `id` breaking the goal
+tiebreak, so the same rows always print byte-identical JSON. Nothing is
+written, nothing is acted on, no network call exists in the package, and forged
+tile numbers, `userId` or `workspaceId` in a request body are ignored because
+every read is workspace-scoped with the session's own identity. Its gate — a
+user can see the loop as outcomes — is covered by `tests/phase17-gate.test.ts`,
+and it end to end after the send, the booking and the cost by
+`tests/phases9-17-integration.test.ts`.
+
+Next is **Phase 18 — Agent System**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -374,6 +425,7 @@ packages/       Shared TypeScript packages (built with project references)
   nextaction/    Deterministic next-best-action engine over the whole revenue loop (Phase 14)
   revenuegraph/  Derived revenue graph: nodes, edges, lifecycle, policy (Phase 15)
   cost/          Immutable cost facts, derived totals and metrics, exact money (Phase 16)
+  dashboard/     Revenue dashboard derived on read, published refusals, policy (Phase 17)
   api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 12+)
@@ -459,7 +511,9 @@ checks. Phase 14 adds no key and no provider: it reads stored rows and applies a
 fixed rule set. Phase 15 adds none either: the graph is derived on read from
 rows the earlier phases already store. Phase 16 adds no key and no provider:
 recording a cost is a local append to the workspace's own store, and every
-total is derived from those rows without touching the network.
+total is derived from those rows without touching the network. Phase 17 adds
+no key and no provider either: reading a dashboard is nine workspace-scoped
+reads and a derivation, with no write, no clock and no network I/O.
 
 ## License
 
