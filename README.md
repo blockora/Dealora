@@ -26,8 +26,9 @@ The repository has completed **Phase 0 — Repository & Engineering Foundation**
 **Phase 11 — First Outbound Integration**, **Phase 12 — Conversation
 Engine**, **Phase 13 — Meeting Workflow**, **Phase 14 — Next Best Action**,
 **Phase 15 — Revenue Graph**, **Phase 16 — Cost Engine**,
-**Phase 17 — Revenue Dashboard**, **Phase 18 — Agent System** and
-**Phase 19 — Agent Evaluation** (see [`ROADMAP.md`](./ROADMAP.md)).
+**Phase 17 — Revenue Dashboard**, **Phase 18 — Agent System**,
+**Phase 19 — Agent Evaluation** and **Phase 20 — Agent Trace &
+Observability** (see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
 with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
@@ -247,8 +248,8 @@ event*. The brief is the other half of the honesty story — it references claim
 and evidence by id rather than copying them, and writes every `§22` section it
 has no record for into `gaps` instead of filling it in. Nothing in this phase
 sends an invitation, schedules anything on a timer, or turns a meeting into a
-fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–18
-together by `tests/phases9-19-integration.test.ts`.
+fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–20
+together by `tests/phases9-20-integration.test.ts`.
 
 Phase 14 adds the Next Best Action Engine: it answers *what should happen next?*
 for one account and for a whole workspace, reading stored rows and applying a
@@ -392,7 +393,7 @@ tile numbers, `userId` or `workspaceId` in a request body are ignored because
 every read is workspace-scoped with the session's own identity. Its gate — a
 user can see the loop as outcomes — is covered by `tests/phase17-gate.test.ts`,
 and it end to end after the send, the booking and the cost by
-`tests/phases9-19-integration.test.ts`.
+`tests/phases9-20-integration.test.ts`.
 
 Phase 18 adds the Agent System: `ROADMAP.md` §25's **twelve agents** — Strategy,
 Market Intelligence, Account Research, Prospect Discovery, Qualification,
@@ -429,7 +430,7 @@ a request contributes: forged `updatedBy`, `createdAt`, `workspaceId`,
 `actorUserId` and `kind` in a body are ignored. Its gate — twelve agents,
 twelve fields, seven states, and nothing executable — is covered by
 `tests/phase18-gate.test.ts`, and end to end after the send, the booking, the
-cost and the dashboard by `tests/phases9-19-integration.test.ts`.
+cost and the dashboard by `tests/phases9-20-integration.test.ts`.
 
 Phase 19 adds Agent Evaluation: `ROADMAP.md` §26's **thirteen metrics** are now
 **measured** rather than declared, and `approved → production` is decided by
@@ -479,9 +480,90 @@ status in a body are ignored and answered byte-identically. Its gate — all
 thirteen metrics measured, every way to fail the gate, and nothing executed — is
 covered by `tests/phase19-gate.test.ts`, and end to end after the send, the
 booking, the cost, the dashboard and the registry by
-`tests/phases9-19-integration.test.ts`.
+`tests/phases9-20-integration.test.ts`.
 
-Next is **Phase 20 — Agent Trace & Observability**.
+Phase 20 adds Agent Trace & Observability: `ROADMAP.md` §27's chain is now a
+real, inspectable record, and §27's critical rule — **never silently pretend an
+action succeeded** — is the *shape of the types* rather than a convention
+anyone has to remember.
+
+The chain is published once, as seven stages in the roadmap's own order: agent,
+decision, tool call, evidence, result, approval, external action. That order is
+also the trail's sort key, so "ordered by stage" never has to mean anything and
+a stage with no steps reads as a tally of **zero** rather than being absent —
+"no approval was ever requested" and "this trace cannot say" are different
+claims, and only the first is true. All nine of §27's tracked dimensions are
+derived from real recorded facts: the **slowest** step rather than a sum,
+because steps in one run may overlap and summing them would invent a duration
+the run never had; reported model and token usage, copied rather than
+estimated; tool names read from `@dealora/agent`'s eighteen declarations
+rather than restated, so a trace cannot cite a capability no agent holds;
+errors counted; **retries** read from storage's own attempt counter; and cost
+attributed through Phase 16's existing `cost_events` under one new `agent_run`
+execution kind — no second cost table, no second total, and `null` rather than
+a fabricated zero when no fact exists.
+
+The critical rule is structural. `TraceRunStatus` has five members and **no
+request can supply one**: the close route carries a run id and does not read its
+body at all. The status is derived in storage from the outcomes the run's own
+steps carry, and a fifth value — `unverified` — is what makes closing an empty
+trace *incapable* of producing a success. `unknown` is a first-class outcome for
+the same reason: an external action nobody confirmed has not failed, it has
+left the question open, and reporting it as either a delivery or a failure is
+exactly the dishonesty §27 and `DEALORA_BLUEPRINT.md` §70 forbid. §70's
+failure → retry → alternative tool → graceful degradation → escalation chain is
+representable because each of those is a **separate step with its own outcome**,
+not a flag flipped on the first one. The rule is deliberately duplicated —
+storage derives the verdict on write and the domain re-derives it on read, and a
+closed run whose two derivations disagree is **refused** rather than printed,
+because a reader shown a verdict its own evidence contradicts has been handed a
+lie.
+
+Ordering is server-derived, because `recordedAt` cannot separate two steps
+recorded in the same millisecond and that is precisely where an audit trail
+matters. `sequence` is monotonic per run and `attempt` is per `stepId`, both
+`UNIQUE`-constrained and both allocated in storage; nothing orders by timestamp
+or by id. An identical resend replays the original row, while **different**
+content for the same `stepId` becomes the next attempt — refusing that would
+have refused the very retry §27 asks to be traced. Runs and steps are
+append-only: there is no update or delete route, a closed run accepts nothing
+further, and re-closing never rewrites a verdict. The agent **version is
+pinned** from the registry at open time so a later version cannot rewrite what a
+historical trace means, and a run opens only for an agent this workspace has
+actually put in `production` — Phase 19's evaluation gate, unchanged and not
+bypassed, with the refusal naming the state the registry holds.
+
+The negative space is the point, and it is published rather than merely
+intended. **No runner, dispatcher, loop, scheduler, queue, worker, tool invoker,
+model client or network client is exported from this package.** A `tool_call`
+step records that a capability somebody else owns was *reported* as invoked; it
+calls nothing, and the phase that owns that tool still runs its own
+authorization. The gate proves it by snapshotting every table: recording a
+seven-step chain including a tool call, an approval and an external action adds
+exactly one run and its steps, and moves no draft, approval, outbound action,
+meeting, evidence or evaluation row. Phase 19's boundary is preserved — a trace
+writes no evaluation judgement and is never converted into one.
+
+The phase adds `agent_trace_runs` and `agent_trace_events` (schema v18), both
+workspace-scoped with run- and user-foreign-keys, and `CHECK` constraints that
+make the invariants unwriteable rather than merely discouraged: the stage and
+outcome vocabularies, positive counters, a non-empty step id, a pinned semver
+version, non-negative durations and tokens, a tool only on a `tool_call`, an
+error code only on a `failed` step, and an open run agreeing with its null
+closing fields. Seven workspace-scoped session-authenticated routes read and
+write them; forged `workspaceId`, `actorUserId`, `status`, `sequence`, `attempt`
+and timestamps in a body are ignored. Its gate — the seven stages, the nine
+dimensions, every way to be derived a status that was not earned, and nothing
+executed — is covered by `tests/phase20-gate.test.ts`, and end to end after the
+send, the booking, the cost, the dashboard, the registry and the evaluation by
+`tests/phases9-20-integration.test.ts`.
+
+The honest limitation: every trace in this repository today records work
+performed **outside** it. This phase makes the recording checkable; the
+executor that will produce real runs is not here, and nothing in this phase
+becomes usable as a result of it.
+
+Next is **Phase 21 — Optimization Engine**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -515,6 +597,7 @@ packages/       Shared TypeScript packages (built with project references)
   dashboard/     Revenue dashboard derived on read, published refusals, policy (Phase 17)
   agent/        Twelve agent declarations, seven-state lifecycle, registry and policy (Phase 18)
   evaluation/   Phase 19's thirteen metrics, the evidence model and the production gate
+  trace/        Agent run traces: seven stages, nine tracked dimensions, derived status (Phase 20)
   api/          Transport handlers and application-service wiring
 integrations/   External system adapters (Phase 12+)
 workflows/      Revenue workflow definitions (Phase 24+)

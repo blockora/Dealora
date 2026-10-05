@@ -183,6 +183,58 @@ has to say so:
   instants, which is the nondeterminism this repository has kept out since
   Phase 14.
 
+## Phase 20 implementation and testing expectations
+
+Agent tracing is real production code over two real tables, and its one
+non-negotiable property is `ROADMAP.md` §27's critical rule: **never silently
+pretend an action succeeded.** Specifically:
+
+- **No caller may supply a status.** `TraceRunStatus` is derived in storage
+  from the outcomes a run's own steps carry, and the close route deliberately
+  does not read its body. If you ever find yourself adding a `status`,
+  `succeeded` flag or completion timestamp to that route, you have removed the
+  phase's reason to exist — and a test should fail if it returns.
+- **Keep the rule duplicated, and keep the cross-check.** Storage derives on
+  write and the domain re-derives on read. A closed run whose two derivations
+  disagree must be **refused** with `UNAVAILABLE`, never printed. If you ever
+  consolidate the two copies into one, the disagreement check loses its
+  meaning — so add the other layer rather than removing this one.
+- **`unverified` is load-bearing, not a leftover.** It is what makes closing an
+  empty trace incapable of producing a success. Adding a sixth status, or
+  deriving `unverified` as `succeeded`, defeats §27 structurally.
+- **Never invent an outcome.** `unknown` exists because a provider that never
+  answered has not failed. Do not map an absent, unconfirmed or unreadable
+  outcome onto `succeeded`, and do not let a recorded `unknown` silently become
+  a failure — the derivation is `failed > unknown > succeeded`, and that
+  ordering is the contract.
+- **Order by `sequence`, never by `recordedAt` or by id.** Two steps recorded in
+  one millisecond are ordinary, and that collision is exactly where an audit
+  trail matters. `sequence` and `attempt` are allocated in storage and
+  `UNIQUE`-constrained; a test must keep rows that share a timestamp in a
+  defined order.
+- **Replay is not retry, and neither is an edit.** An identical resend returns
+  the original row; *different* content for the same `stepId` becomes the next
+  attempt, because §27 tracks retries and a retry is a second attempt. Neither
+  may modify or remove an earlier attempt.
+- **Append-only means no update and no delete.** There is no route for either,
+  a closed run accepts no further step, and re-closing does not rewrite the
+  verdict it already reached.
+- **One number, one owner — for tools and for cost.** A `tool_call` step's tool
+  is read from `@dealora/agent`'s `AGENT_TOOLS`, and a run's cost comes from
+  Phase 16's `cost_events` through `@dealora/cost`'s `deriveBreakdown`. Do not
+  restate either list or re-implement either total; a second copy is the drift
+  ADR 0017 warned about.
+- **Trace ≠ execution, and the boundary is tested.** No runner, dispatcher,
+  loop, scheduler, queue, worker, tool invoker, model client or network client
+  belongs in `@dealora/trace`. A recorded `tool_call` is a claim that a tool was
+  *reported* invoked. Every phase gate here snapshots row counts precisely so a
+  future change that made a trace *perform* its step would fail loudly instead
+  of quietly turning "record a trace" into "run an agent".
+- **A trace is not evaluation evidence.** Phase 19 owns judgements; this phase
+  writes none and never converts a run into one. A cross-check between a
+  recorded outcome and an operator's verdict is a *later* phase's work, and
+  this one does not perform it.
+
 ## Phase 19 implementation and testing expectations
 
 Agent evaluation is real production code over two real tables, so it is held to
