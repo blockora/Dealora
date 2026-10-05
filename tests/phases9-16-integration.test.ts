@@ -11,13 +11,14 @@ import { SandboxEmailProvider } from "@dealora/outbound";
 import { SandboxCalendarProvider } from "@dealora/meeting";
 
 /**
- * Phases 9–15 integration — one document, one decision, one effect, one response,
- * one booking, one recommendation, one graph.
+ * Phases 9–16 integration — one document, one decision, one effect, one response,
+ * one booking, one recommendation, one graph, one cost.
  *
  * Phase 12 added the ability to *read* what came back, Phase 13 the ability to
- * *book* what was read, Phase 14 the ability to *advise* what happens next, and
- * Phase 15 the ability to *trace* everything that happened as one graph. None of
- * them may change what the phases before them guarantee, and that is exactly what
+ * *book* what was read, Phase 14 the ability to *advise* what happens next,
+ * Phase 15 the ability to *trace* everything that happened as one graph, and
+ * Phase 16 the ability to *price* everything that happened — without any of
+ * them changing what the phases before them guarantee, and that is exactly what
  * this file proves: the same journey is walked end to end, and then the seams are
  * probed with each newer surface in play.
  *
@@ -44,6 +45,10 @@ import { SandboxCalendarProvider } from "@dealora/meeting";
  * 11. The whole loop reads back as one derived graph per tenant: every stage of
  *     the revenue loop, all twelve relationships, and not one stored row
  *     (Phase 15).
+ * 12. Every execution the journey performed can show a cost — estimated or
+ *     measured — and the three per-outcome metrics derive from this journey's
+ *     own facts, while the metrics needing customers, revenue or campaigns
+ *     stay refused with their owning phase (Phase 16).
  *
  * The research provider is a **declared test double**, the email provider is the
  * **sandbox**, and the calendar is a **sandbox** too: nothing here retrieves,
@@ -219,6 +224,21 @@ interface Prepared {
   draftVersion: number;
   approvalId: string;
   stagedActionId: string;
+  researchRequestId: string;
+}
+
+/** The derived cost answer Phase 16's metrics route returns. */
+interface IntegrationCostMetrics {
+  ruleVersion: string;
+  totals: { totalMinor: number; eventCount: number };
+  denominators: { prospects: number; qualifiedOpportunities: number; meetings: number };
+  metrics: {
+    name: string;
+    status: string;
+    denominator: number;
+    averageMinor: number | null;
+  }[];
+  refused: { name: string; owningPhase: string | null }[];
 }
 
 /**
@@ -394,6 +414,7 @@ async function prepare(
     draftVersion: draft.draft.version,
     approvalId: decided.approval.id,
     stagedActionId: staged.action.id,
+    researchRequestId: research.request.id,
   };
 }
 
@@ -425,6 +446,7 @@ function rowCounts(): {
   actions: number;
   claims: number;
   evidence: number;
+  costs: number;
 } {
   const db = defaultStore.db;
   return {
@@ -433,6 +455,7 @@ function rowCounts(): {
     actions: db.outboundActions?.length ?? 0,
     claims: db.accountClaims?.length ?? 0,
     evidence: db.evidence?.length ?? 0,
+    costs: db.costEvents?.length ?? 0,
   };
 }
 
@@ -467,7 +490,7 @@ afterAll(() => {
   defaultStore.destroy();
 });
 
-describe("phases 9-15 integration — document, decision, effect, response, booking, next step, graph", () => {
+describe("phases 9-16 integration — document, decision, effect, response, booking, next step, graph, cost", () => {
   it("carries one evidence-backed document through one decision to one delivery and one response", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({
@@ -1262,6 +1285,177 @@ describe("phases 9-15 integration — document, decision, effect, response, book
       ),
     );
     expect(foreign.code).toBe("NOT_FOUND");
+  });
+
+  it("prices the whole loop: every execution shows a cost and the metrics derive from this journey's rows", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+      calendarProviders: [new SandboxCalendarProvider()],
+    });
+    const { token, workspaceId } = tenant("Sixteen");
+
+    // The full journey: a research run, a message that genuinely went out —
+    // then a positive reply and a meeting that genuinely got booked, so all
+    // three executable run kinds exist as real rows.
+    const sent = await journey(
+      handlers,
+      token,
+      workspaceId,
+      unique("p16ada") + "@northwind.example",
+    );
+    const positive = (await dataOf(
+      handlers.createInboundMessageHandler(
+        request(
+          token,
+          { workspaceId, outboundActionId: sent.sentActionId },
+          { body: "Happy to chat. When works for a call next week?" },
+        ),
+      ),
+    )) as { classification: { id: string; intent: string } };
+    expect(positive.classification.intent).toBe("positive_intent");
+    const proposed = (await dataOf(
+      handlers.recommendMeetingHandler(
+        request(
+          token,
+          { workspaceId },
+          {
+            classificationId: positive.classification.id,
+            title: "Intro call",
+            startsAt: "2026-11-02T10:00:00.000Z",
+            endsAt: "2026-11-02T10:30:00.000Z",
+            timezone: "Europe/Berlin",
+            durationMinutes: 30,
+          },
+        ),
+      ),
+    )) as { meeting: { id: string; state: string } };
+    await dataOf(
+      handlers.decideMeetingHandler(
+        request(token, { workspaceId, id: proposed.meeting.id }, { decision: "approve" }),
+      ),
+    );
+    const booked = (await dataOf(
+      handlers.bookMeetingHandler(request(token, { workspaceId, id: proposed.meeting.id })),
+    )) as { meeting: { id: string; state: string } };
+    expect(booked.meeting.state).toBe("booked");
+
+    // One fact per execution kind — the runs this repository can perform.
+    const facts = [
+      {
+        executionKind: "research_run",
+        executionId: sent.researchRequestId,
+        category: "llm",
+        basis: "estimated",
+        amountMinor: 800,
+      },
+      {
+        executionKind: "outbound_send",
+        executionId: sent.sentActionId,
+        category: "tool",
+        basis: "measured",
+        amountMinor: 250,
+      },
+      {
+        executionKind: "meeting_booking",
+        executionId: booked.meeting.id,
+        category: "infrastructure",
+        basis: "measured",
+        amountMinor: 400,
+      },
+    ];
+    const before = rowCounts();
+    for (const fact of facts) {
+      await dataOf(
+        handlers.recordCostHandler(
+          request(
+            token,
+            { workspaceId },
+            {
+              ...fact,
+              currency: "USD",
+              source: "provider usage export",
+              occurredAt: "2026-10-02T00:00:00.000Z",
+              idempotencyKey: unique("p16cost"),
+            },
+          ),
+        ),
+      );
+    }
+    // Recording cost touched exactly one table: cost_events only.
+    const after = rowCounts();
+    expect(after.costs).toBe(before.costs + 3);
+    for (const table of Object.keys(before) as (keyof typeof before)[]) {
+      if (table === "costs") continue;
+      expect(after[table]).toBe(before[table]);
+    }
+
+    // Every execution of the journey shows its own cost — the gate, across
+    // all three run kinds, each with its own basis.
+    for (const fact of facts) {
+      const summary = (await dataOf(
+        handlers.getExecutionCostHandler(
+          request(token, { workspaceId }, undefined, {
+            executionKind: fact.executionKind,
+            executionId: fact.executionId,
+          }),
+        ),
+      )) as {
+        totals: {
+          eventCount: number;
+          totalMinor: number;
+          estimatedMinor: number;
+          measuredMinor: number;
+          currency: string | null;
+        };
+      };
+      expect(summary.totals.eventCount).toBe(1);
+      expect(summary.totals.totalMinor).toBe(fact.amountMinor);
+      expect(summary.totals.currency).toBe("USD");
+      if (fact.basis === "estimated") {
+        expect(summary.totals.estimatedMinor).toBe(fact.amountMinor);
+        expect(summary.totals.measuredMinor).toBe(0);
+      } else {
+        expect(summary.totals.measuredMinor).toBe(fact.amountMinor);
+        expect(summary.totals.estimatedMinor).toBe(0);
+      }
+    }
+
+    // All three per-outcome metrics derive from this one journey: one stored
+    // account, one qualified opportunity, one booked meeting. The three
+    // metrics that need customers, revenue or campaigns stay refused.
+    const metricsOf = async (): Promise<IntegrationCostMetrics> =>
+      (await dataOf(
+        handlers.getCostMetricsHandler(request(token, { workspaceId })),
+      )) as IntegrationCostMetrics;
+    const metrics = await metricsOf();
+    expect(metrics.totals.totalMinor).toBe(800 + 250 + 400);
+    expect(metrics.totals.eventCount).toBe(3);
+    expect(metrics.denominators).toEqual({
+      prospects: 1,
+      qualifiedOpportunities: 1,
+      meetings: 1,
+    });
+    expect(metrics.metrics.every((metric) => metric.status === "derived")).toBe(true);
+    const perProspect = metrics.metrics.find((metric) => metric.name === "cost_per_prospect");
+    expect(perProspect?.denominator).toBe(1);
+    expect(perProspect?.averageMinor).toBe(1450);
+    const perMeeting = metrics.metrics.find((metric) => metric.name === "cost_per_meeting");
+    expect(perMeeting?.denominator).toBe(1);
+    expect(metrics.refused.map((entry) => entry.name)).toEqual([
+      "cost_per_customer",
+      "revenue_per_ai_cost",
+      "revenue_per_campaign",
+    ]);
+    expect(metrics.refused[0]?.owningPhase).toBe("Phase 17 / 23");
+
+    // Deriving twice from the same rows answers the same thing: no stored
+    // aggregate, no accumulation, no clock.
+    expect(await metricsOf()).toEqual(metrics);
+
+    // And none of these reads wrote a single row of any kind.
+    expect(rowCounts()).toEqual(after);
   });
 });
 
