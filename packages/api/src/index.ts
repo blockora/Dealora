@@ -135,6 +135,24 @@ export type {
 } from "@dealora/revenuegraph";
 
 /**
+ * The Cost domain's public surface, re-exported so API consumers can type a
+ * cost response without depending on the domain package directly.
+ */
+export type {
+  CostBasis,
+  CostBreakdown,
+  CostCategory,
+  CostError,
+  CostEventView,
+  CostExecutionKind,
+  CostPolicyView,
+  DerivedCostMetric,
+  ExecutionCostSummary,
+  RefusedCostMetric,
+  WorkspaceCostMetrics,
+} from "@dealora/cost";
+
+/**
  * The Qualification domain's public surface, re-exported so API consumers can
  * type a qualification response without depending on the domain package
  * directly.

@@ -54,6 +54,7 @@ import {
   createRevenueGraphReader,
   createRevenueGraphService,
 } from "@dealora/revenuegraph";
+import { createCostService } from "@dealora/cost";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -435,6 +436,15 @@ export function createDefaultHandlers(options?: {
       createRevenueGraphReader(store as never),
       createRevenueGraphIndexReader(store as never),
     ),
+    /**
+     * The cost boundary: it appends one immutable fact per request for a run
+     * that exists in this workspace, and derives every total and metric on
+     * read. Attribution is the session's (`createdBy`) and the server's clock
+     * (`createdAt`) inside storage — the request body contributes the fact's
+     * own fields and nothing else, so a client cannot name who recorded a
+     * cost, when, or what the total should be.
+     */
+    cost: createCostService(store as never),
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());

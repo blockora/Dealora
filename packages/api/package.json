@@ -18,6 +18,7 @@
     "@dealora/brain": "workspace:*",
     "@dealora/conversation": "workspace:*",
     "@dealora/core": "workspace:*",
+    "@dealora/cost": "workspace:*",
     "@dealora/db": "workspace:*",
     "@dealora/evidence": "workspace:*",
     "@dealora/goal": "workspace:*",

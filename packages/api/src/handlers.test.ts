@@ -61,6 +61,7 @@ import {
   createRevenueGraphReader,
   createRevenueGraphService,
 } from "@dealora/revenuegraph";
+import { createCostService } from "@dealora/cost";
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
 import type { RevenueGoal } from "@dealora/db";
@@ -208,6 +209,16 @@ function revenueGraphService(store: Store) {
     createRevenueGraphReader(store as never),
     createRevenueGraphIndexReader(store as never),
   );
+}
+
+/**
+ * Wire the Cost Engine the way the production wiring does: the real store,
+ * so a route test that records a cost exercises the same append-only fact
+ * table, the same server-side attribution and the same derivation the real
+ * application uses — not a stand-in that could not disagree with it.
+ */
+function costService(store: Store) {
+  return createCostService(store as never);
 }
 
 /**
@@ -360,6 +371,7 @@ function fixture(options?: {
     meeting: meetingService(store),
     nextaction: nextActionService(store),
     revenuegraph: revenueGraphService(store),
+    cost: costService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -844,6 +856,7 @@ describe("API Revenue Goal routes", () => {
       meeting: meetingService(store),
       nextaction: nextActionService(store),
       revenuegraph: revenueGraphService(store),
+      cost: costService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1182,6 +1195,7 @@ describe("API Revenue Plan routes", () => {
       meeting: meetingService(store),
       nextaction: nextActionService(store),
       revenuegraph: revenueGraphService(store),
+      cost: costService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1401,6 +1415,7 @@ describe("API Business Brain routes", () => {
       meeting: meetingService(failingStore),
       nextaction: nextActionService(failingStore),
       revenuegraph: revenueGraphService(failingStore),
+      cost: costService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1745,6 +1760,7 @@ describe("API Account & Contact routes", () => {
       meeting: meetingService(store),
       nextaction: nextActionService(store),
       revenuegraph: revenueGraphService(store),
+      cost: costService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -2056,6 +2072,7 @@ describe("API Research routes", () => {
       meeting: meetingService(store),
       nextaction: nextActionService(store),
       revenuegraph: revenueGraphService(store),
+      cost: costService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -2111,6 +2128,7 @@ describe("API Research routes", () => {
       meeting: meetingService(store),
       nextaction: nextActionService(store),
       revenuegraph: revenueGraphService(store),
+      cost: costService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3254,6 +3272,7 @@ describe("API Qualification routes", () => {
       meeting: meetingService(store),
       nextaction: nextActionService(store),
       revenuegraph: revenueGraphService(store),
+      cost: costService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -3557,6 +3576,7 @@ describe("API Next Best Action routes", () => {
         createRevenueGraphReader(failingStore as never),
         createRevenueGraphIndexReader(failingStore as never),
       ),
+      cost: costService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -3855,5 +3875,478 @@ describe("API Revenue Graph routes", () => {
     expect(policy.refused.find((entry) => entry.name === "campaign")?.owningPhase).toBeNull();
     expect(policy.neverDoes.join(" ")).toContain("never write");
     expect(policy.neverDoes.join(" ")).toContain("never act");
+  });
+});
+
+describe("API Cost routes", () => {
+  /** One real research run in tenant A for costs to be filed against. */
+  function costFixture(): {
+    handlers: ReturnType<typeof createHandlers>;
+    token: string;
+    workspaceId: string;
+    requestId: string;
+    built: ReturnType<typeof fixture>;
+  } {
+    const built = fixture();
+    const account = built.store.createAccount({
+      workspaceId: built.workspaceA,
+      createdBy: built.userA,
+      account: {
+        name: "Northwind",
+        website: null,
+        domain: "northwind.example",
+        industry: "SaaS",
+        companySize: "50-200",
+        geography: "Germany",
+        description: null,
+        source: "manual",
+        sourceReference: null,
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(account)) throw new Error("fixture account failed");
+    const request1 = built.store.createResearchRequest({
+      workspaceId: built.workspaceA,
+      requestedBy: built.userA,
+      accountId: account.value.id,
+      provider: "account_record",
+      categories: ["company_overview"],
+    });
+    if (!isOk(request1)) throw new Error("fixture research request failed");
+    return {
+      handlers: built.handlers,
+      token: built.tokenA,
+      workspaceId: built.workspaceA,
+      requestId: request1.value.id,
+      built,
+    };
+  }
+
+  interface CostEvent {
+    id: string;
+    executionKind: string;
+    executionId: string;
+    category: string;
+    basis: string;
+    amountMinor: number;
+    currency: string;
+    source: string | null;
+    occurredAt: string;
+    idempotencyKey: string;
+    createdBy: string;
+    createdAt: string;
+  }
+
+  interface CostBreakdownData {
+    currency: string | null;
+    eventCount: number;
+    totalMinor: number;
+    estimatedMinor: number;
+    measuredMinor: number;
+    supersededEstimateMinor: number;
+    byCategory: { category: string; amountMinor: number }[];
+  }
+
+  interface ExecutionSummaryData {
+    ruleVersion: string;
+    executionKind: string;
+    executionId: string;
+    totals: CostBreakdownData;
+  }
+
+  interface CostMetricsData {
+    ruleVersion: string;
+    totals: CostBreakdownData;
+    denominators: { prospects: number; qualifiedOpportunities: number; meetings: number };
+    metrics: { name: string; status: string; averageMinor: number | null; denominator: number }[];
+    refused: { name: string; reason: string; owningPhase: string | null }[];
+  }
+
+  interface CostPolicyData {
+    ruleVersion: string;
+    categories: { category: string }[];
+    bases: { basis: string }[];
+    executionKinds: string[];
+    refusedExecutionKinds: { name: string; owningPhase: string | null }[];
+    currencies: string[];
+    oneCurrencyPerWorkspace: boolean;
+    limits: { amountMinorMin: number; idempotencyKeyMax: number };
+    aggregationRule: string;
+    denominators: { metric: string; definition: string }[];
+    metrics: { name: string; status: string }[];
+    neverDoes: string[];
+  }
+
+  const validCostBody = (executionId: string, overrides: Record<string, unknown> = {}) => ({
+    executionKind: "research_run",
+    executionId,
+    category: "llm",
+    basis: "measured",
+    amountMinor: 1234,
+    currency: "USD",
+    source: "usage export",
+    occurredAt: "2026-10-01T00:00:00.000Z",
+    idempotencyKey: "route-key-1",
+    ...overrides,
+  });
+
+  it("records a fact with server attribution and reads it back through the routes", async () => {
+    const f = costFixture();
+    // The body carries forged identity and a forged total; both are ignored.
+    const recorded = (await dataOf(
+      f.handlers.recordCostHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: validCostBody(f.requestId, {
+            createdBy: "someone-else",
+            workspaceId: "forged-workspace",
+            createdAt: "2000-01-01T00:00:00.000Z",
+            totalMinor: 999999,
+          }),
+        }),
+      ),
+    )) as { costEvent: CostEvent };
+    expect(recorded.costEvent.amountMinor).toBe(1234);
+    expect(recorded.costEvent.createdBy).not.toBe("someone-else");
+    expect(recorded.costEvent).not.toHaveProperty("totalMinor");
+
+    const fetched = (await dataOf(
+      f.handlers.getCostHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId, id: recorded.costEvent.id },
+        }),
+      ),
+    )) as CostEvent;
+    expect(fetched).toEqual(recorded.costEvent);
+    // The session's user recorded it — the token resolves to tenant A's owner.
+    expect(fetched.createdBy).toBe(f.built.userA);
+
+    const listed = (await dataOf(
+      f.handlers.listCostsHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    )) as { costEvents: CostEvent[] };
+    expect(listed.costEvents).toHaveLength(1);
+    expect(listed.costEvents[0]).toEqual(recorded.costEvent);
+  });
+
+  it("shows one execution's estimated and measured cost — the phase gate", async () => {
+    const f = costFixture();
+    for (const body of [
+      validCostBody(f.requestId, { basis: "estimated", amountMinor: 1000, idempotencyKey: "g1" }),
+      validCostBody(f.requestId, { basis: "measured", amountMinor: 900, idempotencyKey: "g2" }),
+      validCostBody(f.requestId, {
+        category: "search",
+        basis: "estimated",
+        amountMinor: 100,
+        idempotencyKey: "g3",
+      }),
+    ]) {
+      await dataOf(
+        f.handlers.recordCostHandler(
+          request({ token: f.token, params: { workspaceId: f.workspaceId }, body }),
+        ),
+      );
+    }
+
+    const summary = (await dataOf(
+      f.handlers.getExecutionCostHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          query: { executionKind: "research_run", executionId: f.requestId },
+        }),
+      ),
+    )) as ExecutionSummaryData;
+    expect(summary.ruleVersion).toBe("cost-1.0.0");
+    expect(summary.executionId).toBe(f.requestId);
+    expect(summary.totals.estimatedMinor).toBe(1100);
+    expect(summary.totals.measuredMinor).toBe(900);
+    // The measured llm cost supersedes its own estimate: no double counting.
+    expect(summary.totals.supersededEstimateMinor).toBe(1000);
+    expect(summary.totals.totalMinor).toBe(1000);
+    expect(summary.totals.currency).toBe("USD");
+  });
+
+  it("derives workspace metrics and refuses the metrics that need later phases", async () => {
+    const f = costFixture();
+    await dataOf(
+      f.handlers.recordCostHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: validCostBody(f.requestId),
+        }),
+      ),
+    );
+
+    const metrics = (await dataOf(
+      f.handlers.getCostMetricsHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    )) as CostMetricsData;
+    expect(metrics.totals.totalMinor).toBe(1234);
+    expect(metrics.denominators.prospects).toBe(1);
+    expect(metrics.metrics).toHaveLength(3);
+    const perProspect = metrics.metrics.find((m) => m.name === "cost_per_prospect");
+    expect(perProspect?.status).toBe("derived");
+    expect(perProspect?.averageMinor).toBe(1234);
+    // The three metrics no Phase 0–16 row can feed are refused with a reason
+    // and an owning phase, never approximated.
+    expect(metrics.refused.map((r) => r.name)).toEqual([
+      "cost_per_customer",
+      "revenue_per_ai_cost",
+      "revenue_per_campaign",
+    ]);
+    for (const refused of metrics.refused) {
+      expect(refused.reason.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("publishes the cost vocabulary and the refusals with their owning phases", async () => {
+    const f = costFixture();
+    const policy = (await dataOf(
+      f.handlers.getCostPolicyHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    )) as CostPolicyData;
+    expect(policy.ruleVersion).toBe("cost-1.0.0");
+    expect(policy.categories.map((c) => c.category)).toEqual([
+      "llm",
+      "search",
+      "data",
+      "tool",
+      "infrastructure",
+      "execution",
+    ]);
+    expect(policy.bases.map((b) => b.basis)).toEqual(["estimated", "measured"]);
+    expect(policy.executionKinds).toEqual(["research_run", "outbound_send", "meeting_booking"]);
+    // `workflow` is refused and names the phase that owns it — never
+    // published as an execution kind nothing here can produce.
+    expect(policy.refusedExecutionKinds).toHaveLength(1);
+    expect(policy.refusedExecutionKinds[0]?.name).toBe("workflow");
+    expect(policy.refusedExecutionKinds[0]?.owningPhase).toBe("Phase 24");
+    expect(policy.currencies).toEqual(["USD", "EUR", "GBP", "JPY"]);
+    expect(policy.oneCurrencyPerWorkspace).toBe(true);
+    expect(policy.limits.amountMinorMin).toBe(0);
+    expect(policy.limits.idempotencyKeyMax).toBe(128);
+    expect(policy.aggregationRule).toContain("measured");
+    expect(policy.metrics.filter((m) => m.status === "derived")).toHaveLength(3);
+    expect(policy.metrics.filter((m) => m.status === "refused")).toHaveLength(3);
+    expect(policy.denominators).toHaveLength(3);
+    expect(policy.neverDoes.join(" ")).toContain("never stores a total");
+  });
+
+  it("requires authentication and a workspace id on every Phase 16 route", async () => {
+    const f = costFixture();
+    const anonymous = { ...request({ params: { workspaceId: f.workspaceId } }) };
+    delete (anonymous.query as Record<string, unknown>).sessionToken;
+    const workspaceScoped = [
+      f.handlers.recordCostHandler({ ...anonymous, body: validCostBody(f.requestId) }),
+      f.handlers.getCostHandler({ ...anonymous, params: { workspaceId: f.workspaceId, id: "x" } }),
+      f.handlers.listCostsHandler(anonymous),
+      f.handlers.getExecutionCostHandler(anonymous),
+      f.handlers.getCostMetricsHandler(anonymous),
+      f.handlers.getCostPolicyHandler(anonymous),
+    ];
+    for (const call of workspaceScoped) {
+      const error = await errorOf(call);
+      expect(error.code).toBe("UNAUTHENTICATED");
+    }
+
+    for (const call of [
+      f.handlers.recordCostHandler(request({ token: f.token, body: validCostBody(f.requestId) })),
+      f.handlers.listCostsHandler(request({ token: f.token })),
+      f.handlers.getExecutionCostHandler(request({ token: f.token })),
+      f.handlers.getCostMetricsHandler(request({ token: f.token })),
+      f.handlers.getCostPolicyHandler(request({ token: f.token })),
+    ]) {
+      const error = await errorOf(call);
+      expect(error.code).toBe("VALIDATION_ERROR");
+    }
+  });
+
+  it("maps malformed and refused requests onto the transport envelope", async () => {
+    const f = costFixture();
+    // Malformed money and vocabulary: refused with the field named.
+    for (const body of [
+      validCostBody(f.requestId, { category: "workflow" }),
+      validCostBody(f.requestId, { basis: "guessed" }),
+      validCostBody(f.requestId, { amountMinor: -5 }),
+      validCostBody(f.requestId, { amountMinor: 12.5 }),
+      validCostBody(f.requestId, { currency: "XYZ" }),
+      validCostBody(f.requestId, { occurredAt: "never" }),
+      validCostBody(f.requestId, { idempotencyKey: "" }),
+      validCostBody(f.requestId, { executionId: "" }),
+    ]) {
+      const error = await errorOf(
+        f.handlers.recordCostHandler(
+          request({ token: f.token, params: { workspaceId: f.workspaceId }, body }),
+        ),
+      );
+      expect(error.code).toBe("VALIDATION_ERROR");
+      expect(error.details?.length).toBeGreaterThan(0);
+    }
+
+    // The future `workflow` kind names its owning phase instead of failing
+    // generically — a caller learns what to wait for, not just "no".
+    const workflow = await errorOf(
+      f.handlers.recordCostHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: validCostBody(f.requestId, { executionKind: "workflow" }),
+        }),
+      ),
+    );
+    expect(workflow.code).toBe("VALIDATION_ERROR");
+    expect(workflow.message).toContain("Phase 24");
+
+    // An execution that does not exist cannot receive a cost.
+    const unknownExecution = await errorOf(
+      f.handlers.recordCostHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: validCostBody("never-issued"),
+        }),
+      ),
+    );
+    expect(unknownExecution.code).toBe("NOT_FOUND");
+
+    // A replayed key with a different payload is a CONFLICT, not a rewrite.
+    await dataOf(
+      f.handlers.recordCostHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: validCostBody(f.requestId),
+        }),
+      ),
+    );
+    const conflict = await errorOf(
+      f.handlers.recordCostHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: validCostBody(f.requestId, { amountMinor: 1 }),
+        }),
+      ),
+    );
+    expect(conflict.code).toBe("CONFLICT");
+  });
+
+  it("keeps every cost read and write inside one tenant", async () => {
+    const f = costFixture();
+    const recorded = (await dataOf(
+      f.handlers.recordCostHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: validCostBody(f.requestId),
+        }),
+      ),
+    )) as { costEvent: CostEvent };
+
+    // Tenant B names tenant A's workspace: refused at the guard.
+    const foreignWorkspace = await errorOf(
+      f.handlers.listCostsHandler(
+        request({ token: f.built.tokenB, params: { workspaceId: f.workspaceId } }),
+      ),
+    );
+    expect(foreignWorkspace.code).toBe("UNAUTHORIZED");
+
+    // Tenant B's own workspace holds none of tenant A's facts.
+    const theirs = (await dataOf(
+      f.handlers.listCostsHandler(
+        request({
+          token: f.built.tokenB,
+          params: { workspaceId: f.built.workspaceB },
+        }),
+      ),
+    )) as { costEvents: CostEvent[] };
+    expect(theirs.costEvents).toEqual([]);
+
+    // Reading tenant A's fact id from tenant B reads as absent, not forbidden.
+    const crossed = await errorOf(
+      f.handlers.getCostHandler(
+        request({
+          token: f.built.tokenB,
+          params: { workspaceId: f.built.workspaceB, id: recorded.costEvent.id },
+        }),
+      ),
+    );
+    expect(crossed.code).toBe("NOT_FOUND");
+
+    // Tenant B cannot file a cost against tenant A's run either.
+    const crossedRecord = await errorOf(
+      f.handlers.recordCostHandler(
+        request({
+          token: f.built.tokenB,
+          params: { workspaceId: f.built.workspaceB },
+          body: validCostBody(f.requestId, { idempotencyKey: "crossed" }),
+        }),
+      ),
+    );
+    expect(crossedRecord.code).toBe("NOT_FOUND");
+  });
+
+  it("filters the list by vocabulary and refuses a filter outside it", async () => {
+    const f = costFixture();
+    await dataOf(
+      f.handlers.recordCostHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: validCostBody(f.requestId, { category: "search", idempotencyKey: "s1" }),
+        }),
+      ),
+    );
+    await dataOf(
+      f.handlers.recordCostHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: validCostBody(f.requestId, { category: "llm", idempotencyKey: "s2" }),
+        }),
+      ),
+    );
+
+    const searchOnly = (await dataOf(
+      f.handlers.listCostsHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          query: { category: "search" },
+        }),
+      ),
+    )) as { costEvents: CostEvent[] };
+    expect(searchOnly.costEvents).toHaveLength(1);
+    expect(searchOnly.costEvents[0]?.category).toBe("search");
+
+    const measuredOnly = (await dataOf(
+      f.handlers.listCostsHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          query: { basis: "measured" },
+        }),
+      ),
+    )) as { costEvents: CostEvent[] };
+    expect(measuredOnly.costEvents).toHaveLength(2);
+
+    const badFilter = await errorOf(
+      f.handlers.listCostsHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          query: { category: "not-a-category" },
+        }),
+      ),
+    );
+    expect(badFilter.code).toBe("VALIDATION_ERROR");
   });
 });

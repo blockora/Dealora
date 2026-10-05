@@ -29,6 +29,7 @@ import type { ConversationError, ConversationService } from "@dealora/conversati
 import type { MeetingError, MeetingService } from "@dealora/meeting";
 import type { NextActionError, NextActionService } from "@dealora/nextaction";
 import type { RevenueGraphError, RevenueGraphService } from "@dealora/revenuegraph";
+import type { CostError, CostService } from "@dealora/cost";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -464,6 +465,36 @@ function fromRevenueGraphError(error: RevenueGraphError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `CostError` into the safe API error envelope.
+ *
+ * Exhaustive with no cast, like every other mapper here: TypeScript accepts
+ * this function only while every member of the domain's error union has a
+ * case. A replayed key is a CONFLICT the caller can retry differently;
+ * `UNAVAILABLE` (an aggregate that could not be derived) is internal and is
+ * never surfaced verbatim.
+ */
+function fromCostError(error: CostError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+        return "VALIDATION_ERROR";
+      case "CONFLICT":
+        return "CONFLICT";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = [...error.details];
+  return mapped;
+}
+
 export interface HandlerDeps {
   identity: IdentityService;
   brain: BusinessBrainService;
@@ -482,6 +513,7 @@ export interface HandlerDeps {
   meeting: MeetingService;
   nextaction: NextActionService;
   revenuegraph: RevenueGraphService;
+  cost: CostService;
   resolveSession: SessionResolver;
 }
 
@@ -2794,6 +2826,119 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok(result.value) };
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 16 — Cost Engine
+  //
+  // These handlers answer ROADMAP.md §23: what did a run cost, and what does
+  // the whole workspace's cost look like once derived from its facts.
+  //
+  // Recording appends exactly one immutable fact per request. The body is
+  // read for the fact's fields — execution, category, basis, amount, currency,
+  // occurred-at, idempotency key, source — and for nothing else: who recorded
+  // it is the session, when it was recorded is the server's clock, and a
+  // `createdBy`, `workspaceId` or `totalMinor` in the body is ignored rather
+  // than trusted. Totals are never accepted, only derived.
+  //
+  // Reads are all server-side derivations over the caller's own workspace:
+  // no route stores, accepts or mutates an aggregate.
+  // -------------------------------------------------------------------------
+
+  /** Append one immutable cost fact for a run of this workspace. */
+  const recordCostHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.cost.record(workspaceId, actor.userId, {
+        executionKind: body.executionKind,
+        executionId: body.executionId,
+        category: body.category,
+        basis: body.basis,
+        amountMinor: body.amountMinor,
+        currency: body.currency,
+        source: body.source,
+        occurredAt: body.occurredAt,
+        idempotencyKey: body.idempotencyKey,
+      });
+      if (!result.ok) return { ok: false, error: fromCostError(result.error) };
+      return { ok: true, value: ok({ costEvent: result.value }) };
+    });
+
+  /** One recorded cost fact, authorized against the caller's workspace. */
+  const getCostHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const id = param(req, "id");
+      if (isApiError(id)) return { ok: false, error: id };
+
+      const result = deps.cost.get(workspaceId, actor.userId, id);
+      if (!result.ok) return { ok: false, error: fromCostError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** The workspace's recorded facts, optionally narrowed, newest first. */
+  const listCostsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.cost.list(workspaceId, actor.userId, {
+        executionKind: req.query.executionKind,
+        executionId: req.query.executionId,
+        category: req.query.category,
+        basis: req.query.basis,
+      });
+      if (!result.ok) return { ok: false, error: fromCostError(result.error) };
+      return { ok: true, value: ok({ costEvents: result.value }) };
+    });
+
+  /**
+   * What one execution cost — the phase's gate. The estimated and measured
+   * sums are reported separately over the double-count-safe total, so a run
+   * can show estimated **or** measured cost from stored facts alone.
+   */
+  const getExecutionCostHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.cost.executionCost(workspaceId, actor.userId, {
+        executionKind: req.query.executionKind,
+        executionId: req.query.executionId,
+      });
+      if (!result.ok) return { ok: false, error: fromCostError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * The workspace's derived cost picture: totals, metric denominators, the
+   * three derivable metrics and the three refused with their owning phase.
+   * Every number here is recomputed from the facts on this request.
+   */
+  const getCostMetricsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.cost.metrics(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromCostError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** The cost vocabulary this deployment enforces, and everything it refuses. */
+  const getCostPolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.cost.policy(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromCostError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -2931,6 +3076,16 @@ export function createHandlers(deps: HandlerDeps) {
     getRevenueGraphHandler,
     traceOpportunityHandler,
     getRevenueGraphPolicyHandler,
+
+    // -------------------------------------------------------------------------
+    // Phase 16 — Cost Engine
+    // -------------------------------------------------------------------------
+    recordCostHandler,
+    getCostHandler,
+    listCostsHandler,
+    getExecutionCostHandler,
+    getCostMetricsHandler,
+    getCostPolicyHandler,
   };
 }
 
