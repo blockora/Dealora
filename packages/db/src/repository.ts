@@ -47,6 +47,10 @@ import type {
   CostCategory,
   CostEvent,
   CostExecutionKind,
+  AgentRegistry,
+  AgentRegistryEvent,
+  AgentRegistryEventKind,
+  AgentRegistryStatus,
   NextBestAction,
   NextBestActionKind,
   NextBestActionRiskLevel,
@@ -127,6 +131,55 @@ function ensureDir(): void {
 }
 
 /**
+ * The twelve agent ids ROADMAP.md §25 names, as the storage-layer vocabulary.
+ *
+ * Duplicated here rather than imported from `@dealora/agent` on purpose: the
+ * database package must not depend on a domain package, and the cost of that
+ * independence is that this list could drift from the domain's. The drift is
+ * caught rather than prevented — `packages/db/src/repository.test.ts` asserts
+ * this list equals `AGENT_IDS` and this set equals `AGENT_STATE_ORDER`, so the
+ * two cannot diverge without a test failing.
+ */
+const AGENT_ID_VALUES = [
+  "strategy",
+  "market_intelligence",
+  "account_research",
+  "prospect_discovery",
+  "qualification",
+  "personalization",
+  "conversation",
+  "follow_up",
+  "meeting",
+  "crm",
+  "analytics",
+  "optimization",
+] as const;
+
+/** The seven lifecycle states ROADMAP.md §25 names. Same drift check applies. */
+const AGENT_STATUS_VALUES = [
+  "draft",
+  "testing",
+  "approved",
+  "production",
+  "paused",
+  "disabled",
+  "archived",
+] as const satisfies readonly AgentRegistryStatus[];
+
+const AGENT_ID_SET: ReadonlySet<string> = new Set(AGENT_ID_VALUES);
+const AGENT_STATUS_SET: ReadonlySet<string> = new Set(AGENT_STATUS_VALUES);
+
+/** Whether a string names one of the twelve declared agents. */
+function isStoredAgentId(value: string): boolean {
+  return AGENT_ID_SET.has(value);
+}
+
+/** Whether a string names one of the seven stored lifecycle states. */
+function isStoredAgentStatus(value: string): value is AgentRegistryStatus {
+  return AGENT_STATUS_SET.has(value);
+}
+
+/**
  * Phase 2 migration.
  *
  * A store written by Phase 1 has no Business Brain tables and no `market`
@@ -136,7 +189,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 15;
+export const LATEST_SCHEMA_VERSION = 16;
 
 export interface DbState {
   schemaVersion?: number;
@@ -174,6 +227,8 @@ export interface DbState {
   meetingEvents?: MeetingEvent[];
   nextBestActions?: NextBestAction[];
   costEvents?: CostEvent[];
+  agentRegistry?: AgentRegistry[];
+  agentRegistryEvents?: AgentRegistryEvent[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -216,6 +271,8 @@ export function emptyState(): CompleteDbState {
     meetingEvents: [],
     nextBestActions: [],
     costEvents: [],
+    agentRegistry: [],
+    agentRegistryEvents: [],
   };
 }
 
@@ -438,6 +495,23 @@ export function migrateState(input: DbState): CompleteDbState {
     state.costEvents = Array.isArray(input.costEvents) ? input.costEvents : base.costEvents;
   }
 
+  // Phase 18 adds the Agent Registry: one row per (workspace, agent) holding
+  // only the lifecycle state that workspace's people have chosen, plus the
+  // append-only governance trail of who chose it. Additive like every step
+  // before it: a Phase 16 document gains two empty tables and keeps every cost
+  // event it already had. Nothing before it is touched, and the upgrade adds no
+  // way to *run* an agent — it records decisions about a registry and nothing
+  // else. No row is rewritten, so a registry state recorded before the upgrade
+  // is exactly the state it was afterwards.
+  if (version >= 16) {
+    state.agentRegistry = Array.isArray(input.agentRegistry)
+      ? input.agentRegistry
+      : base.agentRegistry;
+    state.agentRegistryEvents = Array.isArray(input.agentRegistryEvents)
+      ? input.agentRegistryEvents
+      : base.agentRegistryEvents;
+  }
+
   return state;
 }
 
@@ -491,6 +565,8 @@ type RowTable =
   | "meetingEvents"
   | "nextBestActions"
   | "costEvents"
+  | "agentRegistry"
+  | "agentRegistryEvents"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -4388,6 +4464,146 @@ export class Store {
           : a.occurredAt > b.occurredAt
             ? -1
             : a.id.localeCompare(b.id),
+      ),
+    };
+  }
+  // --- Phase 18: Agent Registry (ROADMAP.md §25) ---
+
+  /**
+   * The workspace's recorded lifecycle states, in the store's insertion order.
+   *
+   * An agent with no row is absent rather than defaulted: the *default* is a
+   * domain rule (`draft`, from the declaration), and applying it here would put
+   * a product decision in the persistence layer. The service applies it when
+   * it derives the view, so a workspace that has decided nothing about an agent
+   * reports it as `draft` without a row existing.
+   */
+  listAgentRegistry(
+    workspaceId: EntityId,
+    userId: EntityId,
+  ): Result<AgentRegistry[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    return {
+      ok: true,
+      value: this.rows("agentRegistry").filter((row) => row.workspaceId === workspaceId),
+    };
+  }
+
+  /** One recorded state, authorized against the caller's own workspace. */
+  getAgentRegistry(
+    workspaceId: EntityId,
+    userId: EntityId,
+    agentId: string,
+  ): Result<AgentRegistry | null, StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const row =
+      this.rows("agentRegistry").find(
+        (entry) => entry.workspaceId === workspaceId && entry.agentId === agentId,
+      ) ?? null;
+    return { ok: true, value: row };
+  }
+
+  /**
+   * Record one lifecycle state and append its governance event.
+   *
+   * The store stores the state; it does **not** decide the state. Whether the
+   * transition is permitted is the Phase 18 service's call, from the published
+   * transition table — so persisting a state here can never widen what the
+   * lifecycle allows, and a caller who reaches this method directly still cannot
+   * name an agent outside the twelve or a state outside the seven, because the
+   * vocabularies are validated here as well.
+   *
+   * `updatedBy` and both timestamps come from the server: the caller supplies
+   * the workspace, the agent and the target state and nothing else.
+   */
+  setAgentStatus(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    agentId: string;
+    status: string;
+  }): Result<AgentRegistry, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    if (!isStoredAgentId(input.agentId)) {
+      return { ok: false, error: toError("INVALID", "unknown agent id") };
+    }
+    if (!isStoredAgentStatus(input.status)) {
+      return { ok: false, error: toError("INVALID", "unknown agent state") };
+    }
+    const status = input.status;
+    const at = toDateTime(now());
+    const existing =
+      this.rows("agentRegistry").find(
+        (row) => row.workspaceId === input.workspaceId && row.agentId === input.agentId,
+      ) ?? null;
+
+    const row: AgentRegistry = existing
+      ? { ...existing, status, updatedBy: input.userId, updatedAt: at }
+      : {
+          id: newId(),
+          workspaceId: input.workspaceId,
+          agentId: input.agentId,
+          status,
+          updatedBy: input.userId,
+          updatedAt: at,
+          createdAt: at,
+        };
+    this.mutate("agentRegistry", (rows) => {
+      const typed = rows as AgentRegistry[];
+      if (existing) {
+        typed.splice(
+          typed.findIndex((entry) => entry.id === existing.id),
+          1,
+          row,
+        );
+      } else {
+        typed.push(row);
+      }
+    });
+
+    const kind: AgentRegistryEventKind =
+      existing === null ? "registered" : status === "archived" ? "archived" : "state_changed";
+    const event: AgentRegistryEvent = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      agentId: input.agentId,
+      actorUserId: input.userId,
+      kind,
+      fromStatus: existing ? existing.status : null,
+      toStatus: status,
+      detail: null,
+      createdAt: at,
+    };
+    this.mutate("agentRegistryEvents", (rows) => (rows as AgentRegistryEvent[]).push(event));
+
+    return { ok: true, value: row };
+  }
+
+  /**
+   * The governance trail, optionally narrowed to one agent, in the store's
+   * insertion order (oldest first).
+   *
+   * Ordering is the *service's* decision: it publishes newest-first with an id
+   * tiebreak, and doing it in one place keeps two orderings from existing for
+   * the same list.
+   */
+  listAgentRegistryEvents(
+    workspaceId: EntityId,
+    userId: EntityId,
+    agentId?: string,
+  ): Result<AgentRegistryEvent[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    if (agentId !== undefined && !isStoredAgentId(agentId)) {
+      return { ok: false, error: toError("INVALID", "unknown agent id") };
+    }
+    return {
+      ok: true,
+      value: this.rows("agentRegistryEvents").filter(
+        (event) =>
+          event.workspaceId === workspaceId && (agentId === undefined || event.agentId === agentId),
       ),
     };
   }

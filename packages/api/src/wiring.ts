@@ -57,6 +57,8 @@ import {
 import { createCostService } from "@dealora/cost";
 import { createDashboardService } from "@dealora/dashboard";
 import type { DashboardLookup, DashboardReaders } from "@dealora/dashboard";
+import { createAgentService } from "@dealora/agent";
+import type { AgentRegistryLookup } from "@dealora/agent";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -163,6 +165,26 @@ export function createDefaultHandlers(options?: {
   const dashboardReaders: DashboardReaders = {
     costMetrics: (workspaceId, userId) => cost.metrics(workspaceId, userId),
     nextActionBoard: (workspaceId, userId) => nextaction.recommendForWorkspace(workspaceId, userId),
+  };
+
+  /**
+   * The agent registry's lookup: every method is the store's own workspace-
+   * scoped read and write, passed through unchanged. The tenant check lives
+   * inside the store and each method re-runs it with the caller's own
+   * identity, so this wiring cannot widen a scope — it only names which
+   * registry methods exist.
+   *
+   * There is deliberately nothing else to wire: an agent registry has no
+   * runner, no dispatcher, no model client and no outbound sender. Phase 18
+   * declares agents and records what people decided about them, so a wider
+   * surface here would be a capability nobody authorised.
+   */
+  const agentLookup: AgentRegistryLookup = {
+    authorize: store.authorize.bind(store),
+    listAgentRegistry: store.listAgentRegistry.bind(store),
+    getAgentRegistry: store.getAgentRegistry.bind(store),
+    listAgentRegistryEvents: store.listAgentRegistryEvents.bind(store),
+    setAgentStatus: store.setAgentStatus.bind(store),
   };
 
   const deps: HandlerDeps = {
@@ -505,6 +527,12 @@ export function createDefaultHandlers(options?: {
      * answers — no sender, approver, scheduler, provider, clock or network.
      */
     dashboard: createDashboardService(dashboardLookup, dashboardReaders),
+    /**
+     * The agent registry boundary: it decides lifecycle transitions and
+     * records governance events, and it is given nothing with which to
+     * execute an agent, call a model, reach a network or send a message.
+     */
+    agent: createAgentService(agentLookup),
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());

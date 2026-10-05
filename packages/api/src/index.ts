@@ -184,6 +184,33 @@ export type {
 } from "@dealora/dashboard";
 
 /**
+ * The Agent System's public surface, re-exported so API consumers can type a
+ * registry response without depending on the domain package directly.
+ *
+ * Note what is *not* here: no runner, no dispatcher and no model client.
+ * Phase 18 declares agents and records governance decisions about them, and
+ * re-exporting an execution surface would claim a capability that does not
+ * exist.
+ */
+export type {
+  AgentCostLimit,
+  AgentDeclaration,
+  AgentError,
+  AgentErrorCode,
+  AgentEvaluationMetric,
+  AgentId,
+  AgentMemoryLayer,
+  AgentModelConfig,
+  AgentPolicyView,
+  AgentRegistryEvent,
+  AgentRegistryEventKind,
+  AgentRegistryView,
+  AgentState,
+  AgentToolId,
+  RegisteredAgent,
+} from "@dealora/agent";
+
+/**
  * The Qualification domain's public surface, re-exported so API consumers can
  * type a qualification response without depending on the domain package
  * directly.

@@ -121,6 +121,10 @@ export type {
   CostCategory,
   CostBasis,
   CostExecutionKind,
+  AgentRegistry,
+  AgentRegistryStatus,
+  AgentRegistryEvent,
+  AgentRegistryEventKind,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -163,6 +167,8 @@ export {
   meetingEventTable,
   nextBestActionTable,
   costEventTable,
+  agentRegistryTable,
+  agentRegistryEventTable,
   createTableSql,
   slugify,
   capString,

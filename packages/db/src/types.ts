@@ -2130,3 +2130,67 @@ export interface CostEvent {
   /** Server-derived: when it was recorded. Never client-controlled. */
   createdAt: DateTime;
 }
+
+/**
+ * Phase 18 lifecycle states, exactly ROADMAP.md §25's seven values.
+ *
+ * `production` is part of the stored vocabulary so the column's CHECK
+ * constraint matches the roadmap exactly, but the Phase 18 service refuses to
+ * write it: ROADMAP.md §26 requires Phase 19 evaluation evidence first.
+ */
+export type AgentRegistryStatus =
+  "draft" | "testing" | "approved" | "production" | "paused" | "disabled" | "archived";
+
+/**
+ * One workspace's recorded decision about one agent's lifecycle state.
+ *
+ * Only the *state* is stored. The declaration itself — purpose, tools,
+ * permissions, cost limits, evaluation metrics — is versioned code in
+ * `@dealora/agent`, so this table can never drift from it and can never become
+ * a second source of truth about what an agent is.
+ */
+export interface AgentRegistry {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** One of the twelve agents named by ROADMAP.md §25. */
+  agentId: string;
+  status: AgentRegistryStatus;
+  /** Server-derived: who last changed the state, taken from the session. */
+  updatedBy: EntityId;
+  /** Server-derived: when it was last changed. Never client-controlled. */
+  updatedAt: DateTime;
+  /** Server-derived: when the row was first created. */
+  createdAt: DateTime;
+}
+
+/**
+ * What kind of governance decision an event records.
+ *
+ * `registered` is the first write for an agent, `state_changed` every write
+ * after it, and `archived` the write that retires it. There is deliberately no
+ * "refused" kind: a refused promotion is refused *before* the store is called,
+ * so recording it here would mean writing on an error path — a hidden side
+ * effect of a request that changed nothing.
+ */
+export type AgentRegistryEventKind = "registered" | "state_changed" | "archived";
+
+/**
+ * One append-only governance event: a person changing an agent's state.
+ *
+ * These are decisions *about the registry*, not traces of agent runs.
+ * ROADMAP.md §27 (Phase 20) owns run traces, and none is written here, so this
+ * table answers "who approved this agent?" and never "what did the agent do?".
+ */
+export interface AgentRegistryEvent {
+  id: EntityId;
+  workspaceId: EntityId;
+  agentId: string;
+  /** Server-derived: the authenticated caller who made the decision. */
+  actorUserId: EntityId;
+  kind: AgentRegistryEventKind;
+  fromStatus: AgentRegistryStatus | null;
+  toStatus: AgentRegistryStatus;
+  /** Why the decision was recorded, in one sentence. */
+  detail: string | null;
+  createdAt: DateTime;
+}

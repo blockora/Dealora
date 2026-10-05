@@ -105,6 +105,8 @@ export const COLUMNS = {
   constraints: "constraints",
   text: "text",
   category: "category",
+  agentId: "agent_id",
+  updatedBy: "updated_by",
   sourceNote: "source_note",
   approvedBy: "approved_by",
   approvedAt: "approved_at",
@@ -609,6 +611,22 @@ export const nextBestActionTable = "next_best_actions" as const;
  */
 export const costEventTable = "cost_events" as const;
 
+/**
+ * Phase 18 — Agent Registry (`ROADMAP.md` §25).
+ *
+ * `agent_registry` holds one row per (workspace, agent): the lifecycle state
+ * that workspace's people have put that agent in. UNIQUE(workspace_id,
+ * agent_id) is what makes the registry a set of decisions rather than a log —
+ * a workspace has one current state per agent, not many.
+ *
+ * `agent_registry_events` is the append-only governance trail: who moved which
+ * agent, when, from what state to what. It is a trail of *decisions about the
+ * registry*, never a trace of an agent run — `ROADMAP.md` §27 (Phase 20) owns
+ * run traces, and no run is recorded here.
+ */
+export const agentRegistryTable = "agent_registry" as const;
+export const agentRegistryEventTable = "agent_registry_events" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -645,6 +663,8 @@ export const tables = [
   meetingEventTable,
   nextBestActionTable,
   costEventTable,
+  agentRegistryTable,
+  agentRegistryEventTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -841,6 +861,21 @@ export const indexes = {
     `${COLUMN(costEventTable, COLUMNS.occurredAt)} NOT NULL`,
     `${COLUMN(costEventTable, COLUMNS.idempotencyKey)} NOT NULL`,
     `UNIQUE(${COLUMNS.workspaceId}, ${COLUMNS.idempotencyKey})`,
+  ],
+  agentRegistry: [
+    `${COLUMN(agentRegistryTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(agentRegistryTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(agentRegistryTable, COLUMNS.agentId)} NOT NULL`,
+    `${COLUMN(agentRegistryTable, COLUMNS.status)} NOT NULL`,
+    `UNIQUE(${COLUMNS.workspaceId}, ${COLUMNS.agentId})`,
+  ],
+  agentRegistryEvents: [
+    `${COLUMN(agentRegistryEventTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(agentRegistryEventTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(agentRegistryEventTable, COLUMNS.agentId)} NOT NULL`,
+    `${COLUMN(agentRegistryEventTable, COLUMNS.actorUserId)} NOT NULL`,
+    `${COLUMN(agentRegistryEventTable, COLUMNS.kind)} NOT NULL`,
+    `${COLUMN(agentRegistryEventTable, COLUMNS.toStatus)} NOT NULL`,
   ],
 };
 
@@ -1636,6 +1671,45 @@ ${COLUMN(costEventTable, COLUMNS.amountMinor)} CHECK (${COLUMN(costEventTable, C
 ${COLUMN(costEventTable, COLUMNS.currency)} CHECK (${COLUMN(costEventTable, COLUMNS.currency)} IN ('USD','EUR','GBP','JPY')),
 ${COLUMN(costEventTable, COLUMNS.occurredAt)} CHECK (${COLUMN(costEventTable, COLUMNS.occurredAt)} IS NOT NULL),
 UNIQUE("${COLUMNS.workspaceId}", "${COLUMNS.idempotencyKey}")`,
+  ),
+  createTableSql(
+    agentRegistryTable,
+    [
+      COLUMN(agentRegistryTable, COLUMNS.id),
+      COLUMN(agentRegistryTable, COLUMNS.workspaceId),
+      COLUMN(agentRegistryTable, COLUMNS.agentId),
+      COLUMN(agentRegistryTable, COLUMNS.status),
+      COLUMN(agentRegistryTable, COLUMNS.updatedBy),
+      COLUMN(agentRegistryTable, COLUMNS.updatedAt),
+      COLUMN(agentRegistryTable, COLUMNS.createdAt),
+    ],
+    `${COLUMN(agentRegistryTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(agentRegistryTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentRegistryTable, COLUMNS.updatedBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentRegistryTable, COLUMNS.agentId)} CHECK (${COLUMN(agentRegistryTable, COLUMNS.agentId)} IN ('strategy','market_intelligence','account_research','prospect_discovery','qualification','personalization','conversation','follow_up','meeting','crm','analytics','optimization')),
+${COLUMN(agentRegistryTable, COLUMNS.status)} CHECK (${COLUMN(agentRegistryTable, COLUMNS.status)} IN ('draft','testing','approved','production','paused','disabled','archived')),
+${COLUMN(agentRegistryTable, COLUMNS.updatedAt)} CHECK (${COLUMN(agentRegistryTable, COLUMNS.updatedAt)} IS NOT NULL),
+UNIQUE("${COLUMNS.workspaceId}", "${COLUMNS.agentId}")`,
+  ),
+  createTableSql(
+    agentRegistryEventTable,
+    [
+      COLUMN(agentRegistryEventTable, COLUMNS.id),
+      COLUMN(agentRegistryEventTable, COLUMNS.workspaceId),
+      COLUMN(agentRegistryEventTable, COLUMNS.agentId),
+      COLUMN(agentRegistryEventTable, COLUMNS.actorUserId),
+      COLUMN(agentRegistryEventTable, COLUMNS.kind),
+      COLUMN(agentRegistryEventTable, COLUMNS.fromStatus),
+      COLUMN(agentRegistryEventTable, COLUMNS.toStatus),
+      COLUMN(agentRegistryEventTable, COLUMNS.detail),
+      COLUMN(agentRegistryEventTable, COLUMNS.createdAt),
+    ],
+    `${COLUMN(agentRegistryEventTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(agentRegistryEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentRegistryEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(agentRegistryEventTable, COLUMNS.agentId)} CHECK (${COLUMN(agentRegistryEventTable, COLUMNS.agentId)} IN ('strategy','market_intelligence','account_research','prospect_discovery','qualification','personalization','conversation','follow_up','meeting','crm','analytics','optimization')),
+${COLUMN(agentRegistryEventTable, COLUMNS.kind)} CHECK (${COLUMN(agentRegistryEventTable, COLUMNS.kind)} IN ('registered','state_changed','archived')),
+${COLUMN(agentRegistryEventTable, COLUMNS.toStatus)} CHECK (${COLUMN(agentRegistryEventTable, COLUMNS.toStatus)} IN ('draft','testing','approved','production','paused','disabled','archived'))`,
   ),
 ].join("\n\n");
 

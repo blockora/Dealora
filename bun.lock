@@ -23,11 +23,20 @@
         "@dealora/db": "workspace:*",
       },
     },
+    "packages/agent": {
+      "name": "@dealora/agent",
+      "version": "0.1.0",
+      "dependencies": {
+        "@dealora/core": "workspace:*",
+        "@dealora/db": "workspace:*",
+      },
+    },
     "packages/api": {
       "name": "@dealora/api",
       "version": "0.1.0",
       "dependencies": {
         "@dealora/account": "workspace:*",
+        "@dealora/agent": "workspace:*",
         "@dealora/approval": "workspace:*",
         "@dealora/auth": "workspace:*",
         "@dealora/brain": "workspace:*",
@@ -205,6 +214,8 @@
     "@cacheable/utils": ["@cacheable/utils@2.5.0", "", { "dependencies": { "hashery": "^1.5.1", "keyv": "^5.6.0" } }, "sha512-buipgOVDkkPXNR5+xBpDw7Zk2n1EvU7qBJCNUcL7rhQ//kfpOXPAvQ511Os0vpLYJ1pZnvudNytkQt2hst3wqA=="],
 
     "@dealora/account": ["@dealora/account@workspace:packages/account"],
+
+    "@dealora/agent": ["@dealora/agent@workspace:packages/agent"],
 
     "@dealora/api": ["@dealora/api@workspace:packages/api"],
 

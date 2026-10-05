@@ -31,6 +31,7 @@ import type { NextActionError, NextActionService } from "@dealora/nextaction";
 import type { RevenueGraphError, RevenueGraphService } from "@dealora/revenuegraph";
 import type { CostError, CostService } from "@dealora/cost";
 import type { DashboardError, DashboardService } from "@dealora/dashboard";
+import type { AgentError, AgentService } from "@dealora/agent";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -520,6 +521,36 @@ function fromDashboardError(error: DashboardError): ApiError {
   return mapped;
 }
 
+/**
+ * Map an agent-registry domain error onto the transport vocabulary.
+ *
+ * Exhaustive, like every other mapper here. `UNAVAILABLE` — the only code that
+ * means an internal condition — becomes a generic `SERVER_ERROR`, so storage
+ * internals never reach a client. `CONFLICT` keeps its meaning: a lifecycle
+ * transition the table does not publish is a conflict with the current state,
+ * not a bad request.
+ */
+function fromAgentError(error: AgentError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+        return "VALIDATION_ERROR";
+      case "CONFLICT":
+        return "CONFLICT";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = [...error.details];
+  return mapped;
+}
+
 export interface HandlerDeps {
   identity: IdentityService;
   brain: BusinessBrainService;
@@ -540,6 +571,7 @@ export interface HandlerDeps {
   revenuegraph: RevenueGraphService;
   cost: CostService;
   dashboard: DashboardService;
+  agent: AgentService;
   resolveSession: SessionResolver;
 }
 
@@ -3004,6 +3036,104 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok(result.value) };
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 18 — Agent System
+  // -------------------------------------------------------------------------
+
+  /**
+   * The workspace's agent registry: twelve declared agents and the lifecycle
+   * state this workspace has put each one in.
+   *
+   * The workspace is a route parameter and the caller is the session; the
+   * service re-authorizes that pair against storage. Nothing a client sends is
+   * read here, so no body or query field can reach a declaration.
+   */
+  const getAgentRegistryHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.agent.registry(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromAgentError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * One agent's full declaration and current state.
+   *
+   * The agent id is a route parameter. An id outside the twelve is a validation
+   * error from the service rather than a 404 from the transport, because the
+   * answer is the same whether or not such an agent exists anywhere.
+   */
+  const getAgentHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const agentId = param(req, "agentId");
+      if (isApiError(agentId)) return { ok: false, error: agentId };
+
+      const result = deps.agent.describe(workspaceId, actor.userId, agentId);
+      if (!result.ok) return { ok: false, error: fromAgentError(result.error) };
+      return { ok: true, value: ok({ agent: result.value }) };
+    });
+
+  /**
+   * Record a lifecycle decision about one agent.
+   *
+   * The target state is the only value a client supplies. The prior state, the
+   * actor and the timestamp are the server's, and whether the transition is
+   * permitted at all is decided by the published lifecycle table — so a forged
+   * request cannot promote an agent, and cannot forge the record of who did.
+   */
+  const changeAgentStatusHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const agentId = param(req, "agentId");
+      if (isApiError(agentId)) return { ok: false, error: agentId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+      const status = typeof body.status === "string" ? body.status : "";
+
+      const result = deps.agent.changeStatus(workspaceId, actor.userId, agentId, status);
+      if (!result.ok) return { ok: false, error: fromAgentError(result.error) };
+      return { ok: true, value: ok({ agent: result.value }) };
+    });
+
+  /**
+   * The governance trail: who moved which agent, when, and from what state.
+   *
+   * These are decisions about the registry, not traces of agent runs — Phase 20
+   * owns those, and this phase writes none.
+   */
+  const listAgentEventsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const requested = req.query.agentId;
+      const agentId =
+        typeof requested === "string" && requested.trim() !== "" ? requested : undefined;
+
+      const result = deps.agent.events(workspaceId, actor.userId, agentId);
+      if (!result.ok) return { ok: false, error: fromAgentError(result.error) };
+      return { ok: true, value: ok({ events: result.value }) };
+    });
+
+  /**
+   * The published rule set: the twelve declarations, the lifecycle, the tools
+   * and the phase that executes each one, and the promotion rule that Phase 19
+   * will unlock. Readable before a workspace has registered anything.
+   */
+  const getAgentPolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.agent.policy(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromAgentError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -3157,6 +3287,15 @@ export function createHandlers(deps: HandlerDeps) {
     // -------------------------------------------------------------------------
     getDashboardHandler,
     getDashboardPolicyHandler,
+
+    // -------------------------------------------------------------------------
+    // Phase 18 — Agent System
+    // -------------------------------------------------------------------------
+    getAgentRegistryHandler,
+    getAgentHandler,
+    changeAgentStatusHandler,
+    listAgentEventsHandler,
+    getAgentPolicyHandler,
   };
 }
 

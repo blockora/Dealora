@@ -21,6 +21,7 @@
     { "path": "packages/revenuegraph" },
     { "path": "packages/cost" },
     { "path": "packages/dashboard" },
+    { "path": "packages/agent" },
     { "path": "packages/api" }
   ]
 }
