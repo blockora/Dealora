@@ -83,10 +83,12 @@ describe("createDashboardService", () => {
 
   it("passes the caller's workspace and identity through to every read", () => {
     const seen: { method: string; workspaceId: string; userId: string }[] = [];
-    const watch = (method: string) => (workspaceId: string, userId: string) => {
-      seen.push({ method, workspaceId, userId });
-      return { ok: true, value: [] } as StorageResult<readonly never[]>;
-    };
+    const watch =
+      (method: string) =>
+      (workspaceId: string, userId: string): StorageResult<readonly never[]> => {
+        seen.push({ method, workspaceId, userId });
+        return { ok: true, value: [] };
+      };
     const service = createDashboardService(
       emptyLookup({
         listRevenueGoals: watch("listRevenueGoals"),
