@@ -24,7 +24,8 @@ The repository has completed **Phase 0 — Repository & Engineering Foundation**
 **Phase 7 — Evidence System**, **Phase 8 — Qualification Engine**,
 **Phase 9 — Personalization Engine**, **Phase 10 — Approval Engine**,
 **Phase 11 — First Outbound Integration**, **Phase 12 — Conversation
-Engine**, **Phase 13 — Meeting Workflow**, and **Phase 14 — Next Best Action**
+Engine**, **Phase 13 — Meeting Workflow**, **Phase 14 — Next Best Action**,
+and **Phase 15 — Revenue Graph**
 (see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
@@ -245,8 +246,8 @@ event*. The brief is the other half of the honesty story — it references claim
 and evidence by id rather than copying them, and writes every `§22` section it
 has no record for into `gaps` instead of filling it in. Nothing in this phase
 sends an invitation, schedules anything on a timer, or turns a meeting into a
-fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–14
-together by `tests/phases9-14-integration.test.ts`.
+fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–15
+together by `tests/phases9-15-integration.test.ts`.
 
 Phase 14 adds the Next Best Action Engine: it answers *what should happen next?*
 for one account and for a whole workspace, reading stored rows and applying a
@@ -289,7 +290,35 @@ not an attested fact about an account — and `evidenceIds` / `claimIds` are
 reference lists, never copies. Its gate is covered by
 `tests/phase14-gate.test.ts`.
 
-Next is **Phase 15 — Revenue Graph**.
+Phase 15 adds the Revenue Graph: the twelve relationships `ROADMAP.md` §22
+names, read back as one graph per account and one per workspace. The graph is
+**derived, never stored** — every node and edge is recomputed from the rows
+Phases 5–13 already wrote, so this phase adds no table, no schema version and
+no migration, and a `contested` downgrade removes the opportunity and its edges
+from the very next read instead of leaving a stale "qualified" claim behind.
+
+The vocabulary is published as a **partition**: the seven node kinds the loop
+can actually produce (company, person, signal, evidence, opportunity,
+conversation, meeting) plus five explicit refusals — campaign, customer,
+revenue, agent, workflow — equal §22's twelve core relationship names
+disjointly, each refusal carrying its reason and its owning phase in the policy
+route. The opportunity node *is* the account's newest `qualified`
+qualification: its own id, never a new row, and absent the moment a newer
+evaluation says otherwise.
+
+Every edge carries `derivedFrom` naming the exact rows the rule read, target
+row last, so any relationship can be checked against storage without trusting
+the graph itself; ordering is a total order (occurredAt, stage rank, id), so
+identical rows always print the identical graph, pinned to
+`revenue-graph-1.0.0`. The caller sends an account id and nothing else —
+forged nodes, edges, an opportunity, a frontier and a rule version in the
+request body are ignored — a workspace above 100 accounts is **refused rather
+than truncated**, and the repository surface is `authorize` alone: no writer,
+no actor, no recommender anywhere in the package. Its gate — trace one
+opportunity's lifecycle through every stage of the revenue loop — is covered
+by `tests/phase15-gate.test.ts`.
+
+Next is **Phase 16 — Cost Engine**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -318,13 +347,14 @@ packages/       Shared TypeScript packages (built with project references)
   conversation/  Deterministic classification of inbound responses into an intent and a next action (Phase 12)
   meeting/       Booking state machine, calendar adapter boundary, preparation brief (Phase 13)
   nextaction/    Deterministic next-best-action engine over the whole revenue loop (Phase 14)
+  revenuegraph/  Derived revenue graph: nodes, edges, lifecycle, policy (Phase 15)
   api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 12+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests (Phase 1-14 gates)
+tests/          Cross-package integration tests (Phase 1-15 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
@@ -344,8 +374,9 @@ Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)), the Account
 ([0010](./docs/adr/0010-approval-engine.md)), the First Outbound Integration
 ([0011](./docs/adr/0011-first-outbound-integration.md)), and the Conversation
 Engine ([0012](./docs/adr/0012-conversation-engine.md)), the Meeting Workflow
-([0013](./docs/adr/0013-meeting-workflow.md)), and the Next Best Action Engine
-([0014](./docs/adr/0014-next-best-action-engine.md)).
+([0013](./docs/adr/0013-meeting-workflow.md)), the Next Best Action Engine
+([0014](./docs/adr/0014-next-best-action-engine.md)), and the Revenue Graph
+([0015](./docs/adr/0015-revenue-graph.md)).
 
 ## Getting started
 
@@ -385,7 +416,7 @@ convention and the currently supported keys are documented in
 
 The only key is `DB_DIR` — the directory the local store writes
 `dealora.json` into (defaults to `packages/db/src/data`, which is
-git-ignored). Phases 1-13 need no credential: passwords are hashed with
+git-ignored). Phases 1-15 need no credential: passwords are hashed with
 scrypt, goal parsing, plan compilation, account deduplication, research
 normalization, evidence conversion, qualification scoring, draft rendering,
 approval decisions and response classification are deterministic and take no
@@ -397,7 +428,9 @@ introduces them. Phase 12 adds no key either: it classifies stored text with
 declared rules and writes to the Phase 11 suppression list that already exists.
 Phase 13 adds no key as well: it books through a sandbox calendar adapter that
 performs no network I/O and reuses the Phase 11 suppression list for its opt-out
-checks.
+checks. Phase 14 adds no key and no provider: it reads stored rows and applies a
+fixed rule set. Phase 15 adds none either: the graph is derived on read from
+rows the earlier phases already store.
 
 ## License
 
