@@ -217,6 +217,6 @@ These are **open**, not limitations of this phase:
   silently empty kinds.
 - The lifecycle is data: stages, frontier and the opportunity id are fields on
   every trace, asserted at every stage of the gate rather than once at the end.
-- The action surface is provably zero: the full gate and the Phases 9–15
-  integration test both prove a graph read adds no row to any table, and the
-  service exposes no verb that could.
+- The action surface is provably zero: the full gate and the Phases 9–16
+  integration test (renamed when Phase 16 joined it) both prove a graph read
+  adds no row to any table, and the service exposes no verb that could.

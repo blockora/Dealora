@@ -25,7 +25,7 @@ The repository has completed **Phase 0 — Repository & Engineering Foundation**
 **Phase 9 — Personalization Engine**, **Phase 10 — Approval Engine**,
 **Phase 11 — First Outbound Integration**, **Phase 12 — Conversation
 Engine**, **Phase 13 — Meeting Workflow**, **Phase 14 — Next Best Action**,
-and **Phase 15 — Revenue Graph**
+**Phase 15 — Revenue Graph**, and **Phase 16 — Cost Engine**
 (see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
@@ -246,8 +246,8 @@ event*. The brief is the other half of the honesty story — it references claim
 and evidence by id rather than copying them, and writes every `§22` section it
 has no record for into `gaps` instead of filling it in. Nothing in this phase
 sends an invitation, schedules anything on a timer, or turns a meeting into a
-fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–15
-together by `tests/phases9-15-integration.test.ts`.
+fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–16
+together by `tests/phases9-16-integration.test.ts`.
 
 Phase 14 adds the Next Best Action Engine: it answers *what should happen next?*
 for one account and for a whole workspace, reading stored rows and applying a
@@ -318,7 +318,32 @@ no actor, no recommender anywhere in the package. Its gate — trace one
 opportunity's lifecycle through every stage of the revenue loop — is covered
 by `tests/phase15-gate.test.ts`.
 
-Next is **Phase 16 — Cost Engine**.
+Phase 16 adds the Cost Engine: what each run cost, recorded as immutable
+**cost facts** and read back as derived totals. `ROADMAP.md` §23's six
+categories — llm, search, data, tool, infrastructure, execution — are a closed
+vocabulary on an append-only `cost_events` row (schema v15), attributed
+server-side to the session and to a **real execution of the same workspace**,
+and every total, average and ratio is **derived on read**: there is no stored
+aggregate anywhere, so a stale number cannot be served and a fact is never
+rewritten to simplify a sum.
+
+Money is whole minor units — never a float — divided with exact integer
+arithmetic reported next to its remainder, one currency per workspace fixed by
+the first fact, and a total that would leave the safe-integer range refuses
+the answer instead of rounding it. An estimate that was later measured is
+superseded per (execution, category), disclosed in full rather than counted
+twice. A replayed idempotency key returns the same fact and a reused key
+conflicts, while forged `createdBy`, `workspaceId` or `totalMinor` fields in
+the request are ignored in favour of the session and the stored rows. The six
+metrics of §23 are published as a **partition**: Cost / Prospect, Cost /
+Qualified Opportunity and Cost / Meeting derive from rows Phases 5 and 13
+already store, and Cost / Customer, Revenue / AI Cost and Revenue / Campaign
+are refused with their reasons and owning phases. Its gate — an execution can
+show estimated or measured cost, for every run kind this repository can
+perform, with `workflow` refused by name until Phase 24 — is covered by
+`tests/phase16-gate.test.ts`.
+
+Next is **Phase 17 — Revenue Dashboard**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -348,13 +373,14 @@ packages/       Shared TypeScript packages (built with project references)
   meeting/       Booking state machine, calendar adapter boundary, preparation brief (Phase 13)
   nextaction/    Deterministic next-best-action engine over the whole revenue loop (Phase 14)
   revenuegraph/  Derived revenue graph: nodes, edges, lifecycle, policy (Phase 15)
+  cost/          Immutable cost facts, derived totals and metrics, exact money (Phase 16)
   api/          Transport handlers and application-service wiring
 agents/         Specialized agent definitions (Phase 18+)
 integrations/   External system adapters (Phase 12+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests (Phase 1-15 gates)
+tests/          Cross-package integration tests (Phase 1-16 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
@@ -376,7 +402,8 @@ Compiler ([0005](./docs/adr/0005-revenue-plan-compiler.md)), the Account
 Engine ([0012](./docs/adr/0012-conversation-engine.md)), the Meeting Workflow
 ([0013](./docs/adr/0013-meeting-workflow.md)), the Next Best Action Engine
 ([0014](./docs/adr/0014-next-best-action-engine.md)), and the Revenue Graph
-([0015](./docs/adr/0015-revenue-graph.md)).
+([0015](./docs/adr/0015-revenue-graph.md)), and the Cost Engine
+([0016](./docs/adr/0016-cost-engine.md)).
 
 ## Getting started
 
@@ -416,7 +443,7 @@ convention and the currently supported keys are documented in
 
 The only key is `DB_DIR` — the directory the local store writes
 `dealora.json` into (defaults to `packages/db/src/data`, which is
-git-ignored). Phases 1-15 need no credential: passwords are hashed with
+git-ignored). Phases 1-16 need no credential: passwords are hashed with
 scrypt, goal parsing, plan compilation, account deduplication, research
 normalization, evidence conversion, qualification scoring, draft rendering,
 approval decisions and response classification are deterministic and take no
@@ -430,7 +457,9 @@ Phase 13 adds no key as well: it books through a sandbox calendar adapter that
 performs no network I/O and reuses the Phase 11 suppression list for its opt-out
 checks. Phase 14 adds no key and no provider: it reads stored rows and applies a
 fixed rule set. Phase 15 adds none either: the graph is derived on read from
-rows the earlier phases already store.
+rows the earlier phases already store. Phase 16 adds no key and no provider:
+recording a cost is a local append to the workspace's own store, and every
+total is derived from those rows without touching the network.
 
 ## License
 

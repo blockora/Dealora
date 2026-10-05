@@ -69,7 +69,7 @@ Phase 1 needs no credential: passwords are hashed with scrypt and a per-user
 salt, sessions are opaque random tokens, and the test suite runs without any
 secret. Add new keys to this table in the same commit that introduces them.
 
-Phases 1-15 add no further keys and require no LLM provider key: the Business
+Phases 1-16 add no further keys and require no LLM provider key: the Business
 Brain, the Revenue Goal Engine, the Revenue Plan Compiler, the Account &
 Prospect Input layer, the Research Engine, the Evidence System, the
 Qualification Engine, the Personalization Engine, the Approval Engine, the
