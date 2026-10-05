@@ -161,12 +161,88 @@ has to say so:
   holding a tool grant has still earned nothing, because the tool's own phase
   re-derives authorization.
 - **A lifecycle state is a decision, not a capability.** `approved → production`
-  is refused until Phase 19 records evaluation evidence, so no code may write
-  `production` to reach a feature faster. If a change needs that state, it needs
-  the evidence Phase 19 exists to produce.
+  is gated on Phase 19's evaluation evidence, so no code may write `production`
+  to reach a feature faster, and passing the gate still grants nothing an agent
+  can *do* — `usableStates` stays empty until a later phase ships a runner. If a
+  change needs that state, it needs the evidence Phase 19 exists to produce.
 - **A governance event is not a trace.** The registry's event trail records who
   moved an agent and when. Runs, latency and tool calls belong to `ROADMAP.md`
   §27 (Phase 20); writing them here would duplicate that phase.
+- **An observation is not an evaluation outcome.** A caller contributes a
+  subject and either a judgement or a measured quantity. The rate, the total,
+  the threshold comparison, the pass and the agent version are all derived from
+  stored rows, and no column may be added that holds one of them. Absence is
+  reported as `insufficient_evidence` with **no value** — never zero.
+- **Declining to judge is not a pass.** `unobserved` stays in the denominator so
+  an evaluator cannot raise a metric by not looking. If a new metric type needs
+  a different treatment, say so in its rule-table rationale and test the
+  boundary.
+- **Staleness is expressed by supersession, not by a clock.** A fresh evaluation
+  round supersedes the previous one. If a derivation starts reading
+  `Date.now()`, the same stored rows will answer differently at different
+  instants, which is the nondeterminism this repository has kept out since
+  Phase 14.
+
+## Phase 19 implementation and testing expectations
+
+Agent evaluation is real production code over two real tables, so it is held to
+the same bar as the phases before it. Specifically:
+
+- **Thresholds live in one versioned table.** Every metric's kind, direction,
+  threshold, minimum sample and rationale belong in `EVALUATION_METRICS`. If a
+  bar moves, bump `EVALUATION_RULE_VERSION` in the same commit so a stored
+  report keeps the version that judged it.
+- **Rates are exact integers, not floats.** Basis points and cross-multiplication
+  are what make "exactly at the threshold" a decidable fact. Do not reintroduce
+  a division or an epsilon; a test at, one under and one over the threshold is
+  the guard.
+- **One number, one owner.** `cost`'s ceiling is the agent's declared
+  `costLimits`, read from `@dealora/agent`. Do not restate it in
+  `@dealora/evaluation` — a second copy is exactly the drift ADR 0017 warned
+  about.
+- **The gate fails closed everywhere.** No round, insufficient coverage, a
+  failing metric, a superseded round, another version's evidence, another
+  workspace's evidence and an unreadable store must all refuse, and each
+  refusal should name what is missing. A storage failure must never resolve to
+  *allowed*.
+- **Judgements are append-only.** A changed opinion opens a new round. There is
+  no update and no delete in the repository, and a test should fail if one
+  appears.
+- **The negative space is tested, not asserted in prose.** No runner, no model
+  client, no network, no scheduler, no trace of a run, no usable state — the
+  package test and the gate both check these, because a future change that
+  quietly made an agent executable, or that stored a computed outcome in a
+  column, would otherwise be invisible until it mattered.
+
+The agent registry is real production code with a real table, so it is held to
+the same bar as the phases before it. Specifically:
+
+- **A declaration is versioned code.** Never store a declaration, and never add
+  a stored field that restates one — a workspace stores only the lifecycle state
+  it decided. A test should fail if a row starts describing what an agent *is*.
+- **Vocabulary is closed at both layers.** The twelve ids and seven states are
+  `CHECK` constraints in the schema as well as types in the domain. If you add
+  an agent or a state, change the rule table, the DDL and the drift test in the
+  same commit.
+- **Total ordering, with the tiebreak chosen deliberately.** The registry prints
+  in `AGENT_IDS` order. The event trail sorts newest first with a *stable* sort
+  and no id tiebreak, because ids are generated and same-millisecond decisions
+  would otherwise print in a different order on every run. Do not reintroduce
+  an id tiebreak without a reason the tests can state.
+- **Every read and write is workspace-scoped with the session's identity.** A
+  test must cover the same-workspace success, the cross-workspace denial, a
+  forged workspace id, and a forged attribution field in a body — and the
+  forged-body case is asserted against the stored row, not against the
+  response alone.
+- **A refused transition writes nothing.** When the lifecycle refuses a move, no
+  row and no event may be created, and the agent's prior state must be
+  unchanged. Assert the full row-count snapshot, as Phase 17's dashboard tests
+  do.
+- **The negative space is tested, not asserted in prose.** No runner, no model
+  client, no network, no scheduler, no memory read, and `usableStates` empty:
+  the package test and the gate both check these over the real API, because a
+  future change that quietly adds an execution path would otherwise be invisible
+  until it ran.
 
 ## Phase 18 implementation and testing expectations
 

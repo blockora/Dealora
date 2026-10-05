@@ -26,8 +26,8 @@ The repository has completed **Phase 0 — Repository & Engineering Foundation**
 **Phase 11 — First Outbound Integration**, **Phase 12 — Conversation
 Engine**, **Phase 13 — Meeting Workflow**, **Phase 14 — Next Best Action**,
 **Phase 15 — Revenue Graph**, **Phase 16 — Cost Engine**,
-**Phase 17 — Revenue Dashboard**, and **Phase 18 — Agent System**
-(see [`ROADMAP.md`](./ROADMAP.md)).
+**Phase 17 — Revenue Dashboard**, **Phase 18 — Agent System** and
+**Phase 19 — Agent Evaluation** (see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
 with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
@@ -248,7 +248,7 @@ and evidence by id rather than copying them, and writes every `§22` section it
 has no record for into `gaps` instead of filling it in. Nothing in this phase
 sends an invitation, schedules anything on a timer, or turns a meeting into a
 fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–18
-together by `tests/phases9-18-integration.test.ts`.
+together by `tests/phases9-19-integration.test.ts`.
 
 Phase 14 adds the Next Best Action Engine: it answers *what should happen next?*
 for one account and for a whole workspace, reading stored rows and applying a
@@ -392,7 +392,7 @@ tile numbers, `userId` or `workspaceId` in a request body are ignored because
 every read is workspace-scoped with the session's own identity. Its gate — a
 user can see the loop as outcomes — is covered by `tests/phase17-gate.test.ts`,
 and it end to end after the send, the booking and the cost by
-`tests/phases9-18-integration.test.ts`.
+`tests/phases9-19-integration.test.ts`.
 
 Phase 18 adds the Agent System: `ROADMAP.md` §25's **twelve agents** — Strategy,
 Market Intelligence, Account Research, Prospect Discovery, Qualification,
@@ -411,13 +411,14 @@ an agent holding `send_message` has still sent nothing: Phase 10 approval and
 Phase 11 suppression decide, and the `write_external` permission is published
 and granted to nobody.
 
-`approved → production` is published but **refused**, naming **Phase 19** as its
-owner, because `ROADMAP.md` §26 gates production on evaluation evidence that
-does not exist yet. `usableStates` is therefore empty and **no agent can be used
-in any state**. All 13 evaluation metrics are declared and owned by Phase 19;
-none is measured here. The 8 memory layers are declared and never opened. The
-event trail records governance decisions only — who moved an agent, when, from
-what state to what — because `ROADMAP.md` §27 (Phase 20) owns run traces.
+`approved → production` is published but **gated**, and Phase 18 refused it
+outright naming **Phase 19** as its owner, because `ROADMAP.md` §26 gates
+production on evaluation evidence that did not exist yet. `usableStates` is
+therefore empty and **no agent can be used in any state**. All 13 evaluation
+metrics are declared and owned by Phase 19. The 8 memory layers are declared and
+never opened. The event trail records governance decisions only — who moved an
+agent, when, from what state to what — because `ROADMAP.md` §27 (Phase 20) owns
+run traces.
 
 The phase adds `agent_registry` and `agent_registry_events` (schema v16), both
 workspace-scoped, with `CHECK` constraints pinning their columns to the twelve
@@ -428,9 +429,59 @@ a request contributes: forged `updatedBy`, `createdAt`, `workspaceId`,
 `actorUserId` and `kind` in a body are ignored. Its gate — twelve agents,
 twelve fields, seven states, and nothing executable — is covered by
 `tests/phase18-gate.test.ts`, and end to end after the send, the booking, the
-cost and the dashboard by `tests/phases9-18-integration.test.ts`.
+cost and the dashboard by `tests/phases9-19-integration.test.ts`.
 
-Next is **Phase 19 — Agent Evaluation**.
+Phase 19 adds Agent Evaluation: `ROADMAP.md` §26's **thirteen metrics** are now
+**measured** rather than declared, and `approved → production` is decided by
+that evidence instead of refused.
+
+Human judgement in, deterministic measurement out. A caller contributes a
+**subject** and either one of three verdicts — `met`, `unmet`, `unobserved` —
+or, for `cost` and `latency`, a whole-number measurement. Every rate, total,
+threshold comparison and the gate itself are derived from stored rows on read,
+so there is no request that can say "this agent passed". `unobserved` stays in
+the denominator: declining to judge a subject counts *against* an agent, never
+for it. Below a published minimum sample a metric reports `insufficient_evidence`
+with **no value at all** — never zero, because a zero would read as a perfect
+hallucination rate and a total failure for task success.
+
+The arithmetic is exact. Rates are integer basis points compared by
+cross-multiplication, never by dividing a float, so "exactly at the threshold" is
+a decidable fact rather than a rounding artefact. `cost`'s bar is the agent's
+**own** declared ceiling, read from `@dealora/agent`, and both the total and the
+largest single run are checked; `latency` is the **slowest** recorded run
+against a ceiling this phase publishes and labels as its own judgement.
+
+Evidence is keyed by `(workspace, agent, version)`. A round pins the declared
+version, so a new agent version starts with no evidence by construction rather
+than by policy, and a fresh round **supersedes** the previous one instead of
+editing it — judgements are append-only, so a changed opinion opens a new round
+and the old evidence survives exactly as recorded. No derivation consults a
+clock, and no table stores a rate, a pass or a status: there is nothing a client
+could submit *as* an outcome.
+
+The gate fails closed at every step — no round, insufficient coverage, a failing
+metric, a superseded round, another version's evidence, another workspace's
+evidence, or an unreadable store each refuse, and every refusal names what is
+missing. It grants a governance state and **no capability**: `usableStates` is
+still empty and a promoted agent is still not usable, because this repository
+still has no runner. `ROADMAP.md` §27 (Phase 20) still owns run traces, token
+usage and tool calls, and this phase writes none of them.
+
+The phase adds `agent_evaluation_runs` and `agent_evaluation_observations`
+(schema v17), both workspace-scoped, with `CHECK` constraints making exactly one
+of three row shapes representable — `cost` in whole minor units, `latency` in
+whole milliseconds, everything else one of three verdicts — and
+`UNIQUE(workspace, run, metric, subject)` so a replayed judgement returns the
+same row instead of adding a second vote. Five workspace-scoped routes read and
+write them; forged `workspaceId`, `createdBy`, `createdAt`, version, rate and
+status in a body are ignored and answered byte-identically. Its gate — all
+thirteen metrics measured, every way to fail the gate, and nothing executed — is
+covered by `tests/phase19-gate.test.ts`, and end to end after the send, the
+booking, the cost, the dashboard and the registry by
+`tests/phases9-19-integration.test.ts`.
+
+Next is **Phase 20 — Agent Trace & Observability**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -463,12 +514,13 @@ packages/       Shared TypeScript packages (built with project references)
   cost/          Immutable cost facts, derived totals and metrics, exact money (Phase 16)
   dashboard/     Revenue dashboard derived on read, published refusals, policy (Phase 17)
   agent/        Twelve agent declarations, seven-state lifecycle, registry and policy (Phase 18)
+  evaluation/   Phase 19's thirteen metrics, the evidence model and the production gate
   api/          Transport handlers and application-service wiring
 integrations/   External system adapters (Phase 12+)
 workflows/      Revenue workflow definitions (Phase 24+)
 skills/         Reusable skill modules
 examples/       Developer examples
-tests/          Cross-package integration tests (Phase 1-16 gates)
+tests/          Cross-package integration tests (Phase 1-19 gates)
 docs/           Documentation and ADRs
 scripts/        Development scripts
 cli/            Developer CLI (Phase 26+)
@@ -491,7 +543,10 @@ Engine ([0012](./docs/adr/0012-conversation-engine.md)), the Meeting Workflow
 ([0013](./docs/adr/0013-meeting-workflow.md)), the Next Best Action Engine
 ([0014](./docs/adr/0014-next-best-action-engine.md)), and the Revenue Graph
 ([0015](./docs/adr/0015-revenue-graph.md)), and the Cost Engine
-([0016](./docs/adr/0016-cost-engine.md)).
+([0016](./docs/adr/0016-cost-engine.md)), the Revenue Dashboard
+([0017](./docs/adr/0017-revenue-dashboard.md)), the Agent System
+([0018](./docs/adr/0018-agent-system.md)), and Agent Evaluation
+([0019](./docs/adr/0019-agent-evaluation.md)).
 
 ## Getting started
 
