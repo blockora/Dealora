@@ -14,6 +14,9 @@ import type { DbState } from "./repository.js";
 import { toDateTime } from "./types.js";
 import type {
   Claim,
+  CostBasis,
+  CostCategory,
+  CostExecutionKind,
   Evidence,
   Qualification,
   ResearchFinding,
@@ -3780,5 +3783,329 @@ describe("meetings, briefs and the booking audit trail", () => {
     expect(migrated.conversationEvents).toEqual(document.conversationEvents);
     expect(migrated.qualifications).toEqual(document.qualifications);
     expect(migrated.outboundActions).toEqual(document.outboundActions);
+  });
+});
+
+describe("cost events", () => {
+  /** A workspace with one real research run a cost can be filed against. */
+  const costFixture = () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Cost Co");
+    const account = store.createAccount({
+      workspaceId,
+      createdBy: owner.id,
+      account: {
+        name: "Northwind Trading",
+        website: "https://northwind.example",
+        domain: "northwind.example",
+        industry: "Wholesale",
+        companySize: "120",
+        geography: "UK",
+        description: null,
+        source: "manual",
+        sourceReference: null,
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(account)) throw new Error("seed account creation failed");
+    const request = store.createResearchRequest({
+      workspaceId,
+      requestedBy: owner.id,
+      accountId: account.value.id,
+      provider: "account_record",
+      categories: ["company_overview"],
+    });
+    if (!isOk(request)) throw new Error("seed research request failed");
+    return { store, owner, workspaceId, accountId: account.value.id, requestId: request.value.id };
+  };
+
+  const fact = (
+    executionId: string,
+    overrides: Partial<{
+      executionKind: string;
+      category: string;
+      basis: string;
+      amountMinor: number;
+      currency: string;
+      source: string | null;
+      occurredAt: string;
+      idempotencyKey: string;
+    }> = {},
+  ) => ({
+    // Vocabulary fields are cast once here so the refusal tests below can feed
+    // deliberately invalid values and prove storage rejects them.
+    executionKind: (overrides.executionKind ?? "research_run") as CostExecutionKind,
+    executionId,
+    category: (overrides.category ?? "llm") as CostCategory,
+    basis: (overrides.basis ?? "measured") as CostBasis,
+    amountMinor: overrides.amountMinor ?? 1234,
+    currency: overrides.currency ?? "USD",
+    source: overrides.source === undefined ? "provider usage export" : overrides.source,
+    occurredAt: overrides.occurredAt ?? "2026-10-01T00:00:00.000Z",
+    idempotencyKey: overrides.idempotencyKey ?? "cost-key-1",
+  });
+
+  it("records a cost fact with server-side attribution and a real execution", () => {
+    const fx = costFixture();
+    const created = fx.store.createCostEvent({
+      workspaceId: fx.workspaceId,
+      createdBy: fx.owner.id,
+      event: fact(fx.requestId),
+    });
+    if (!isOk(created)) throw new Error("cost event creation failed");
+    expect(created.value.workspaceId).toBe(fx.workspaceId);
+    // Attribution is written by the server from the session, never the client.
+    expect(created.value.createdBy).toBe(fx.owner.id);
+    expect(created.value.createdAt).toBeTruthy();
+    expect(created.value.amountMinor).toBe(1234);
+    expect(created.value.currency).toBe("USD");
+    expect(created.value.basis).toBe("measured");
+    // A zero amount is representable: "it cost nothing" is still a fact.
+    const free = fx.store.createCostEvent({
+      workspaceId: fx.workspaceId,
+      createdBy: fx.owner.id,
+      event: fact(fx.requestId, { amountMinor: 0, idempotencyKey: "cost-key-free" }),
+    });
+    if (!isOk(free)) throw new Error("zero-amount cost event failed");
+    expect(free.value.amountMinor).toBe(0);
+  });
+
+  it("refuses vocabulary and malformed money with INVALID", () => {
+    const fx = costFixture();
+    const attempt = (event: ReturnType<typeof fact>) => {
+      const result = fx.store.createCostEvent({
+        workspaceId: fx.workspaceId,
+        createdBy: fx.owner.id,
+        event,
+      });
+      expect(isErr(result)).toBe(true);
+      if (isErr(result)) expect(result.error.code).toBe("INVALID");
+    };
+    attempt(fact(fx.requestId, { category: "workflow" }));
+    attempt(fact(fx.requestId, { basis: "guessed" }));
+    attempt(fact(fx.requestId, { executionKind: "workflow" }));
+    attempt(fact(fx.requestId, { amountMinor: -1 }));
+    attempt(fact(fx.requestId, { amountMinor: 12.5 }));
+    attempt(fact(fx.requestId, { amountMinor: Number.MAX_SAFE_INTEGER + 1 }));
+    attempt(fact(fx.requestId, { currency: "XYZ" }));
+    attempt(fact(fx.requestId, { currency: "usd" }));
+    attempt(fact(fx.requestId, { occurredAt: "not-a-time" }));
+    attempt(fact(fx.requestId, { idempotencyKey: "" }));
+    attempt(fact(fx.requestId, { idempotencyKey: "k".repeat(129) }));
+    attempt(fact(fx.requestId, { source: "" }));
+    attempt(fact(fx.requestId, { source: "s".repeat(129) }));
+    // Nothing was recorded by any refused attempt.
+    const all = fx.store.listCostEvents(fx.workspaceId, fx.owner.id);
+    if (!isOk(all)) throw new Error("list failed");
+    expect(all.value).toHaveLength(0);
+  });
+
+  it("refuses a cost filed against an unknown or foreign execution", () => {
+    const fx = costFixture();
+    const missing = fx.store.createCostEvent({
+      workspaceId: fx.workspaceId,
+      createdBy: fx.owner.id,
+      event: fact("never-issued"),
+    });
+    expect(isErr(missing)).toBe(true);
+    if (isErr(missing)) expect(missing.error.code).toBe("NOT_FOUND");
+
+    // Another workspace's run is equally unusable — no cross-tenant filing.
+    const otherOwner = makeOwner(fx.store, "other@example.com");
+    const otherWorkspaceId = makeWorkspace(fx.store, otherOwner.id, "Other Co");
+    const otherAccount = fx.store.createAccount({
+      workspaceId: otherWorkspaceId,
+      createdBy: otherOwner.id,
+      account: {
+        name: "Other Account",
+        website: null,
+        domain: "other.example",
+        industry: null,
+        companySize: null,
+        geography: null,
+        description: null,
+        source: "manual",
+        sourceReference: null,
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(otherAccount)) throw new Error("seed foreign account failed");
+    const otherRequest = fx.store.createResearchRequest({
+      workspaceId: otherWorkspaceId,
+      requestedBy: otherOwner.id,
+      accountId: otherAccount.value.id,
+      provider: "account_record",
+      categories: ["company_overview"],
+    });
+    if (!isOk(otherRequest)) throw new Error("seed foreign request failed");
+    const foreign = fx.store.createCostEvent({
+      workspaceId: fx.workspaceId,
+      createdBy: fx.owner.id,
+      event: fact(otherRequest.value.id),
+    });
+    expect(isErr(foreign)).toBe(true);
+    if (isErr(foreign)) expect(foreign.error.code).toBe("NOT_FOUND");
+  });
+
+  it("is idempotent: replay returns the same fact, a reused key conflicts", () => {
+    const fx = costFixture();
+    const first = fx.store.createCostEvent({
+      workspaceId: fx.workspaceId,
+      createdBy: fx.owner.id,
+      event: fact(fx.requestId),
+    });
+    if (!isOk(first)) throw new Error("first cost event failed");
+
+    // Identical replay returns the same row and writes nothing new.
+    const replay = fx.store.createCostEvent({
+      workspaceId: fx.workspaceId,
+      createdBy: fx.owner.id,
+      event: fact(fx.requestId),
+    });
+    if (!isOk(replay)) throw new Error("replay failed");
+    expect(replay.value.id).toBe(first.value.id);
+
+    // The same key with a different payload is refused, not merged.
+    const conflict = fx.store.createCostEvent({
+      workspaceId: fx.workspaceId,
+      createdBy: fx.owner.id,
+      event: fact(fx.requestId, { amountMinor: 999 }),
+    });
+    expect(isErr(conflict)).toBe(true);
+    if (isErr(conflict)) expect(conflict.error.code).toBe("CONFLICT");
+
+    // A different key for the same content is a distinct fact (dedupe is by
+    // key, not by content), so recording the same cost twice is explicit.
+    const second = fx.store.createCostEvent({
+      workspaceId: fx.workspaceId,
+      createdBy: fx.owner.id,
+      event: fact(fx.requestId, { idempotencyKey: "cost-key-2" }),
+    });
+    if (!isOk(second)) throw new Error("second cost event failed");
+    expect(second.value.id).not.toBe(first.value.id);
+
+    const all = fx.store.listCostEvents(fx.workspaceId, fx.owner.id);
+    if (!isOk(all)) throw new Error("list failed");
+    expect(all.value).toHaveLength(2);
+  });
+
+  it("enforces one currency per workspace", () => {
+    const fx = costFixture();
+    const first = fx.store.createCostEvent({
+      workspaceId: fx.workspaceId,
+      createdBy: fx.owner.id,
+      event: fact(fx.requestId, { currency: "USD" }),
+    });
+    if (!isOk(first)) throw new Error("first cost event failed");
+    const mixed = fx.store.createCostEvent({
+      workspaceId: fx.workspaceId,
+      createdBy: fx.owner.id,
+      event: fact(fx.requestId, { currency: "EUR", idempotencyKey: "cost-key-eur" }),
+    });
+    expect(isErr(mixed)).toBe(true);
+    if (isErr(mixed)) expect(mixed.error.code).toBe("INVALID");
+    const all = fx.store.listCostEvents(fx.workspaceId, fx.owner.id);
+    if (!isOk(all)) throw new Error("list failed");
+    expect(all.value).toHaveLength(1);
+    expect(all.value[0]?.currency).toBe("USD");
+  });
+
+  it("keeps cost facts private to their workspace", () => {
+    const fx = costFixture();
+    const created = fx.store.createCostEvent({
+      workspaceId: fx.workspaceId,
+      createdBy: fx.owner.id,
+      event: fact(fx.requestId),
+    });
+    if (!isOk(created)) throw new Error("cost event creation failed");
+
+    const stranger = "no-membership-here";
+    expect(isErr(fx.store.getCostEvent(created.value.id, stranger))).toBe(true);
+    expect(isErr(fx.store.listCostEvents(fx.workspaceId, stranger))).toBe(true);
+
+    const otherOwner = makeOwner(fx.store, "other@example.com");
+    const otherWorkspaceId = makeWorkspace(fx.store, otherOwner.id, "Other Co");
+    const otherList = fx.store.listCostEvents(otherWorkspaceId, otherOwner.id);
+    if (!isOk(otherList)) throw new Error("foreign list failed");
+    expect(otherList.value).toHaveLength(0);
+  });
+
+  it("lists newest-first with a total, deterministic order and filters", () => {
+    const fx = costFixture();
+    const at = (iso: string) => ({ occurredAt: iso });
+    const rows = [
+      fact(fx.requestId, {
+        idempotencyKey: "k1",
+        category: "llm",
+        ...at("2026-10-01T00:00:00.000Z"),
+      }),
+      fact(fx.requestId, {
+        idempotencyKey: "k2",
+        category: "search",
+        ...at("2026-10-03T00:00:00.000Z"),
+      }),
+      fact(fx.requestId, {
+        idempotencyKey: "k3",
+        category: "search",
+        ...at("2026-10-03T00:00:00.000Z"),
+        basis: "estimated",
+      }),
+    ];
+    for (const event of rows) {
+      const created = fx.store.createCostEvent({
+        workspaceId: fx.workspaceId,
+        createdBy: fx.owner.id,
+        event,
+      });
+      if (!isOk(created)) throw new Error("cost event creation failed");
+    }
+    const listed = fx.store.listCostEvents(fx.workspaceId, fx.owner.id);
+    if (!isOk(listed)) throw new Error("list failed");
+    expect(listed.value).toHaveLength(3);
+    // Newest first; the two sharing an instant are tie-broken by id so the
+    // order is total and two reads of the same rows agree.
+    expect(listed.value[0]?.occurredAt).toBe("2026-10-03T00:00:00.000Z");
+    expect(listed.value[2]?.occurredAt).toBe("2026-10-01T00:00:00.000Z");
+    expect([listed.value[0]?.id, listed.value[1]?.id]).toEqual(
+      [listed.value[0]?.id, listed.value[1]?.id].sort(),
+    );
+
+    const search = fx.store.listCostEvents(fx.workspaceId, fx.owner.id, {
+      category: "search",
+    });
+    if (!isOk(search)) throw new Error("filtered list failed");
+    expect(search.value).toHaveLength(2);
+    const estimated = fx.store.listCostEvents(fx.workspaceId, fx.owner.id, {
+      basis: "estimated",
+    });
+    if (!isOk(estimated)) throw new Error("filtered list failed");
+    expect(estimated.value).toHaveLength(1);
+    const byExecution = fx.store.listCostEvents(fx.workspaceId, fx.owner.id, {
+      executionKind: "research_run",
+      executionId: fx.requestId,
+    });
+    if (!isOk(byExecution)) throw new Error("filtered list failed");
+    expect(byExecution.value).toHaveLength(3);
+  });
+
+  it("migrates a v14 document forward by adding only the cost table", () => {
+    const fx = costFixture();
+    const document = JSON.parse(JSON.stringify(fx.store.db)) as typeof fx.store.db;
+    const v14 = {
+      ...document,
+      schemaVersion: 14,
+      costEvents: undefined,
+    };
+    const migrated = migrateState(v14 as unknown as Parameters<typeof migrateState>[0]);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    // The new table exists and starts empty; nothing before it is rewritten.
+    expect(migrated.costEvents).toEqual([]);
+    expect(migrated.researchRequests).toEqual(document.researchRequests);
+    expect(migrated.accounts).toEqual(document.accounts);
+    expect(migrated.nextBestActions).toEqual(document.nextBestActions);
+    expect(migrated.users).toEqual(document.users);
   });
 });

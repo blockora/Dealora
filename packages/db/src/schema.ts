@@ -112,6 +112,11 @@ export const COLUMNS = {
   targetMetric: "target_metric",
   targetValue: "target_value",
   currency: "currency",
+  basis: "basis",
+  amountMinor: "amount_minor",
+  executionKind: "execution_kind",
+  executionId: "execution_id",
+  occurredAt: "occurred_at",
   timeWindow: "time_window",
   icpId: "icp_id",
   buyerPersonaIds: "buyer_persona_ids",
@@ -577,6 +582,33 @@ export const meetingEventTable = "meeting_events" as const;
  */
 export const nextBestActionTable = "next_best_actions" as const;
 
+/**
+ * Table: recorded cost events (Phase 16).
+ *
+ * One immutable cost fact per row, attributed to the run that incurred it.
+ * `DEALORA_BLUEPRINT.md` §33 asks every run to record six categories of cost;
+ * this table stores those facts and nothing else — every total, breakdown and
+ * per-outcome metric is **derived on read** from these rows, so a stored
+ * aggregate can never go stale and a historical fact is never overwritten to
+ * simplify a sum.
+ *
+ * `basis` separates an **estimate** from a **measurement**: `ROADMAP.md` §23's
+ * gate is "a workflow execution can show estimated or measured cost", so the
+ * distinction lives on the fact rather than in the reader's memory.
+ *
+ * `amount_minor` is a whole number of the currency's minor units — never a
+ * float — and CHECK-constrained non-negative: this phase has no refund or
+ * reversal vocabulary, so a negative amount cannot be represented. One
+ * currency per workspace is enforced in storage, so no aggregate can ever mix
+ * currencies. `(workspace_id, idempotency_key)` is UNIQUE, so a replayed
+ * request returns the same fact instead of recording it twice.
+ *
+ * `created_by` and `created_at` are written server-side from the session:
+ * who recorded a cost and when is never a client claim, and `occurred_at` —
+ * the instant the cost was incurred — is validated, never trusted.
+ */
+export const costEventTable = "cost_events" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -612,6 +644,7 @@ export const tables = [
   meetingBriefTable,
   meetingEventTable,
   nextBestActionTable,
+  costEventTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -795,6 +828,19 @@ export const indexes = {
     `${COLUMN(nextBestActionTable, COLUMNS.workspaceId)} NOT NULL`,
     `${COLUMN(nextBestActionTable, COLUMNS.accountId)} NOT NULL`,
     `${COLUMN(nextBestActionTable, COLUMNS.action)} NOT NULL`,
+  ],
+  costEvents: [
+    `${COLUMN(costEventTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(costEventTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(costEventTable, COLUMNS.executionKind)} NOT NULL`,
+    `${COLUMN(costEventTable, COLUMNS.executionId)} NOT NULL`,
+    `${COLUMN(costEventTable, COLUMNS.category)} NOT NULL`,
+    `${COLUMN(costEventTable, COLUMNS.basis)} NOT NULL`,
+    `${COLUMN(costEventTable, COLUMNS.amountMinor)} NOT NULL`,
+    `${COLUMN(costEventTable, COLUMNS.currency)} NOT NULL`,
+    `${COLUMN(costEventTable, COLUMNS.occurredAt)} NOT NULL`,
+    `${COLUMN(costEventTable, COLUMNS.idempotencyKey)} NOT NULL`,
+    `UNIQUE(${COLUMNS.workspaceId}, ${COLUMNS.idempotencyKey})`,
   ],
 };
 
@@ -1563,6 +1609,33 @@ ${COLUMN(nextBestActionTable, COLUMNS.expectedOutcome)} CHECK (${COLUMN(nextBest
 ${COLUMN(nextBestActionTable, COLUMNS.confidence)} CHECK (${COLUMN(nextBestActionTable, COLUMNS.confidence)} IN ('low','medium','high')),
 ${COLUMN(nextBestActionTable, COLUMNS.reason)} CHECK (length(${COLUMN(nextBestActionTable, COLUMNS.reason)}) > 0),
 ${COLUMN(nextBestActionTable, COLUMNS.approvalRequired)} CHECK (${COLUMN(nextBestActionTable, COLUMNS.approvalRequired)} = (${COLUMN(nextBestActionTable, COLUMNS.riskLevel)} = 'level_2_external_action'))`,
+  ),
+  createTableSql(
+    costEventTable,
+    [
+      COLUMN(costEventTable, COLUMNS.id),
+      COLUMN(costEventTable, COLUMNS.workspaceId),
+      COLUMN(costEventTable, COLUMNS.executionKind),
+      COLUMN(costEventTable, COLUMNS.executionId),
+      COLUMN(costEventTable, COLUMNS.category),
+      COLUMN(costEventTable, COLUMNS.basis),
+      COLUMN(costEventTable, COLUMNS.amountMinor),
+      COLUMN(costEventTable, COLUMNS.currency),
+      COLUMN(costEventTable, COLUMNS.source),
+      COLUMN(costEventTable, COLUMNS.occurredAt),
+      COLUMN(costEventTable, COLUMNS.idempotencyKey),
+      COLUMN(costEventTable, COLUMNS.createdBy),
+    ],
+    `${COLUMN(costEventTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(costEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(costEventTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(costEventTable, COLUMNS.executionKind)} CHECK (${COLUMN(costEventTable, COLUMNS.executionKind)} IN ('research_run','outbound_send','meeting_booking')),
+${COLUMN(costEventTable, COLUMNS.category)} CHECK (${COLUMN(costEventTable, COLUMNS.category)} IN ('llm','search','data','tool','infrastructure','execution')),
+${COLUMN(costEventTable, COLUMNS.basis)} CHECK (${COLUMN(costEventTable, COLUMNS.basis)} IN ('estimated','measured')),
+${COLUMN(costEventTable, COLUMNS.amountMinor)} CHECK (${COLUMN(costEventTable, COLUMNS.amountMinor)} >= 0),
+${COLUMN(costEventTable, COLUMNS.currency)} CHECK (${COLUMN(costEventTable, COLUMNS.currency)} IN ('USD','EUR','GBP','JPY')),
+${COLUMN(costEventTable, COLUMNS.occurredAt)} CHECK (${COLUMN(costEventTable, COLUMNS.occurredAt)} IS NOT NULL),
+UNIQUE("${COLUMNS.workspaceId}", "${COLUMNS.idempotencyKey}")`,
   ),
 ].join("\n\n");
 

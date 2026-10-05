@@ -117,6 +117,10 @@ export type {
   NextBestActionOutcome,
   NextBestActionRiskLevel,
   NextBestActionState,
+  CostEvent,
+  CostCategory,
+  CostBasis,
+  CostExecutionKind,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -158,6 +162,7 @@ export {
   meetingBriefTable,
   meetingEventTable,
   nextBestActionTable,
+  costEventTable,
   createTableSql,
   slugify,
   capString,

@@ -43,6 +43,10 @@ import type {
   ConversationClassification,
   ConversationEvent,
   ConversationEventKind,
+  CostBasis,
+  CostCategory,
+  CostEvent,
+  CostExecutionKind,
   NextBestAction,
   NextBestActionKind,
   NextBestActionRiskLevel,
@@ -132,7 +136,7 @@ function ensureDir(): void {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 14;
+export const LATEST_SCHEMA_VERSION = 15;
 
 export interface DbState {
   schemaVersion?: number;
@@ -169,6 +173,7 @@ export interface DbState {
   meetingBriefs?: MeetingBrief[];
   meetingEvents?: MeetingEvent[];
   nextBestActions?: NextBestAction[];
+  costEvents?: CostEvent[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -210,6 +215,7 @@ export function emptyState(): CompleteDbState {
     meetingBriefs: [],
     meetingEvents: [],
     nextBestActions: [],
+    costEvents: [],
   };
 }
 
@@ -421,6 +427,17 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.nextBestActions;
   }
 
+  // Phase 16 adds the recorded cost facts the Cost Engine derives every total
+  // and metric from. Additive like every step before it: a Phase 14 document
+  // gains one empty table and keeps every recommendation it already had, so an
+  // account advised before the upgrade can still have its cost recorded
+  // afterwards. Nothing before it is touched — in particular no historical row
+  // is rewritten or revalued, because Phase 16 adds the ability to *record*
+  // what a run cost, never to restate what any earlier phase stored.
+  if (version >= 15) {
+    state.costEvents = Array.isArray(input.costEvents) ? input.costEvents : base.costEvents;
+  }
+
   return state;
 }
 
@@ -473,6 +490,7 @@ type RowTable =
   | "meetingBriefs"
   | "meetingEvents"
   | "nextBestActions"
+  | "costEvents"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -483,6 +501,29 @@ interface BrainTables {
   brandVoices: BrandVoice[];
   claims: Claim[];
 }
+
+/**
+ * Storage-side cost vocabulary (Phase 16) — enforced here independently of
+ * any caller, because the store is a public surface too: application code must
+ * not be able to widen the six categories, the two bases or the execution
+ * kinds by being careless.
+ */
+const COST_CATEGORIES: readonly CostCategory[] = [
+  "llm",
+  "search",
+  "data",
+  "tool",
+  "infrastructure",
+  "execution",
+];
+const COST_BASES: readonly CostBasis[] = ["estimated", "measured"];
+const COST_EXECUTION_KINDS: readonly CostExecutionKind[] = [
+  "research_run",
+  "outbound_send",
+  "meeting_booking",
+];
+/** The currencies this repository accepts — one per workspace, never mixed. */
+const COST_CURRENCIES = ["USD", "EUR", "GBP", "JPY"] as const;
 
 /** Unique in-memory store per process, seedable for tests. */
 export class Store {
@@ -4153,6 +4194,203 @@ export class Store {
       value: [...filtered].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)),
     };
   }
+
+  // --- Cost events (Phase 16) ---
+
+  /**
+   * Record one immutable cost fact against the run that incurred it.
+   *
+   * Everything authoritative is decided here rather than accepted from the
+   * caller: membership fixes the workspace, `createdBy` / `createdAt` come
+   * from the server, the execution must be a row that exists inside this
+   * workspace, and one currency per workspace means no aggregate can ever mix
+   * currencies. Amounts are whole minor units — integers, never floats — and
+   * a negative amount cannot be represented at all, because Phase 16's
+   * vocabulary has no refund or reversal.
+   *
+   * A replayed `idempotencyKey` returns the same row without writing a second
+   * one when the payload is identical, or fails with `CONFLICT` when the key
+   * was already spent on a different fact — so a retried request can never
+   * double-count and a reused key can never quietly restate a cost.
+   */
+  createCostEvent(input: {
+    workspaceId: EntityId;
+    createdBy: EntityId;
+    event: {
+      executionKind: CostExecutionKind;
+      executionId: EntityId;
+      category: CostCategory;
+      basis: CostBasis;
+      amountMinor: number;
+      currency: string;
+      source: string | null;
+      occurredAt: string;
+      idempotencyKey: string;
+    };
+  }): Result<CostEvent, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.createdBy);
+    if (!auth.ok) return auth;
+    const event = input.event;
+
+    if (!COST_EXECUTION_KINDS.includes(event.executionKind)) {
+      return { ok: false, error: toError("INVALID", "unknown execution kind") };
+    }
+    if (!COST_CATEGORIES.includes(event.category)) {
+      return { ok: false, error: toError("INVALID", "unknown cost category") };
+    }
+    if (!COST_BASES.includes(event.basis)) {
+      return {
+        ok: false,
+        error: toError("INVALID", "cost basis must be estimated or measured"),
+      };
+    }
+    if (!Number.isSafeInteger(event.amountMinor) || event.amountMinor < 0) {
+      return {
+        ok: false,
+        error: toError("INVALID", "amountMinor must be a non-negative whole number of minor units"),
+      };
+    }
+    const currency = typeof event.currency === "string" ? event.currency.trim() : "";
+    if (!(COST_CURRENCIES as readonly string[]).includes(currency)) {
+      return { ok: false, error: toError("INVALID", "unsupported currency") };
+    }
+    if (typeof event.occurredAt !== "string" || Number.isNaN(Date.parse(event.occurredAt))) {
+      return { ok: false, error: toError("INVALID", "occurredAt must be a valid instant") };
+    }
+    const occurredAt = toDateTime(new Date(event.occurredAt));
+    const key = typeof event.idempotencyKey === "string" ? event.idempotencyKey.trim() : "";
+    if (key === "" || key.length > 128) {
+      return {
+        ok: false,
+        error: toError("INVALID", "idempotencyKey must be 1 to 128 characters"),
+      };
+    }
+    const source = event.source === null ? null : String(event.source).trim();
+    if (source !== null && (source === "" || source.length > 128)) {
+      return {
+        ok: false,
+        error: toError("INVALID", "source must be null or 1 to 128 characters"),
+      };
+    }
+
+    // The execution must be a real run of this workspace: a cost can never be
+    // filed against another tenant's run or an id that was never issued.
+    const subject = ((): { workspaceId: EntityId } | null => {
+      switch (event.executionKind) {
+        case "research_run":
+          return this.findById("researchRequests", event.executionId);
+        case "outbound_send":
+          return this.findById("outboundActions", event.executionId);
+        case "meeting_booking":
+          return this.findById("meetings", event.executionId);
+      }
+    })();
+    if (subject === null || subject.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("NOT_FOUND", "execution not found") };
+    }
+
+    const existing = this.rows("costEvents").filter((r) => r.workspaceId === input.workspaceId);
+
+    // Replay: the same key returns the same fact, or the ambiguity is refused.
+    const replay = existing.find((r) => r.idempotencyKey === key);
+    if (replay) {
+      const identical =
+        replay.executionKind === event.executionKind &&
+        replay.executionId === event.executionId &&
+        replay.category === event.category &&
+        replay.basis === event.basis &&
+        replay.amountMinor === event.amountMinor &&
+        replay.currency === currency &&
+        replay.occurredAt === occurredAt &&
+        replay.source === source;
+      if (!identical) {
+        return {
+          ok: false,
+          error: toError("CONFLICT", "idempotency key already used for a different cost event"),
+        };
+      }
+      return { ok: true, value: replay };
+    }
+
+    // One currency per workspace: a second currency would make every total
+    // ambiguous, so the first recorded fact fixes it.
+    const mixed = existing.find((r) => r.currency !== currency);
+    if (mixed) {
+      return {
+        ok: false,
+        error: toError(
+          "INVALID",
+          `this workspace records costs in ${mixed.currency}; ${currency} would make its totals mix currencies`,
+        ),
+      };
+    }
+
+    const row: CostEvent = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      executionKind: event.executionKind,
+      executionId: event.executionId,
+      category: event.category,
+      basis: event.basis,
+      amountMinor: event.amountMinor,
+      currency,
+      source,
+      occurredAt,
+      idempotencyKey: key,
+      createdBy: input.createdBy,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("costEvents", (rows) => rows.push(row));
+    return { ok: true, value: row };
+  }
+
+  /** One recorded cost fact, authorized against the caller's own workspace. */
+  getCostEvent(id: EntityId, userId: EntityId): Result<CostEvent, StorageError> {
+    const event = this.findById("costEvents", id);
+    if (!event) return { ok: false, error: toError("NOT_FOUND", "cost event not found") };
+    const auth = this.requireWorkspace(event.workspaceId, userId);
+    // Reported as not found rather than unauthorized, so a foreign id is
+    // indistinguishable from one that was never issued.
+    if (!auth.ok) return { ok: false, error: toError("NOT_FOUND", "cost event not found") };
+    return { ok: true, value: event };
+  }
+
+  /**
+   * A workspace's recorded cost facts, optionally narrowed to one execution,
+   * category or basis, ordered by when the cost was incurred (newest first,
+   * ties broken by id so the order is total).
+   */
+  listCostEvents(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: {
+      executionKind?: CostExecutionKind;
+      executionId?: EntityId;
+      category?: CostCategory;
+      basis?: CostBasis;
+    },
+  ): Result<CostEvent[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const filtered = this.rows("costEvents").filter(
+      (r) =>
+        r.workspaceId === workspaceId &&
+        (filter?.executionKind === undefined || r.executionKind === filter.executionKind) &&
+        (filter?.executionId === undefined || r.executionId === filter.executionId) &&
+        (filter?.category === undefined || r.category === filter.category) &&
+        (filter?.basis === undefined || r.basis === filter.basis),
+    );
+    return {
+      ok: true,
+      value: [...filtered].sort((a, b) =>
+        a.occurredAt < b.occurredAt
+          ? 1
+          : a.occurredAt > b.occurredAt
+            ? -1
+            : a.id.localeCompare(b.id),
+      ),
+    };
+  }
 }
 
 /** Default single-process store for local runs. */
@@ -4300,6 +4538,10 @@ export const db = {
   createNextBestAction: store.createNextBestAction.bind(store),
   getNextBestAction: store.getNextBestAction.bind(store),
   listNextBestActions: store.listNextBestActions.bind(store),
+
+  createCostEvent: store.createCostEvent.bind(store),
+  getCostEvent: store.getCostEvent.bind(store),
+  listCostEvents: store.listCostEvents.bind(store),
 
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),

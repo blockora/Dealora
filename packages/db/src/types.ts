@@ -2070,3 +2070,63 @@ export interface NextBestAction {
   createdBy: EntityId;
   createdAt: DateTime;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 16 — Cost Engine
+// ---------------------------------------------------------------------------
+
+/**
+ * The six cost categories `ROADMAP.md` §23 and `DEALORA_BLUEPRINT.md` §33
+ * name — a closed vocabulary, so a cost outside this list cannot be
+ * represented, advertised or silently folded into another bucket.
+ */
+export type CostCategory = "llm" | "search" | "data" | "tool" | "infrastructure" | "execution";
+
+/**
+ * Whether an amount was **estimated** before the fact or **measured** from a
+ * usage or billing record. `ROADMAP.md` §23's gate turns on exactly this
+ * distinction: a workflow execution can show estimated or measured cost.
+ */
+export type CostBasis = "estimated" | "measured";
+
+/**
+ * The run a cost event is attributed to. Phase 16's closed list covers the
+ * runs this repository can actually perform; `workflow` is refused with the
+ * phase that owns it rather than published as an unreachable kind.
+ */
+export type CostExecutionKind = "research_run" | "outbound_send" | "meeting_booking";
+
+/**
+ * An immutable recorded cost fact — `DEALORA_BLUEPRINT.md` §33's "every run
+ * should record".
+ *
+ * The row is append-only: `amountMinor` is a whole number of the currency's
+ * minor units (never a float), `occurredAt` is the instant the cost was
+ * incurred (a validated fact, never an authoritative timestamp), and
+ * `createdBy` / `createdAt` are written server-side, so who recorded a cost
+ * and when is never a client claim. `idempotencyKey` is unique per workspace,
+ * which is what makes a replayed request return the same fact instead of
+ * counting it twice.
+ */
+export interface CostEvent {
+  id: EntityId;
+  workspaceId: EntityId;
+  executionKind: CostExecutionKind;
+  executionId: EntityId;
+  category: CostCategory;
+  basis: CostBasis;
+  /** Whole minor units of `currency` (e.g. cents for USD). Integer, ≥ 0. */
+  amountMinor: number;
+  /** One currency per workspace; totals never mix currencies. */
+  currency: string;
+  /** The system that reported the fact (e.g. a billing export). Optional. */
+  source: string | null;
+  /** The instant the cost was incurred. A validated fact, not an authority. */
+  occurredAt: DateTime;
+  /** Client-chosen replay key, unique within the workspace. */
+  idempotencyKey: string;
+  /** Server-derived: who recorded it, taken from the session. */
+  createdBy: EntityId;
+  /** Server-derived: when it was recorded. Never client-controlled. */
+  createdAt: DateTime;
+}
