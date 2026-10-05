@@ -63,6 +63,8 @@ import {
 } from "@dealora/revenuegraph";
 import { createCostService } from "@dealora/cost";
 import { createDashboardService } from "@dealora/dashboard";
+import { createAgentService } from "@dealora/agent";
+import type { AgentService } from "@dealora/agent";
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
 import type { RevenueGoal } from "@dealora/db";
@@ -253,6 +255,22 @@ function dashboardService(store: Store) {
 }
 
 /**
+ * Wire the Agent Registry the way the production wiring does: the real store
+ * behind the workspace-scoped lookup, and nothing else at all. A route test
+ * therefore exercises the real lifecycle table over the real rows the store
+ * wrote, and cannot pass against a stand-in that never refuses a promotion.
+ */
+function agentService(store: Store) {
+  return createAgentService({
+    authorize: store.authorize.bind(store),
+    listAgentRegistry: store.listAgentRegistry.bind(store),
+    getAgentRegistry: store.getAgentRegistry.bind(store),
+    listAgentRegistryEvents: store.listAgentRegistryEvents.bind(store),
+    setAgentStatus: store.setAgentStatus.bind(store),
+  });
+}
+
+/**
  * Wire the Personalization service the way the production wiring does.
  *
  * The readers are the same narrow ones `createDefaultHandlers` builds: the
@@ -303,6 +321,12 @@ function fixture(options?: {
   researchProviders?: readonly ResearchProvider[];
   /** A fixed clock for the evidence layer, so freshness is reproducible. */
   evidenceClock?: () => Date;
+  /**
+   * Replaces the agent registry boundary with one whose storage fails, so a
+   * route's internal-error mapping can be exercised against every other real
+   * service. Defaults to the real store-backed registry.
+   */
+  agentOverride?: AgentService;
 }): {
   handlers: ReturnType<typeof createHandlers>;
   tokenA: string;
@@ -404,6 +428,7 @@ function fixture(options?: {
     revenuegraph: revenueGraphService(store),
     cost: costService(store),
     dashboard: dashboardService(store),
+    agent: options?.agentOverride ?? agentService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -890,6 +915,7 @@ describe("API Revenue Goal routes", () => {
       revenuegraph: revenueGraphService(store),
       cost: costService(store),
       dashboard: dashboardService(store),
+      agent: agentService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1230,6 +1256,7 @@ describe("API Revenue Plan routes", () => {
       revenuegraph: revenueGraphService(store),
       cost: costService(store),
       dashboard: dashboardService(store),
+      agent: agentService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1451,6 +1478,7 @@ describe("API Business Brain routes", () => {
       revenuegraph: revenueGraphService(failingStore),
       cost: costService(failingStore),
       dashboard: dashboardService(failingStore),
+      agent: agentService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1797,6 +1825,7 @@ describe("API Account & Contact routes", () => {
       revenuegraph: revenueGraphService(store),
       cost: costService(store),
       dashboard: dashboardService(store),
+      agent: agentService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -2110,6 +2139,7 @@ describe("API Research routes", () => {
       revenuegraph: revenueGraphService(store),
       cost: costService(store),
       dashboard: dashboardService(store),
+      agent: agentService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -2167,6 +2197,7 @@ describe("API Research routes", () => {
       revenuegraph: revenueGraphService(store),
       cost: costService(store),
       dashboard: dashboardService(store),
+      agent: agentService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3312,6 +3343,7 @@ describe("API Qualification routes", () => {
       revenuegraph: revenueGraphService(store),
       cost: costService(store),
       dashboard: dashboardService(store),
+      agent: agentService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -3617,6 +3649,7 @@ describe("API Next Best Action routes", () => {
       ),
       cost: costService(failingStore),
       dashboard: dashboardService(failingStore),
+      agent: agentService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -4819,5 +4852,601 @@ describe("API Dashboard routes", () => {
     expect(policy.items).toHaveLength(14);
     expect(policy.neverDoes.join(" ")).toContain("never write");
     expect(policy.neverDoes.join(" ")).toContain("never fabricate");
+  });
+});
+
+describe("API Agent System routes", () => {
+  interface RegisteredAgentData {
+    declaration: {
+      agentId: string;
+      version: string;
+      owner: string;
+      purpose: string;
+      tools: string[];
+      permissions: string[];
+      memoryAccess: string[];
+      approvalRequired: boolean;
+      maxRiskLevel: string;
+      costLimits: { maxSpendMinor: number; maxPerExecutionMinor: number; currency: string };
+      evaluationMetrics: string[];
+      model: { provider: string | null; model: string | null; temperature: number | null };
+      initialState: string;
+    };
+    status: string;
+    usable: boolean;
+    updatedBy: string | null;
+    updatedAt: string | null;
+  }
+  interface AgentRegistryData {
+    ruleVersion: string;
+    agents: RegisteredAgentData[];
+  }
+  interface AgentPolicyData {
+    ruleVersion: string;
+    agents: { agentId: string; owner: string }[];
+    states: string[];
+    transitions: { from: string; to: string; reason: string }[];
+    tools: { tool: string; executedBy: string; approvalImplied: boolean }[];
+    permissions: { permission: string; description: string }[];
+    memoryLayers: string[];
+    evaluationMetrics: { metric: string; owningPhase: string }[];
+    usableStates: string[];
+    promotionRule: string;
+    requiredFields: string[];
+    neverDoes: string[];
+  }
+  interface AgentEventData {
+    id: string;
+    agentId: string;
+    actorUserId: string;
+    kind: string;
+    fromStatus: string | null;
+    toStatus: string;
+  }
+
+  const agentParams = (workspaceId: string): Record<string, string> => ({ workspaceId });
+  const oneAgent = (workspaceId: string, agentId: string): Record<string, string> => ({
+    workspaceId,
+    agentId,
+  });
+
+  it("returns the whole registry for a member, in roadmap order", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const data = (await dataOf(
+      handlers.getAgentRegistryHandler(request({ token: tokenA, params: agentParams(workspaceA) })),
+    )) as AgentRegistryData;
+    expect(data.ruleVersion).toBe("agent-1.0.0");
+    expect(data.agents.map((entry) => entry.declaration.agentId)).toEqual([
+      "strategy",
+      "market_intelligence",
+      "account_research",
+      "prospect_discovery",
+      "qualification",
+      "personalization",
+      "conversation",
+      "follow_up",
+      "meeting",
+      "crm",
+      "analytics",
+      "optimization",
+    ]);
+    // Nothing has been decided, so every agent reads as its declaration default.
+    expect(data.agents.every((entry) => entry.status === "draft")).toBe(true);
+    expect(data.agents.every((entry) => entry.usable === false)).toBe(true);
+    expect(data.agents.every((entry) => entry.updatedBy === null)).toBe(true);
+  });
+
+  it("returns every required declaration field for one agent", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const data = (await dataOf(
+      handlers.getAgentHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "qualification") }),
+      ),
+    )) as { agent: RegisteredAgentData };
+    const declaration = data.agent.declaration;
+    expect(declaration.agentId).toBe("qualification");
+    expect(declaration.version).toBe("1.0.0");
+    expect(declaration.owner).toMatch(/^Phase 8/);
+    expect(declaration.purpose.length).toBeGreaterThan(20);
+    expect(declaration.tools).toContain("request_qualification");
+    expect(declaration.permissions.length).toBeGreaterThan(0);
+    expect(declaration.memoryAccess.length).toBeGreaterThan(0);
+    expect(declaration.approvalRequired).toBe(false);
+    expect(declaration.maxRiskLevel).toBe("level_1_draft");
+    expect(declaration.costLimits.currency).toBe("USD");
+    expect(declaration.costLimits.maxSpendMinor).toBeGreaterThan(0);
+    expect(declaration.evaluationMetrics).toContain("qualification_accuracy");
+    // Phase 18 declares a model configuration; it never opens one.
+    expect(declaration.model).toEqual({ provider: null, model: null, temperature: null });
+    expect(declaration.initialState).toBe("draft");
+  });
+
+  it("rejects an unauthenticated read", async () => {
+    const { handlers, workspaceA } = fixture();
+    const error = await errorOf(
+      handlers.getAgentRegistryHandler(request({ params: agentParams(workspaceA) })),
+    );
+    expect(error.code).toBe("UNAUTHENTICATED");
+  });
+
+  it("rejects a forged session token", async () => {
+    const { handlers, workspaceA } = fixture();
+    const error = await errorOf(
+      handlers.getAgentRegistryHandler(
+        request({ token: "forged-token", params: agentParams(workspaceA) }),
+      ),
+    );
+    expect(error.code).toBe("UNAUTHENTICATED");
+  });
+
+  it("rejects a caller from another workspace", async () => {
+    const { handlers, tokenB, workspaceA } = fixture();
+    const error = await errorOf(
+      handlers.getAgentRegistryHandler(request({ token: tokenB, params: agentParams(workspaceA) })),
+    );
+    expect(error.code).toBe("UNAUTHORIZED");
+  });
+
+  it("rejects a workspace that does not exist", async () => {
+    const { handlers, tokenA } = fixture();
+    const error = await errorOf(
+      handlers.getAgentRegistryHandler(
+        request({ token: tokenA, params: agentParams("ws-forged") }),
+      ),
+    );
+    expect(error.code).toBe("NOT_FOUND");
+  });
+
+  it("requires a workspace route parameter", async () => {
+    const { handlers, tokenA } = fixture();
+    const error = await errorOf(handlers.getAgentRegistryHandler(request({ token: tokenA })));
+    expect(error.code).toBe("VALIDATION_ERROR");
+    expect(error.message).toContain("workspaceId");
+  });
+
+  it("rejects an agent id outside the twelve", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const error = await errorOf(
+      handlers.getAgentHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "sales_agent") }),
+      ),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+    expect(error.details?.[0]?.field).toBe("agentId");
+  });
+
+  it("ignores any body a client sends to the read routes", async () => {
+    const { handlers, tokenA, workspaceA, workspaceB } = fixture();
+    const forged = {
+      agentId: "strategy",
+      status: "production",
+      usable: true,
+      workspaceId: workspaceB,
+      updatedBy: "someone-else",
+      costLimits: { maxSpendMinor: 99_999_999, currency: "EUR" },
+    };
+    const withBody = (await dataOf(
+      handlers.getAgentRegistryHandler(
+        request({ token: tokenA, body: forged, params: agentParams(workspaceA) }),
+      ),
+    )) as AgentRegistryData;
+    const withoutBody = (await dataOf(
+      handlers.getAgentRegistryHandler(request({ token: tokenA, params: agentParams(workspaceA) })),
+    )) as AgentRegistryData;
+    // A forged body produces a byte-identical response: nothing in it is read.
+    expect(JSON.stringify(withBody)).toBe(JSON.stringify(withoutBody));
+    const strategy = withBody.agents.find((entry) => entry.declaration.agentId === "strategy");
+    expect(strategy?.usable).toBe(false);
+    expect(strategy?.status).toBe("draft");
+    expect(strategy?.declaration.costLimits.currency).toBe("USD");
+  });
+
+  it("is byte-identical across repeated reads of an unchanged registry", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const first = JSON.stringify(
+      await dataOf(
+        handlers.getAgentRegistryHandler(
+          request({ token: tokenA, params: agentParams(workspaceA) }),
+        ),
+      ),
+    );
+    const second = JSON.stringify(
+      await dataOf(
+        handlers.getAgentRegistryHandler(
+          request({ token: tokenA, params: agentParams(workspaceA) }),
+        ),
+      ),
+    );
+    expect(first).toBe(second);
+  });
+
+  it("records a lifecycle decision and reads it back through the real store", async () => {
+    const { handlers, tokenA, workspaceA, userA, store } = fixture();
+    const changed = (await dataOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "qualification"),
+          body: { status: "testing" },
+        }),
+      ),
+    )) as { agent: RegisteredAgentData };
+    expect(changed.agent.status).toBe("testing");
+    // The actor is the session's, never the client's.
+    expect(changed.agent.updatedBy).toBe(userA);
+
+    const reread = (await dataOf(
+      handlers.getAgentHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "qualification") }),
+      ),
+    )) as { agent: RegisteredAgentData };
+    expect(reread.agent.status).toBe("testing");
+
+    // The store really holds the row, written by the real repository method.
+    const stored = store.listAgentRegistry(workspaceA, userA);
+    if (!isOk(stored)) throw new Error("registry read failed");
+    expect(stored.value).toHaveLength(1);
+    expect(stored.value[0]?.agentId).toBe("qualification");
+    expect(stored.value[0]?.status).toBe("testing");
+  });
+
+  it("refuses promotion to production and names Phase 19", async () => {
+    const { handlers, tokenA, workspaceA, store, userA } = fixture();
+    for (const status of ["testing", "approved"]) {
+      await dataOf(
+        handlers.changeAgentStatusHandler(
+          request({
+            token: tokenA,
+            params: oneAgent(workspaceA, "analytics"),
+            body: { status },
+          }),
+        ),
+      );
+    }
+    const error = await errorOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "analytics"),
+          body: { status: "production" },
+        }),
+      ),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+    expect(error.message).toContain("evaluation evidence");
+    expect(error.details?.[0]?.message).toContain("Phase 19");
+
+    // Nothing was written by the refused request: the row is still `approved`.
+    const stored = store.getAgentRegistry(workspaceA, userA, "analytics");
+    if (!isOk(stored)) throw new Error("registry read failed");
+    expect(stored.value?.status).toBe("approved");
+    const events = store.listAgentRegistryEvents(workspaceA, userA);
+    if (!isOk(events)) throw new Error("event read failed");
+    expect(events.value).toHaveLength(2);
+  });
+
+  it("rejects a state outside the seven published states", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const error = await errorOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "meeting"),
+          body: { status: "live" },
+        }),
+      ),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+    expect(error.details?.[0]?.field).toBe("status");
+  });
+
+  it("rejects a change with no status at all", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const error = await errorOf(
+      handlers.changeAgentStatusHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "meeting"), body: {} }),
+      ),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("ignores forged attribution fields in the change body", async () => {
+    const { handlers, tokenA, workspaceA, userA, store } = fixture();
+    await dataOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "conversation"),
+          body: {
+            status: "testing",
+            updatedBy: "attacker",
+            createdAt: "1999-01-01T00:00:00.000Z",
+            workspaceId: "ws-other",
+            actorUserId: "attacker",
+            kind: "archived",
+          },
+        }),
+      ),
+    );
+    const stored = store.getAgentRegistry(workspaceA, userA, "conversation");
+    if (!isOk(stored)) throw new Error("registry read failed");
+    expect(stored.value?.updatedBy).toBe(userA);
+    expect(stored.value?.updatedAt).not.toBe("1999-01-01T00:00:00.000Z");
+    expect(stored.value?.workspaceId).toBe(workspaceA);
+    const events = store.listAgentRegistryEvents(workspaceA, userA);
+    if (!isOk(events)) throw new Error("event read failed");
+    expect(events.value[0]?.actorUserId).toBe(userA);
+    expect(events.value[0]?.kind).toBe("registered");
+  });
+
+  it("returns the governance trail newest first, ties in decision order", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    for (const status of ["testing", "approved", "paused"]) {
+      await dataOf(
+        handlers.changeAgentStatusHandler(
+          request({ token: tokenA, params: oneAgent(workspaceA, "follow_up"), body: { status } }),
+        ),
+      );
+    }
+    const data = (await dataOf(
+      handlers.listAgentEventsHandler(request({ token: tokenA, params: agentParams(workspaceA) })),
+    )) as { events: (AgentEventData & { createdAt: string })[] };
+
+    // The rule is asserted, not a particular permutation: the trail is ordered
+    // newest first by timestamp, and events sharing a millisecond — which the
+    // store's clock can produce — read in the order they were decided. Ordering
+    // ties by a generated id would make this differ between runs.
+    expect(data.events).toHaveLength(3);
+    expect(new Set(data.events.map((event) => event.toStatus))).toEqual(
+      new Set(["testing", "approved", "paused"]),
+    );
+    for (let i = 1; i < data.events.length; i += 1) {
+      expect(
+        (data.events[i - 1]?.createdAt ?? "") >= (data.events[i]?.createdAt ?? ""),
+        "trail is not ordered newest first",
+      ).toBe(true);
+    }
+    // The trail records a chain: exactly one registration, and each later
+    // decision starts from the state the previous one left behind.
+    const registrations = data.events.filter((event) => event.kind === "registered");
+    expect(registrations).toHaveLength(1);
+    expect(registrations[0]?.fromStatus).toBeNull();
+    expect(registrations[0]?.toStatus).toBe("testing");
+    const changes = data.events.filter((event) => event.kind === "state_changed");
+    expect(changes).toHaveLength(2);
+    expect(changes.map((event) => `${event.fromStatus}->${event.toStatus}`).sort()).toEqual([
+      "approved->paused",
+      "testing->approved",
+    ]);
+    expect(data.events.every((event) => event.actorUserId !== null)).toBe(true);
+  });
+
+  it("narrows the governance trail with a query parameter", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await dataOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "analytics"),
+          body: { status: "testing" },
+        }),
+      ),
+    );
+    await dataOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "crm"),
+          body: { status: "testing" },
+        }),
+      ),
+    );
+    const all = (await dataOf(
+      handlers.listAgentEventsHandler(request({ token: tokenA, params: agentParams(workspaceA) })),
+    )) as { events: AgentEventData[] };
+    const narrowed = (await dataOf(
+      handlers.listAgentEventsHandler(
+        request({ token: tokenA, params: agentParams(workspaceA), query: { agentId: "crm" } }),
+      ),
+    )) as { events: AgentEventData[] };
+    expect(all.events).toHaveLength(2);
+    expect(narrowed.events).toHaveLength(1);
+    expect(narrowed.events[0]?.agentId).toBe("crm");
+  });
+
+  it("rejects an unknown agent in the governance filter", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const error = await errorOf(
+      handlers.listAgentEventsHandler(
+        request({ token: tokenA, params: agentParams(workspaceA), query: { agentId: "nope" } }),
+      ),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("keeps two workspaces' registries apart", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB } = fixture();
+    await dataOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "crm"),
+          body: { status: "testing" },
+        }),
+      ),
+    );
+    for (const status of ["testing", "paused"]) {
+      await dataOf(
+        handlers.changeAgentStatusHandler(
+          request({ token: tokenB, params: oneAgent(workspaceB, "crm"), body: { status } }),
+        ),
+      );
+    }
+    const mine = (await dataOf(
+      handlers.getAgentHandler(request({ token: tokenA, params: oneAgent(workspaceA, "crm") })),
+    )) as { agent: RegisteredAgentData };
+    const theirs = (await dataOf(
+      handlers.getAgentHandler(request({ token: tokenB, params: oneAgent(workspaceB, "crm") })),
+    )) as { agent: RegisteredAgentData };
+    expect(mine.agent.status).toBe("testing");
+    expect(theirs.agent.status).toBe("paused");
+  });
+
+  it("refuses a cross-tenant change", async () => {
+    const { handlers, tokenB, workspaceA, userA, store } = fixture();
+    const error = await errorOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenB,
+          params: oneAgent(workspaceA, "crm"),
+          body: { status: "testing" },
+        }),
+      ),
+    );
+    expect(error.code).toBe("UNAUTHORIZED");
+    // The refused request wrote nothing anywhere.
+    const rows = store.listAgentRegistry(workspaceA, userA);
+    if (!isOk(rows)) throw new Error("registry read failed");
+    expect(rows.value).toEqual([]);
+  });
+
+  it("publishes the whole rule set as policy", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const data = (await dataOf(
+      handlers.getAgentPolicyHandler(request({ token: tokenA, params: agentParams(workspaceA) })),
+    )) as AgentPolicyData;
+    expect(data.agents).toHaveLength(12);
+    expect(data.states).toEqual([
+      "draft",
+      "testing",
+      "approved",
+      "production",
+      "paused",
+      "disabled",
+      "archived",
+    ]);
+    expect(data.requiredFields).toHaveLength(12);
+    expect(data.memoryLayers.length).toBeGreaterThan(0);
+    // Every evaluation metric names the phase that will measure it.
+    expect(data.evaluationMetrics.every((metric) => metric.owningPhase === "Phase 19")).toBe(true);
+    expect(data.evaluationMetrics).toHaveLength(13);
+    // Every tool names an existing phase as its executor.
+    expect(data.tools.every((tool) => /^Phase \d+/.test(tool.executedBy))).toBe(true);
+    expect(data.neverDoes.join(" ")).toContain("Never executes");
+  });
+
+  it("publishes that nothing is usable yet, and which phase will change that", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const data = (await dataOf(
+      handlers.getAgentPolicyHandler(request({ token: tokenA, params: agentParams(workspaceA) })),
+    )) as AgentPolicyData;
+    expect(data.usableStates).toEqual([]);
+    expect(data.promotionRule).toContain("Phase 19");
+    // The production edge is published so the machine is legible, not hidden.
+    expect(
+      data.transitions.some((entry) => entry.from === "approved" && entry.to === "production"),
+    ).toBe(true);
+  });
+
+  it("authorizes the policy read like every other route", async () => {
+    const { handlers, tokenA, tokenB, workspaceA } = fixture();
+    expect(
+      (await errorOf(handlers.getAgentPolicyHandler(request({ params: agentParams(workspaceA) }))))
+        .code,
+    ).toBe("UNAUTHENTICATED");
+    expect(
+      (
+        await errorOf(
+          handlers.getAgentPolicyHandler(
+            request({ token: tokenB, params: agentParams(workspaceA) }),
+          ),
+        )
+      ).code,
+    ).toBe("UNAUTHORIZED");
+    expect(
+      (
+        await errorOf(
+          handlers.getAgentPolicyHandler(
+            request({ token: tokenA, params: agentParams("ws-forged") }),
+          ),
+        )
+      ).code,
+    ).toBe("NOT_FOUND");
+  });
+
+  /** A registry whose storage refuses, standing in for an internal fault. */
+  function brokenAgentService(broken: "list" | "write") {
+    const refusal = {
+      ok: false as const,
+      error: { code: "UNAVAILABLE", message: "the disk is on fire" },
+    };
+    return createAgentService({
+      authorize: () => ({ ok: true as const, value: undefined }),
+      listAgentRegistry: () => (broken === "list" ? refusal : { ok: true as const, value: [] }),
+      getAgentRegistry: () => (broken === "list" ? refusal : { ok: true as const, value: null }),
+      listAgentRegistryEvents: () =>
+        broken === "list" ? refusal : { ok: true as const, value: [] },
+      setAgentStatus: () =>
+        broken === "write"
+          ? refusal
+          : {
+              ok: true as const,
+              value: {
+                workspaceId: "w1",
+                agentId: "crm",
+                status: "testing",
+                updatedBy: "u1",
+                updatedAt: "t",
+              },
+            },
+    });
+  }
+
+  it("maps an internal storage failure to a generic server error", async () => {
+    const { handlers, tokenA, workspaceA } = fixture({
+      agentOverride: brokenAgentService("list"),
+    });
+    const error = await errorOf(
+      handlers.getAgentRegistryHandler(request({ token: tokenA, params: agentParams(workspaceA) })),
+    );
+    expect(error.code).toBe("SERVER_ERROR");
+    // `UNAVAILABLE` is an internal condition and is never surfaced verbatim.
+    expect(error.message).toBe("unexpected failure");
+    expect(JSON.stringify(error)).not.toContain("disk");
+  });
+
+  it("maps a failed write without pretending the agent changed", async () => {
+    const { handlers, tokenA, workspaceA } = fixture({
+      agentOverride: brokenAgentService("write"),
+    });
+    const error = await errorOf(
+      handlers.changeAgentStatusHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "crm"),
+          body: { status: "testing" },
+        }),
+      ),
+    );
+    expect(error.code).toBe("SERVER_ERROR");
+    expect(JSON.stringify(error)).not.toContain("disk");
+  });
+
+  it("writes nothing on any read route", async () => {
+    const { handlers, tokenA, workspaceA, store, userA } = fixture();
+    await dataOf(
+      handlers.getAgentRegistryHandler(request({ token: tokenA, params: agentParams(workspaceA) })),
+    );
+    await dataOf(
+      handlers.getAgentPolicyHandler(request({ token: tokenA, params: agentParams(workspaceA) })),
+    );
+    await dataOf(
+      handlers.listAgentEventsHandler(request({ token: tokenA, params: agentParams(workspaceA) })),
+    );
+    const rows = store.listAgentRegistry(workspaceA, userA);
+    const events = store.listAgentRegistryEvents(workspaceA, userA);
+    if (!isOk(rows) || !isOk(events)) throw new Error("read failed");
+    expect(rows.value).toEqual([]);
+    expect(events.value).toEqual([]);
   });
 });

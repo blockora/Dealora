@@ -4109,3 +4109,218 @@ describe("cost events", () => {
     expect(migrated.users).toEqual(document.users);
   });
 });
+
+describe("agent registry", () => {
+  /** A workspace with an owner, which is the minimum the registry needs. */
+  const agentFixture = () => {
+    const store = seed();
+    const owner = makeOwner(store, "agent-owner@example.com");
+    const workspaceId = makeWorkspace(store, owner.id, "Agent Co");
+    return { store, owner, workspaceId };
+  };
+
+  it("records a lifecycle state with server-side attribution", () => {
+    const fx = agentFixture();
+    const written = fx.store.setAgentStatus({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "qualification",
+      status: "testing",
+    });
+    if (!isOk(written)) throw new Error("agent status write failed");
+    // The actor and both timestamps are the server's, never the client's.
+    expect(written.value.workspaceId).toBe(fx.workspaceId);
+    expect(written.value.agentId).toBe("qualification");
+    expect(written.value.status).toBe("testing");
+    expect(written.value.updatedBy).toBe(fx.owner.id);
+    expect(written.value.updatedAt).toBeTruthy();
+  });
+
+  it("keeps one row per (workspace, agent) and appends a governance event", () => {
+    const fx = agentFixture();
+    for (const status of ["testing", "approved"]) {
+      const written = fx.store.setAgentStatus({
+        workspaceId: fx.workspaceId,
+        userId: fx.owner.id,
+        agentId: "qualification",
+        status,
+      });
+      if (!isOk(written)) throw new Error("agent status write failed");
+    }
+    const rows = fx.store.listAgentRegistry(fx.workspaceId, fx.owner.id);
+    if (!isOk(rows)) throw new Error("registry list failed");
+    // Two writes, one current state: a registry holds decisions, not a log.
+    expect(rows.value).toHaveLength(1);
+    expect(rows.value[0]?.status).toBe("approved");
+
+    const events = fx.store.listAgentRegistryEvents(fx.workspaceId, fx.owner.id);
+    if (!isOk(events)) throw new Error("event list failed");
+    expect(events.value).toHaveLength(2);
+    const [registered, changed] = events.value;
+    expect(registered?.kind).toBe("registered");
+    expect(registered?.fromStatus).toBeNull();
+    expect(registered?.toStatus).toBe("testing");
+    expect(changed?.kind).toBe("state_changed");
+    expect(changed?.fromStatus).toBe("testing");
+    expect(changed?.toStatus).toBe("approved");
+    expect(changed?.actorUserId).toBe(fx.owner.id);
+  });
+
+  it("marks the write that retires an agent as archived", () => {
+    const fx = agentFixture();
+    const first = fx.store.setAgentStatus({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "crm",
+      status: "testing",
+    });
+    if (!isOk(first)) throw new Error("agent status write failed");
+    const retired = fx.store.setAgentStatus({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "crm",
+      status: "archived",
+    });
+    if (!isOk(retired)) throw new Error("archive write failed");
+    const events = fx.store.listAgentRegistryEvents(fx.workspaceId, fx.owner.id);
+    if (!isOk(events)) throw new Error("event list failed");
+    expect(events.value.map((event) => event.kind)).toEqual(["registered", "archived"]);
+  });
+
+  it("reads a single entry, or null when nothing has been decided", () => {
+    const fx = agentFixture();
+    const absent = fx.store.getAgentRegistry(fx.workspaceId, fx.owner.id, "analytics");
+    if (!isOk(absent)) throw new Error("entry read failed");
+    // No row is defaulted here: the draft default belongs to the domain.
+    expect(absent.value).toBeNull();
+
+    const written = fx.store.setAgentStatus({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "analytics",
+      status: "testing",
+    });
+    if (!isOk(written)) throw new Error("agent status write failed");
+    const present = fx.store.getAgentRegistry(fx.workspaceId, fx.owner.id, "analytics");
+    if (!isOk(present)) throw new Error("entry read failed");
+    expect(present.value?.status).toBe("testing");
+  });
+
+  it("narrows the event trail to one agent", () => {
+    const fx = agentFixture();
+    for (const agentId of ["qualification", "analytics", "qualification"]) {
+      const written = fx.store.setAgentStatus({
+        workspaceId: fx.workspaceId,
+        userId: fx.owner.id,
+        agentId,
+        status: "testing",
+      });
+      if (!isOk(written)) throw new Error("agent status write failed");
+    }
+    const all = fx.store.listAgentRegistryEvents(fx.workspaceId, fx.owner.id);
+    if (!isOk(all)) throw new Error("event list failed");
+    expect(all.value).toHaveLength(3);
+
+    const narrowed = fx.store.listAgentRegistryEvents(fx.workspaceId, fx.owner.id, "qualification");
+    if (!isOk(narrowed)) throw new Error("filtered event list failed");
+    expect(narrowed.value).toHaveLength(2);
+    expect(narrowed.value.every((event) => event.agentId === "qualification")).toBe(true);
+  });
+
+  it("refuses an agent or state outside the published vocabularies", () => {
+    const fx = agentFixture();
+    const badAgent = fx.store.setAgentStatus({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "not_an_agent",
+      status: "testing",
+    });
+    expect(isErr(badAgent)).toBe(true);
+
+    const badState = fx.store.setAgentStatus({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "qualification",
+      status: "live",
+    });
+    expect(isErr(badState)).toBe(true);
+
+    const badFilter = fx.store.listAgentRegistryEvents(fx.workspaceId, fx.owner.id, "not_an_agent");
+    expect(isErr(badFilter)).toBe(true);
+
+    const rows = fx.store.listAgentRegistry(fx.workspaceId, fx.owner.id);
+    if (!isOk(rows)) throw new Error("registry list failed");
+    expect(rows.value).toEqual([]);
+  });
+
+  it("isolates the registry by workspace in both directions", () => {
+    const fx = agentFixture();
+    const otherOwner = makeOwner(fx.store, "other-owner@example.com");
+    const otherWorkspaceId = makeWorkspace(fx.store, otherOwner.id, "Other Agent Co");
+
+    const written = fx.store.setAgentStatus({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "conversation",
+      status: "testing",
+    });
+    if (!isOk(written)) throw new Error("agent status write failed");
+
+    // A second workspace sees an empty registry, not the first one's decision.
+    const otherRows = fx.store.listAgentRegistry(otherWorkspaceId, otherOwner.id);
+    if (!isOk(otherRows)) throw new Error("other registry list failed");
+    expect(otherRows.value).toEqual([]);
+
+    // A non-member cannot read, write, or enumerate another tenant's rows.
+    expect(isErr(fx.store.listAgentRegistry(fx.workspaceId, otherOwner.id))).toBe(true);
+    expect(isErr(fx.store.getAgentRegistry(fx.workspaceId, otherOwner.id, "conversation"))).toBe(
+      true,
+    );
+    expect(isErr(fx.store.listAgentRegistryEvents(fx.workspaceId, otherOwner.id))).toBe(true);
+    expect(
+      isErr(
+        fx.store.setAgentStatus({
+          workspaceId: fx.workspaceId,
+          userId: otherOwner.id,
+          agentId: "conversation",
+          status: "testing",
+        }),
+      ),
+    ).toBe(true);
+
+    // The refused write left the first workspace's state untouched.
+    const rows = fx.store.listAgentRegistry(fx.workspaceId, fx.owner.id);
+    if (!isOk(rows)) throw new Error("registry list failed");
+    expect(rows.value).toHaveLength(1);
+    expect(rows.value[0]?.status).toBe("testing");
+    const events = fx.store.listAgentRegistryEvents(fx.workspaceId, fx.owner.id);
+    if (!isOk(events)) throw new Error("event list failed");
+    expect(events.value).toHaveLength(1);
+  });
+
+  it("migrates a v15 document forward by adding only the agent tables", () => {
+    const fx = agentFixture();
+    const written = fx.store.setAgentStatus({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "qualification",
+      status: "testing",
+    });
+    if (!isOk(written)) throw new Error("agent status write failed");
+    const document = JSON.parse(JSON.stringify(fx.store.db)) as typeof fx.store.db;
+    const v15 = {
+      ...document,
+      schemaVersion: 15,
+      agentRegistry: undefined,
+      agentRegistryEvents: undefined,
+    };
+    const migrated = migrateState(v15 as unknown as Parameters<typeof migrateState>[0]);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    // The new tables exist and start empty; nothing before them is rewritten.
+    expect(migrated.agentRegistry).toEqual([]);
+    expect(migrated.agentRegistryEvents).toEqual([]);
+    expect(migrated.costEvents).toEqual(document.costEvents);
+    expect(migrated.accounts).toEqual(document.accounts);
+    expect(migrated.users).toEqual(document.users);
+  });
+});

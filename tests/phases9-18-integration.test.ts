@@ -11,8 +11,9 @@ import { SandboxEmailProvider } from "@dealora/outbound";
 import { SandboxCalendarProvider } from "@dealora/meeting";
 
 /**
- * Phases 9–17 integration — one document, one decision, one effect, one response,
- * one booking, one recommendation, one graph, one cost.
+ * Phases 9–18 integration — one document, one decision, one effect, one response,
+ * one booking, one recommendation, one graph, one cost, one dashboard, one
+ * agent registry.
  *
  * Phase 12 added the ability to *read* what came back, Phase 13 the ability to
  * *book* what was read, Phase 14 the ability to *advise* what happens next,
@@ -54,6 +55,10 @@ import { SandboxCalendarProvider } from "@dealora/meeting";
  *     tenant — qualified prospects, positive conversations, meetings and
  *     opportunities derived from the rows above, the unrecorded financial
  *     outcomes still refused, and reading it writes nothing (Phase 17).
+ * 14. The whole journey reads back as one agent registry per tenant: the twelve
+ *     declared agents, the lifecycle decisions this workspace has made about
+ *     them, and — the point of the phase — nothing executed, nothing sent and
+ *     no production promotion available until Phase 19 measures (Phase 18).
  *
  * The research provider is a **declared test double**, the email provider is the
  * **sandbox**, and the calendar is a **sandbox** too: nothing here retrieves,
@@ -475,6 +480,8 @@ function rowCounts(): {
   claims: number;
   evidence: number;
   costs: number;
+  registry: number;
+  registryEvents: number;
 } {
   const db = defaultStore.db;
   return {
@@ -484,6 +491,8 @@ function rowCounts(): {
     claims: db.accountClaims?.length ?? 0,
     evidence: db.evidence?.length ?? 0,
     costs: db.costEvents?.length ?? 0,
+    registry: db.agentRegistry?.length ?? 0,
+    registryEvents: db.agentRegistryEvents?.length ?? 0,
   };
 }
 
@@ -518,7 +527,7 @@ afterAll(() => {
   defaultStore.destroy();
 });
 
-describe("phases 9-17 integration — document, decision, effect, response, booking, next step, graph, cost, dashboard", () => {
+describe("phases 9-18 integration — document, decision, effect, response, booking, next step, graph, cost, dashboard, agents", () => {
   it("carries one evidence-backed document through one decision to one delivery and one response", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({
@@ -1671,6 +1680,230 @@ describe("phases 9-17 integration — document, decision, effect, response, book
     const stored = defaultStore.db.conversationClassifications ?? [];
     const matching = stored.filter((row) => row.workspaceId === workspaceId);
     expect(matching).toHaveLength(1);
+  });
+});
+
+interface IntegrationAgent {
+  declaration: {
+    agentId: string;
+    version: string;
+    owner: string;
+    purpose: string;
+    tools: string[];
+    permissions: string[];
+    memoryAccess: string[];
+    approvalRequired: boolean;
+    costLimits: { maxSpendMinor: number; maxPerExecutionMinor: number; currency: string };
+    evaluationMetrics: string[];
+    model: { provider: string | null; model: string | null; temperature: number | null };
+    initialState: string;
+  };
+  status: string;
+  usable: boolean;
+  updatedBy: string | null;
+  updatedAt: string | null;
+}
+
+interface IntegrationRegistry {
+  ruleVersion: string;
+  agents: IntegrationAgent[];
+}
+
+interface IntegrationAgentEvents {
+  events: {
+    id: string;
+    workspaceId: string;
+    agentId: string;
+    actorUserId: string;
+    kind: string;
+    fromStatus: string | null;
+    toStatus: string;
+    createdAt: string;
+  }[];
+}
+
+interface IntegrationAgentPolicy {
+  agents: { agentId: string; owner: string }[];
+  states: string[];
+  usableStates: string[];
+  promotionRule: string;
+  tools: { tool: string; executedBy: string; approvalImplied: boolean }[];
+  evaluationMetrics: { metric: string; owningPhase: string }[];
+  neverDoes: string[];
+}
+
+describe("phases 9-18 integration — the agent registry over a real journey", () => {
+  it("declares the twelve agents and their lifecycle over the state the journey produced, without touching it", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+      calendarProviders: [new SandboxCalendarProvider()],
+    });
+    const { token, workspaceId } = tenant("Eighteen Registry");
+    const recipient = unique("p18registry") + "@northwind.example";
+
+    // The whole Phases 9–13 loop first: a document, a decision, a send, a
+    // response. The registry reads state that genuinely exists, not a fixture
+    // invented for it.
+    const walked = await journey(handlers, token, workspaceId, recipient);
+
+    const before = rowCounts();
+
+    const registry = (await dataOf(
+      handlers.getAgentRegistryHandler(request(token, { workspaceId })),
+    )) as IntegrationRegistry;
+    expect(registry.agents).toHaveLength(12);
+    expect(registry.agents.map((entry) => entry.declaration.agentId)).toEqual([
+      "strategy",
+      "market_intelligence",
+      "account_research",
+      "prospect_discovery",
+      "qualification",
+      "personalization",
+      "conversation",
+      "follow_up",
+      "meeting",
+      "crm",
+      "analytics",
+      "optimization",
+    ]);
+    // Untouched by the journey: nothing in Phases 9–17 registered an agent, and
+    // every agent therefore reads as its declaration default.
+    expect(registry.agents.every((entry) => entry.status === "draft")).toBe(true);
+    expect(registry.agents.every((entry) => entry.updatedBy === null)).toBe(true);
+
+    // The agents that name this journey's own phases declare the tools those
+    // phases already own — the registry references them rather than
+    // reimplementing or bypassing them.
+    const byId = new Map(registry.agents.map((entry) => [entry.declaration.agentId, entry]));
+    expect(byId.get("personalization")?.declaration.owner).toMatch(/^Phase 9/);
+    expect(byId.get("personalization")?.declaration.tools).toContain("render_draft");
+    expect(byId.get("conversation")?.declaration.owner).toMatch(/^Phase 12/);
+    expect(byId.get("conversation")?.declaration.tools).toContain("classify_reply");
+    expect(byId.get("follow_up")?.declaration.tools).toContain("request_approval");
+    expect(byId.get("meeting")?.declaration.tools).toContain("book_meeting");
+    // Phase 19 will measure what these agents declare; Phase 18 measures none.
+    expect(byId.get("conversation")?.declaration.evaluationMetrics).toContain(
+      "response_classification_accuracy",
+    );
+    expect(byId.get("conversation")?.declaration.model).toEqual({
+      provider: null,
+      model: null,
+      temperature: null,
+    });
+
+    // Reading the registry wrote nothing: the journey's drafts, approvals,
+    // sends, claims, evidence and costs are exactly as it left them.
+    expect(rowCounts()).toEqual(before);
+    expect(walked.sentActionId).toBeTruthy();
+  });
+
+  it("records lifecycle decisions for the phases this journey used, and refuses promotion", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+    });
+    const { token, workspaceId } = tenant("Eighteen Lifecycle");
+    const recipient = unique("p18lifecycle") + "@northwind.example";
+    await journey(handlers, token, workspaceId, recipient);
+
+    // The registry is where a workspace records what it has decided about the
+    // agents that own its loop.
+    for (const agentId of ["personalization", "conversation"]) {
+      for (const status of ["testing", "approved"]) {
+        await dataOf(
+          handlers.changeAgentStatusHandler(request(token, { workspaceId, agentId }, { status })),
+        );
+      }
+    }
+
+    const events = (await dataOf(
+      handlers.listAgentEventsHandler(request(token, { workspaceId })),
+    )) as IntegrationAgentEvents;
+    expect(events.events).toHaveLength(4);
+    expect(events.events.every((event) => event.workspaceId === workspaceId)).toBe(true);
+    // Decisions newest first by timestamp, ties in the order they were made,
+    // and the trail records decisions only — never a run.
+    for (let i = 1; i < events.events.length; i += 1) {
+      expect(
+        (events.events[i - 1]?.createdAt ?? "") >= (events.events[i]?.createdAt ?? ""),
+        "the trail is not ordered newest first",
+      ).toBe(true);
+    }
+    expect(events.events.filter((event) => event.kind === "registered")).toHaveLength(2);
+    expect(
+      events.events
+        .filter((event) => event.kind === "state_changed")
+        .map((event) => `${event.agentId}:${event.fromStatus}->${event.toStatus}`)
+        .sort(),
+    ).toEqual(["conversation:testing->approved", "personalization:testing->approved"]);
+    expect(JSON.stringify(events.events).toLowerCase()).not.toContain("trace");
+
+    // The road ends where ROADMAP.md §26 says it ends: Phase 18 declares the
+    // metrics, Phase 19 measures them, and no agent reaches production here.
+    const before = rowCounts();
+    const refused = await errorOf(
+      handlers.changeAgentStatusHandler(
+        request(token, { workspaceId, agentId: "conversation" }, { status: "production" }),
+      ),
+    );
+    expect(refused.code).toBe("VALIDATION_ERROR");
+    expect(refused.message).toContain("evaluation evidence");
+    expect(refused.details?.[0]?.message).toContain("Phase 19");
+    expect(rowCounts()).toEqual(before);
+
+    // And nothing became usable, so the loop's send and booking paths are
+    // exactly as strict as they were before any agent existed.
+    const registry = (await dataOf(
+      handlers.getAgentRegistryHandler(request(token, { workspaceId })),
+    )) as IntegrationRegistry;
+    expect(registry.agents.every((entry) => entry.usable === false)).toBe(true);
+  });
+
+  it("keeps the registry per tenant and names each tool's owning phase", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+    });
+    const mine = tenant("Eighteen Mine");
+    const theirs = tenant("Eighteen Theirs");
+
+    await dataOf(
+      handlers.changeAgentStatusHandler(
+        request(
+          mine.token,
+          { workspaceId: mine.workspaceId, agentId: "crm" },
+          { status: "testing" },
+        ),
+      ),
+    );
+
+    const crossing = await errorOf(
+      handlers.getAgentRegistryHandler(request(mine.token, { workspaceId: theirs.workspaceId })),
+    );
+    expect(crossing.code).toBe("UNAUTHORIZED");
+
+    const theirRegistry = (await dataOf(
+      handlers.getAgentRegistryHandler(request(theirs.token, { workspaceId: theirs.workspaceId })),
+    )) as IntegrationRegistry;
+    expect(theirRegistry.agents.every((entry) => entry.status === "draft")).toBe(true);
+
+    // Every tool names an existing phase, so the registry cannot become a
+    // second source of truth about what a capability is.
+    const policy = (await dataOf(
+      handlers.getAgentPolicyHandler(request(mine.token, { workspaceId: mine.workspaceId })),
+    )) as IntegrationAgentPolicy;
+    for (const tool of policy.tools) {
+      expect(tool.executedBy, tool.tool).toMatch(/^Phase \d+/);
+    }
+    expect(policy.evaluationMetrics.every((metric) => metric.owningPhase === "Phase 19")).toBe(
+      true,
+    );
+    expect(policy.usableStates).toEqual([]);
+    expect(policy.neverDoes.join(" ")).toContain("Never executes");
   });
 });
 
