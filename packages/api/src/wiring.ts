@@ -49,6 +49,11 @@ import {
   createAccountStateReader,
   createNextActionService,
 } from "@dealora/nextaction";
+import {
+  createRevenueGraphIndexReader,
+  createRevenueGraphReader,
+  createRevenueGraphService,
+} from "@dealora/revenuegraph";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -416,6 +421,19 @@ export function createDefaultHandlers(options?: {
       store as never,
       createAccountStateReader(store as never),
       createAccountIndexReader(store as never),
+    ),
+    /**
+     * The revenue graph boundary: it derives nodes and edges from rows the
+     * other phases already stored and writes nothing back. The reader resolves
+     * each account through storage with the caller's own identity, so a
+     * foreign id reads as missing and the engine never sees another tenant's
+     * records. It is given no sender, no approver, no scheduler and no
+     * provider: the strongest thing it can do is draw a picture.
+     */
+    revenuegraph: createRevenueGraphService(
+      store as never,
+      createRevenueGraphReader(store as never),
+      createRevenueGraphIndexReader(store as never),
     ),
     resolveSession: (token) => {
       try {

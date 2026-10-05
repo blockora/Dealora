@@ -116,6 +116,25 @@ export type {
 } from "@dealora/nextaction";
 
 /**
+ * The Revenue Graph domain's public surface, re-exported so API consumers can
+ * type a graph or trace response without depending on the domain package
+ * directly.
+ */
+export type {
+  OpportunityLifecycle,
+  OpportunityStage,
+  OpportunityTrace,
+  RevenueGraphEdge,
+  RevenueGraphEdgeKind,
+  RevenueGraphError,
+  RevenueGraphNode,
+  RevenueGraphNodeKind,
+  RevenueGraphPolicyView,
+  RevenueGraphStage,
+  WorkspaceGraph,
+} from "@dealora/revenuegraph";
+
+/**
  * The Qualification domain's public surface, re-exported so API consumers can
  * type a qualification response without depending on the domain package
  * directly.

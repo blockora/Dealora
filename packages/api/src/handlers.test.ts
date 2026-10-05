@@ -56,6 +56,11 @@ import {
   createAccountStateReader,
   createNextActionService,
 } from "@dealora/nextaction";
+import {
+  createRevenueGraphIndexReader,
+  createRevenueGraphReader,
+  createRevenueGraphService,
+} from "@dealora/revenuegraph";
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
 import type { RevenueGoal } from "@dealora/db";
@@ -188,6 +193,20 @@ function nextActionService(store: Store) {
     store as never,
     createAccountStateReader(store as never),
     createAccountIndexReader(store as never),
+  );
+}
+
+/**
+ * Wire the Revenue Graph service the way the production wiring does: the same
+ * account reader and account index, so a route test asking for a graph
+ * exercises the real derivation over the real store rather than a stand-in
+ * that could not disagree with it.
+ */
+function revenueGraphService(store: Store) {
+  return createRevenueGraphService(
+    store as never,
+    createRevenueGraphReader(store as never),
+    createRevenueGraphIndexReader(store as never),
   );
 }
 
@@ -340,6 +359,7 @@ function fixture(options?: {
     conversation: conversationService(store),
     meeting: meetingService(store),
     nextaction: nextActionService(store),
+    revenuegraph: revenueGraphService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -823,6 +843,7 @@ describe("API Revenue Goal routes", () => {
       conversation: conversationService(store),
       meeting: meetingService(store),
       nextaction: nextActionService(store),
+      revenuegraph: revenueGraphService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1160,6 +1181,7 @@ describe("API Revenue Plan routes", () => {
       conversation: conversationService(store),
       meeting: meetingService(store),
       nextaction: nextActionService(store),
+      revenuegraph: revenueGraphService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1378,6 +1400,7 @@ describe("API Business Brain routes", () => {
       conversation: conversationService(failingStore),
       meeting: meetingService(failingStore),
       nextaction: nextActionService(failingStore),
+      revenuegraph: revenueGraphService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1721,6 +1744,7 @@ describe("API Account & Contact routes", () => {
       conversation: conversationService(store),
       meeting: meetingService(store),
       nextaction: nextActionService(store),
+      revenuegraph: revenueGraphService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -2031,6 +2055,7 @@ describe("API Research routes", () => {
       conversation: conversationService(store),
       meeting: meetingService(store),
       nextaction: nextActionService(store),
+      revenuegraph: revenueGraphService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -2085,6 +2110,7 @@ describe("API Research routes", () => {
       conversation: conversationService(store),
       meeting: meetingService(store),
       nextaction: nextActionService(store),
+      revenuegraph: revenueGraphService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3227,6 +3253,7 @@ describe("API Qualification routes", () => {
       conversation: conversationService(store),
       meeting: meetingService(store),
       nextaction: nextActionService(store),
+      revenuegraph: revenueGraphService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -3525,6 +3552,11 @@ describe("API Next Best Action routes", () => {
         createAccountStateReader(failingStore as never),
         createAccountIndexReader(failingStore as never),
       ),
+      revenuegraph: createRevenueGraphService(
+        broken as never,
+        createRevenueGraphReader(failingStore as never),
+        createRevenueGraphIndexReader(failingStore as never),
+      ),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -3535,5 +3567,293 @@ describe("API Next Best Action routes", () => {
     // `UNAVAILABLE` is an internal condition and is never surfaced verbatim.
     expect(error.message).toBe("unexpected failure");
     expect(JSON.stringify(error)).not.toContain("disk");
+
+    // The same envelope for the Revenue Graph, whose workspace account index
+    // fails the same way: the internal reason never reaches the wire.
+    const graphError = await errorOf(
+      handlers.getRevenueGraphHandler(request({ token: "t", params: { workspaceId: "w1" } })),
+    );
+    expect(graphError.code).toBe("SERVER_ERROR");
+    expect(graphError.message).toBe("unexpected failure");
+    expect(JSON.stringify(graphError)).not.toContain("could not be read");
+  });
+});
+
+describe("API Revenue Graph routes", () => {
+  /** One account in tenant A, so the routes have something real to read. */
+  function graphFixture(): {
+    handlers: ReturnType<typeof createHandlers>;
+    token: string;
+    workspaceId: string;
+    accountId: string;
+    built: ReturnType<typeof fixture>;
+  } {
+    const built = fixture();
+    const account = built.store.createAccount({
+      workspaceId: built.workspaceA,
+      createdBy: built.userA,
+      account: {
+        name: "Northwind",
+        website: null,
+        domain: "northwind.example",
+        industry: "SaaS",
+        companySize: "50-200",
+        geography: "Germany",
+        description: null,
+        source: "manual",
+        sourceReference: null,
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(account)) throw new Error("fixture account failed");
+    return {
+      handlers: built.handlers,
+      token: built.tokenA,
+      workspaceId: built.workspaceA,
+      accountId: account.value.id,
+      built,
+    };
+  }
+
+  interface GraphNode {
+    id: string;
+    kind: string;
+    occurredAt: string;
+    label: string | null;
+    state: string | null;
+  }
+
+  interface GraphEdge {
+    kind: string;
+    from: string;
+    to: string;
+    occurredAt: string;
+    derivedFrom: { kind: string; id: string }[];
+  }
+
+  interface GraphTrace {
+    ruleVersion: string;
+    accountId: string;
+    accountName: string;
+    nodes: GraphNode[];
+    edges: GraphEdge[];
+    lifecycle: {
+      stages: { stage: string; nodeIds: string[] }[];
+      frontier: string;
+      opportunity: string | null;
+    };
+  }
+
+  interface WorkspaceGraphData {
+    ruleVersion: string;
+    accountCount: number;
+    nodes: GraphNode[];
+    edges: GraphEdge[];
+  }
+
+  it("answers the workspace graph, merged from the accounts the caller holds", async () => {
+    const f = graphFixture();
+    const graph = (await dataOf(
+      f.handlers.getRevenueGraphHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    )) as WorkspaceGraphData;
+    expect(graph.ruleVersion).toBe("revenue-graph-1.0.0");
+    expect(graph.accountCount).toBe(1);
+    expect(graph.nodes.map((node) => node.id)).toContain(f.accountId);
+    // One node per stored row — nothing beside them.
+    expect(graph.nodes).toHaveLength(1);
+    expect(graph.edges).toEqual([]);
+  });
+
+  it("traces one account's lifecycle from stored rows", async () => {
+    const f = graphFixture();
+    const trace = (await dataOf(
+      f.handlers.traceOpportunityHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: { accountId: f.accountId },
+        }),
+      ),
+    )) as GraphTrace;
+    expect(trace.ruleVersion).toBe("revenue-graph-1.0.0");
+    expect(trace.accountId).toBe(f.accountId);
+    expect(trace.accountName).toBe("Northwind");
+    expect(trace.nodes).toHaveLength(1);
+    expect(trace.lifecycle).toEqual({
+      stages: [{ stage: "company", nodeIds: [f.accountId] }],
+      frontier: "company",
+      opportunity: null,
+    });
+  });
+
+  it("never lets a client dictate a node, an edge, an opportunity or a frontier", async () => {
+    const f = graphFixture();
+    const clean = (await dataOf(
+      f.handlers.traceOpportunityHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: { accountId: f.accountId },
+        }),
+      ),
+    )) as GraphTrace;
+    const forged = (await dataOf(
+      f.handlers.traceOpportunityHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: {
+            accountId: f.accountId,
+            nodes: [{ id: "forged-node", kind: "revenue" }],
+            edges: [{ kind: "forged_edge", from: "a", to: "b" }],
+            opportunity: "forged-opportunity",
+            lifecycle: { frontier: "meeting", stages: [] },
+            ruleVersion: "forged-9.9.9",
+          },
+        }),
+      ),
+    )) as GraphTrace;
+    // The answer is byte-for-byte what the rows produce, never what the body said.
+    expect(forged).toEqual(clean);
+    expect(JSON.stringify(forged)).not.toContain("forged");
+    expect(forged.lifecycle.opportunity).toBeNull();
+  });
+
+  it("requires authentication on every Phase 15 route", async () => {
+    const f = graphFixture();
+    const anonymous = { ...request({ params: { workspaceId: f.workspaceId } }) };
+    delete (anonymous.query as Record<string, unknown>).sessionToken;
+    const calls = [
+      f.handlers.getRevenueGraphHandler(anonymous),
+      f.handlers.traceOpportunityHandler({ ...anonymous, body: { accountId: f.accountId } }),
+      f.handlers.getRevenueGraphPolicyHandler(anonymous),
+    ];
+    for (const call of calls) {
+      const error = await errorOf(call);
+      expect(error.code).toBe("UNAUTHENTICATED");
+    }
+  });
+
+  it("requires a workspace id on every workspace-scoped route", async () => {
+    const f = graphFixture();
+    for (const call of [
+      f.handlers.getRevenueGraphHandler(request({ token: f.token })),
+      f.handlers.traceOpportunityHandler(
+        request({ token: f.token, body: { accountId: f.accountId } }),
+      ),
+      f.handlers.getRevenueGraphPolicyHandler(request({ token: f.token })),
+    ]) {
+      const error = await errorOf(call);
+      expect(error.code).toBe("VALIDATION_ERROR");
+    }
+  });
+
+  it("maps domain refusals onto the transport envelope", async () => {
+    const f = graphFixture();
+    const notFound = await errorOf(
+      f.handlers.traceOpportunityHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: { accountId: "acct-does-not-exist" },
+        }),
+      ),
+    );
+    expect(notFound.code).toBe("NOT_FOUND");
+
+    for (const accountId of [undefined, null, "", 42, {}]) {
+      const invalid = await errorOf(
+        f.handlers.traceOpportunityHandler(
+          request({
+            token: f.token,
+            params: { workspaceId: f.workspaceId },
+            body: { accountId },
+          }),
+        ),
+      );
+      expect(invalid.code).toBe("VALIDATION_ERROR");
+    }
+  });
+
+  it("keeps every graph read inside one tenant", async () => {
+    const mine = graphFixture();
+    const theirGraph = (await dataOf(
+      mine.built.handlers.getRevenueGraphHandler(
+        request({ token: mine.built.tokenB, params: { workspaceId: mine.built.workspaceB } }),
+      ),
+    )) as WorkspaceGraphData;
+    // Tenant B's graph never contains tenant A's account.
+    expect(theirGraph.accountCount).toBe(0);
+    expect(theirGraph.nodes).toEqual([]);
+
+    // Naming tenant A's account from tenant B reads as absent, not forbidden.
+    const crossed = await errorOf(
+      mine.built.handlers.traceOpportunityHandler(
+        request({
+          token: mine.built.tokenB,
+          params: { workspaceId: mine.built.workspaceB },
+          body: { accountId: mine.accountId },
+        }),
+      ),
+    );
+    expect(crossed.code).toBe("NOT_FOUND");
+
+    // And calling into a workspace the caller does not hold is refused at the
+    // workspace guard before any account is looked up.
+    const foreignWorkspace = await errorOf(
+      mine.built.handlers.getRevenueGraphHandler(
+        request({ token: mine.built.tokenA, params: { workspaceId: mine.built.workspaceB } }),
+      ),
+    );
+    expect(foreignWorkspace.code).toBe("UNAUTHORIZED");
+  });
+
+  it("publishes the whole vocabulary, including everything it refuses", async () => {
+    const f = graphFixture();
+    const policy = (await dataOf(
+      f.handlers.getRevenueGraphPolicyHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    )) as {
+      ruleVersion: string;
+      nodeKinds: string[];
+      edgeKinds: string[];
+      stages: string[];
+      refused: { name: string; reason: string; owningPhase: string | null }[];
+      neverDoes: string[];
+    };
+    expect(policy.ruleVersion).toBe("revenue-graph-1.0.0");
+    expect(policy.nodeKinds).toHaveLength(7);
+    expect(policy.edgeKinds).toHaveLength(12);
+    expect(policy.stages).toHaveLength(7);
+    // The seven published kinds plus the five refusals partition ROADMAP.md's
+    // twelve core relationship names, so no later-phase vocabulary leaks in.
+    const refusedNames = policy.refused.map((entry) => entry.name).sort();
+    expect(refusedNames).toEqual(["agent", "campaign", "customer", "revenue", "workflow"]);
+    expect([...policy.nodeKinds, ...refusedNames].sort()).toEqual(
+      [
+        "agent",
+        "campaign",
+        "company",
+        "conversation",
+        "customer",
+        "evidence",
+        "meeting",
+        "opportunity",
+        "person",
+        "revenue",
+        "signal",
+        "workflow",
+      ].sort(),
+    );
+    for (const entry of policy.refused) {
+      expect(entry.reason.length).toBeGreaterThan(0);
+    }
+    expect(policy.refused.find((entry) => entry.name === "campaign")?.owningPhase).toBeNull();
+    expect(policy.neverDoes.join(" ")).toContain("never write");
+    expect(policy.neverDoes.join(" ")).toContain("never act");
   });
 });

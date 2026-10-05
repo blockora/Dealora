@@ -27,7 +27,8 @@
     "@dealora/personalization": "workspace:*",
     "@dealora/plan": "workspace:*",
     "@dealora/qualification": "workspace:*",
-    "@dealora/research": "workspace:*"
+    "@dealora/research": "workspace:*",
+    "@dealora/revenuegraph": "workspace:*"
   },
   "devDependencies": {}
 }

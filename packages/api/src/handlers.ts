@@ -28,6 +28,7 @@ import type { OutboundError, OutboundService } from "@dealora/outbound";
 import type { ConversationError, ConversationService } from "@dealora/conversation";
 import type { MeetingError, MeetingService } from "@dealora/meeting";
 import type { NextActionError, NextActionService } from "@dealora/nextaction";
+import type { RevenueGraphError, RevenueGraphService } from "@dealora/revenuegraph";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -435,6 +436,34 @@ function fromNextActionError(error: NextActionError): ApiError {
   return mapped;
 }
 
+/**
+ * Translate a domain `RevenueGraphError` into the safe API error envelope.
+ *
+ * Exhaustive with no cast, like every other mapper here: TypeScript accepts
+ * this function only while every member of the domain's error union has a
+ * case, so a new domain code cannot reach the wire as something the transport
+ * contract does not define. `UNAVAILABLE` is internal (a store row disagreeing
+ * with its own vocabulary) and is never surfaced verbatim.
+ */
+function fromRevenueGraphError(error: RevenueGraphError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+        return "VALIDATION_ERROR";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = [...error.details];
+  return mapped;
+}
+
 export interface HandlerDeps {
   identity: IdentityService;
   brain: BusinessBrainService;
@@ -452,6 +481,7 @@ export interface HandlerDeps {
   conversation: ConversationService;
   meeting: MeetingService;
   nextaction: NextActionService;
+  revenuegraph: RevenueGraphService;
   resolveSession: SessionResolver;
 }
 
@@ -2695,6 +2725,75 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok(result.value) };
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 15 — Revenue Graph
+  //
+  // These handlers answer ROADMAP.md §22's one question — how does this
+  // workspace's revenue loop actually connect? — for a whole workspace, for a
+  // single account's opportunity lifecycle, and for the rule set that decides
+  // what the graph may say.
+  //
+  // **All three are reads.** There is no route here that creates a node, adds
+  // an edge, records an opportunity or extends a lifecycle: every relationship
+  // is derived server-side from stored linkage, and this phase has no write
+  // path at all. Nothing is recommended either — Phase 14 owns advice — and
+  // nothing is acted on.
+  //
+  // The only field a caller ever sends is an account id. Nodes, edges,
+  // provenance, opportunity and lifecycle are never read from the request, so
+  // a body that carries them is ignored rather than trusted.
+  // -------------------------------------------------------------------------
+
+  /**
+   * The whole workspace's graph: every account's nodes and edges, merged,
+   * deduplicated and ordered by the revenue loop. A workspace above the
+   * published account cap is **refused** rather than silently truncated.
+   */
+  const getRevenueGraphHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.revenuegraph.workspaceGraph(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromRevenueGraphError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * Trace the lifecycle of one account's opportunity: the account's graph
+   * plus its ordered stages, frontier and opportunity node, all derived live
+   * from current rows. The caller sends an account id and nothing else.
+   */
+  const traceOpportunityHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.revenuegraph.traceOpportunity(workspaceId, actor.userId, {
+        accountId: body.accountId,
+      });
+      if (!result.ok) return { ok: false, error: fromRevenueGraphError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /**
+   * The vocabulary this deployment enforces — every node kind, every edge
+   * kind with its stored-field derivation, the stage order — plus everything
+   * the graph refuses with the phase that owns it. Readable before a workspace
+   * has a single account.
+   */
+  const getRevenueGraphPolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.revenuegraph.policy(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromRevenueGraphError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -2825,6 +2924,13 @@ export function createHandlers(deps: HandlerDeps) {
     listNextActionsHandler,
     getNextActionHandler,
     getNextActionPolicyHandler,
+
+    // -------------------------------------------------------------------------
+    // Phase 15 — Revenue Graph
+    // -------------------------------------------------------------------------
+    getRevenueGraphHandler,
+    traceOpportunityHandler,
+    getRevenueGraphPolicyHandler,
   };
 }
 
