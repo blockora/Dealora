@@ -11,13 +11,14 @@ import { SandboxEmailProvider } from "@dealora/outbound";
 import { SandboxCalendarProvider } from "@dealora/meeting";
 
 /**
- * Phases 9–16 integration — one document, one decision, one effect, one response,
+ * Phases 9–17 integration — one document, one decision, one effect, one response,
  * one booking, one recommendation, one graph, one cost.
  *
  * Phase 12 added the ability to *read* what came back, Phase 13 the ability to
  * *book* what was read, Phase 14 the ability to *advise* what happens next,
- * Phase 15 the ability to *trace* everything that happened as one graph, and
- * Phase 16 the ability to *price* everything that happened — without any of
+ * Phase 15 the ability to *trace* everything that happened as one graph, Phase 16
+ * the ability to *price* everything that happened, and Phase 17 the ability to
+ * *report* everything that happened as business outcomes — without any of
  * them changing what the phases before them guarantee, and that is exactly what
  * this file proves: the same journey is walked end to end, and then the seams are
  * probed with each newer surface in play.
@@ -49,6 +50,10 @@ import { SandboxCalendarProvider } from "@dealora/meeting";
  *     measured — and the three per-outcome metrics derive from this journey's
  *     own facts, while the metrics needing customers, revenue or campaigns
  *     stay refused with their owning phase (Phase 16).
+ * 13. The whole journey reads back as one dashboard of business outcomes per
+ *     tenant — qualified prospects, positive conversations, meetings and
+ *     opportunities derived from the rows above, the unrecorded financial
+ *     outcomes still refused, and reading it writes nothing (Phase 17).
  *
  * The research provider is a **declared test double**, the email provider is the
  * **sandbox**, and the calendar is a **sandbox** too: nothing here retrieves,
@@ -239,6 +244,29 @@ interface IntegrationCostMetrics {
     averageMinor: number | null;
   }[];
   refused: { name: string; owningPhase: string | null }[];
+}
+
+/** The dashboard Phase 17 derives, as the transport layer returns it. */
+interface IntegrationDashboard {
+  ruleVersion: string;
+  goal: { status: string; goal: { id: string } | null; reason: string | null };
+  directRevenue: { status: string; amountMinor: number | null; owningPhase: string | null };
+  pipelineCreated: { status: string; amountMinor: number | null; owningPhase: string | null };
+  qualifiedProspects: { status: string; value: number | null };
+  positiveConversations: { status: string; value: number | null };
+  meetings: { status: string; total: number; byState: { state: string; count: number }[] };
+  opportunities: { status: string; value: number | null };
+  customers: { status: string; value: number | null; owningPhase: string | null };
+  agentActivity: { key: string; count: number }[];
+  approvalsRequired: { status: string; required: number; approvalIds: string[] };
+  workflowFailures: {
+    status: string;
+    total: number;
+    bySource: { source: string; count: number }[];
+  };
+  hotConversations: { status: string; value: number | null };
+  cost: { ruleVersion: string; totals: { totalMinor: number; eventCount: number } };
+  nextBestActions: { ruleVersion: string; recommendations: unknown[] };
 }
 
 /**
@@ -490,7 +518,7 @@ afterAll(() => {
   defaultStore.destroy();
 });
 
-describe("phases 9-16 integration — document, decision, effect, response, booking, next step, graph, cost", () => {
+describe("phases 9-17 integration — document, decision, effect, response, booking, next step, graph, cost, dashboard", () => {
   it("carries one evidence-backed document through one decision to one delivery and one response", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({
@@ -1456,6 +1484,193 @@ describe("phases 9-16 integration — document, decision, effect, response, book
 
     // And none of these reads wrote a single row of any kind.
     expect(rowCounts()).toEqual(after);
+  });
+
+  it("reports the whole loop as business outcomes on one dashboard, per tenant", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+      calendarProviders: [new SandboxCalendarProvider()],
+    });
+    const { token, workspaceId } = tenant("Seventeen");
+    const other = tenant("Seventeen Other");
+
+    // The same journey the phases before it walked: a real account, real
+    // research, a real qualification, a real message that genuinely went out,
+    // a real positive reply, and a real meeting that genuinely got booked.
+    const sent = await journey(
+      handlers,
+      token,
+      workspaceId,
+      unique("p17ada") + "@northwind.example",
+    );
+    const positive = (await dataOf(
+      handlers.createInboundMessageHandler(
+        request(
+          token,
+          { workspaceId, outboundActionId: sent.sentActionId },
+          { body: "Happy to chat. When works for a call next week?" },
+        ),
+      ),
+    )) as { classification: { id: string; intent: string } };
+    expect(positive.classification.intent).toBe("positive_intent");
+    const proposed = (await dataOf(
+      handlers.recommendMeetingHandler(
+        request(
+          token,
+          { workspaceId },
+          {
+            classificationId: positive.classification.id,
+            title: "Intro call",
+            startsAt: "2026-11-02T10:00:00.000Z",
+            endsAt: "2026-11-02T10:30:00.000Z",
+            timezone: "Europe/Berlin",
+            durationMinutes: 30,
+          },
+        ),
+      ),
+    )) as { meeting: { id: string; state: string } };
+    await dataOf(
+      handlers.decideMeetingHandler(
+        request(token, { workspaceId, id: proposed.meeting.id }, { decision: "approve" }),
+      ),
+    );
+    const booked = (await dataOf(
+      handlers.bookMeetingHandler(request(token, { workspaceId, id: proposed.meeting.id })),
+    )) as { meeting: { id: string; state: string } };
+    expect(booked.meeting.state).toBe("booked");
+
+    const before = rowCounts();
+    const dashboardOf = async (t: string, w: string): Promise<IntegrationDashboard> =>
+      (await dataOf(
+        handlers.getDashboardHandler(request(t, { workspaceId: w })),
+      )) as IntegrationDashboard;
+    const snapshot = await dashboardOf(token, workspaceId);
+
+    // Reading the dashboard wrote nothing at all.
+    expect(rowCounts()).toEqual(before);
+
+    // **What is working?** One account qualified, one positive conversation, one
+    // booked meeting, and — because the qualified account's loop actually
+    // reached a calendar — one opportunity. These are outcomes read out of the
+    // rows every earlier phase wrote, not numbers anyone supplied.
+    expect(snapshot.qualifiedProspects.value).toBe(1);
+    expect(snapshot.positiveConversations.value).toBe(1);
+    expect(snapshot.meetings.total).toBe(1);
+    expect(snapshot.meetings.byState.find((entry) => entry.state === "booked")?.count).toBe(1);
+    expect(snapshot.opportunities.value).toBe(1);
+
+    // **What needs attention?** The journey owes no decision and has failed
+    // nothing; the approval was decided and the send genuinely went out.
+    expect(snapshot.workflowFailures.total).toBe(0);
+    expect(snapshot.workflowFailures.bySource).toEqual([
+      { source: "research_run", count: 0 },
+      { source: "outbound_send", count: 0 },
+      { source: "meeting_booking", count: 0 },
+    ]);
+
+    // **Agent Activity is the work, not the outcome** — and it disagrees with
+    // the outcome tiles exactly where it should. The meeting exists, so
+    // activity counts one meeting, but no draft-rendered counter is invented
+    // for phases that stored nothing here beyond the one the journey made.
+    const activity = new Map(snapshot.agentActivity.map((entry) => [entry.key, entry.count]));
+    expect(activity.get("accounts_researched")).toBe(1);
+    expect(activity.get("prospects_qualified")).toBe(1);
+    expect(activity.get("replies_classified")).toBe(1);
+
+    // **Where are we?** A journey with no revenue goal still gets no invented
+    // target: the tile refuses and says why.
+    expect(snapshot.goal.status).toBe("no_data");
+    expect(snapshot.goal.goal).toBeNull();
+
+    // The three financial outcomes no phase through 17 records stay refused,
+    // with the phase that owns them, no matter how far the loop got.
+    for (const tile of [snapshot.directRevenue, snapshot.pipelineCreated]) {
+      expect(tile.status).toBe("no_data");
+      expect(tile.amountMinor).toBeNull();
+      expect(tile.owningPhase).toBe("Phase 23");
+    }
+    expect(snapshot.customers.status).toBe("no_data");
+    expect(snapshot.customers.value).toBeNull();
+
+    // **What should happen next?** Phase 14's board, embedded whole, so this
+    // phase can never advise differently from the engine that owns advice.
+    const board = (await dataOf(
+      handlers.recommendWorkspaceActionsHandler(request(token, { workspaceId })),
+    )) as { ruleVersion: string; recommendations: unknown[] };
+    expect(snapshot.nextBestActions.ruleVersion).toBe(board.ruleVersion);
+    expect(snapshot.nextBestActions.recommendations).toEqual(board.recommendations);
+
+    // Deriving twice answers identically: no stored aggregate, no clock.
+    expect(await dashboardOf(token, workspaceId)).toEqual(snapshot);
+
+    // **Per tenant.** Another workspace's dashboard is its own, and reading the
+    // first workspace with the second tenant's token is refused outright.
+    const theirs = await dashboardOf(other.token, other.workspaceId);
+    expect(theirs.qualifiedProspects.value).toBe(0);
+    expect(theirs.meetings.total).toBe(0);
+    expect(theirs.opportunities.value).toBe(0);
+    expect(theirs.nextBestActions.recommendations).toEqual([]);
+    const crossTenant = await errorOf(
+      handlers.getDashboardHandler(request(other.token, { workspaceId })),
+    );
+    expect(crossTenant.code).toBe("UNAUTHORIZED");
+  });
+
+  it("adds nothing of its own to storage: the dashboard is derived on read", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+      calendarProviders: [new SandboxCalendarProvider()],
+    });
+    const { token, workspaceId } = tenant("Seventeen Read Only");
+
+    const before = rowCounts();
+    // A full journey, so every tile has something real to derive from.
+    const sent = await journey(
+      handlers,
+      token,
+      workspaceId,
+      unique("p17ro") + "@northwind.example",
+    );
+    const positive = (await dataOf(
+      handlers.createInboundMessageHandler(
+        request(
+          token,
+          { workspaceId, outboundActionId: sent.sentActionId },
+          { body: "Sounds good, send it over." },
+        ),
+      ),
+    )) as { classification: { id: string } };
+
+    const afterJourney = rowCounts();
+    expect(afterJourney.drafts).toBe(before.drafts + 1);
+    expect(afterJourney.approvals).toBe(before.approvals + 1);
+    expect(afterJourney.actions).toBe(before.actions + 1);
+    // The journey's findings become one claim each, so only the direction is
+    // fixed here; the exact count belongs to Phase 7's own gate.
+    expect(afterJourney.claims).toBeGreaterThan(before.claims);
+    expect(afterJourney.evidence).toBeGreaterThan(before.evidence);
+
+    // Reading both dashboard routes, twice each, in any order, writes nothing:
+    // not a draft, not an approval, not an outbound action, not a cost event,
+    // and not an evidence or claim record.
+    await dataOf(handlers.getDashboardHandler(request(token, { workspaceId })));
+    await dataOf(handlers.getDashboardPolicyHandler(request(token, { workspaceId })));
+    await dataOf(handlers.getDashboardHandler(request(token, { workspaceId })));
+    await dataOf(handlers.getDashboardPolicyHandler(request(token, { workspaceId })));
+
+    expect(rowCounts()).toEqual(afterJourney);
+
+    // The response was classified, which is a Phase 12 fact the dashboard
+    // reads — it did not create the classification, and reading it again did
+    // not create another one.
+    expect(positive.classification.id).toEqual(expect.any(String));
+    const stored = defaultStore.db.conversationClassifications ?? [];
+    const matching = stored.filter((row) => row.workspaceId === workspaceId);
+    expect(matching).toHaveLength(1);
   });
 });
 

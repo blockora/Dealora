@@ -62,6 +62,7 @@ import {
   createRevenueGraphService,
 } from "@dealora/revenuegraph";
 import { createCostService } from "@dealora/cost";
+import { createDashboardService } from "@dealora/dashboard";
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
 import type { RevenueGoal } from "@dealora/db";
@@ -222,6 +223,36 @@ function costService(store: Store) {
 }
 
 /**
+ * Wire the Revenue Dashboard the way the production wiring does: the real
+ * store behind the workspace-scoped row lookup, and the **real** Phase 16 cost
+ * service and Phase 14 recommendation service behind the two cross-phase
+ * readers. A route test therefore derives its dashboard from the same rows the
+ * earlier phases actually wrote, and cannot pass against a stand-in that could
+ * not disagree with the engine.
+ */
+function dashboardService(store: Store) {
+  return createDashboardService(
+    {
+      authorize: store.authorize.bind(store),
+      listRevenueGoals: store.listRevenueGoals.bind(store),
+      listQualifications: store.listQualifications.bind(store),
+      listConversationClassifications: store.listConversationClassifications.bind(store),
+      listMeetings: store.listMeetings.bind(store),
+      listMeetingEvents: store.listMeetingEvents.bind(store),
+      listResearchRequests: store.listResearchRequests.bind(store),
+      listDrafts: store.listDrafts.bind(store),
+      listApprovalRequests: store.listApprovalRequests.bind(store),
+      listOutboundActions: store.listOutboundActions.bind(store),
+    },
+    {
+      costMetrics: (workspaceId, userId) => costService(store).metrics(workspaceId, userId),
+      nextActionBoard: (workspaceId, userId) =>
+        nextActionService(store).recommendForWorkspace(workspaceId, userId),
+    },
+  );
+}
+
+/**
  * Wire the Personalization service the way the production wiring does.
  *
  * The readers are the same narrow ones `createDefaultHandlers` builds: the
@@ -372,6 +403,7 @@ function fixture(options?: {
     nextaction: nextActionService(store),
     revenuegraph: revenueGraphService(store),
     cost: costService(store),
+    dashboard: dashboardService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -857,6 +889,7 @@ describe("API Revenue Goal routes", () => {
       nextaction: nextActionService(store),
       revenuegraph: revenueGraphService(store),
       cost: costService(store),
+      dashboard: dashboardService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1196,6 +1229,7 @@ describe("API Revenue Plan routes", () => {
       nextaction: nextActionService(store),
       revenuegraph: revenueGraphService(store),
       cost: costService(store),
+      dashboard: dashboardService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1416,6 +1450,7 @@ describe("API Business Brain routes", () => {
       nextaction: nextActionService(failingStore),
       revenuegraph: revenueGraphService(failingStore),
       cost: costService(failingStore),
+      dashboard: dashboardService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1761,6 +1796,7 @@ describe("API Account & Contact routes", () => {
       nextaction: nextActionService(store),
       revenuegraph: revenueGraphService(store),
       cost: costService(store),
+      dashboard: dashboardService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -2073,6 +2109,7 @@ describe("API Research routes", () => {
       nextaction: nextActionService(store),
       revenuegraph: revenueGraphService(store),
       cost: costService(store),
+      dashboard: dashboardService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -2129,6 +2166,7 @@ describe("API Research routes", () => {
       nextaction: nextActionService(store),
       revenuegraph: revenueGraphService(store),
       cost: costService(store),
+      dashboard: dashboardService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3273,6 +3311,7 @@ describe("API Qualification routes", () => {
       nextaction: nextActionService(store),
       revenuegraph: revenueGraphService(store),
       cost: costService(store),
+      dashboard: dashboardService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -3577,6 +3616,7 @@ describe("API Next Best Action routes", () => {
         createRevenueGraphIndexReader(failingStore as never),
       ),
       cost: costService(failingStore),
+      dashboard: dashboardService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -4348,5 +4388,436 @@ describe("API Cost routes", () => {
       ),
     );
     expect(badFilter.code).toBe("VALIDATION_ERROR");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 17 — Revenue Dashboard
+// ---------------------------------------------------------------------------
+
+describe("API Dashboard routes", () => {
+  interface DashboardGoalTileData {
+    status: string;
+    goal: { id: string; targetMetric: string; targetValue: number } | null;
+    reason: string | null;
+  }
+  interface DashboardCountTileData {
+    status: string;
+    value: number | null;
+    reason: string | null;
+    owningPhase: string | null;
+    derivation: string;
+  }
+  interface DashboardMoneyTileData {
+    status: string;
+    amountMinor: number | null;
+    currency: string | null;
+    owningPhase: string | null;
+  }
+  interface DashboardMeetingsData {
+    total: number;
+    byState: { state: string; count: number }[];
+  }
+  interface DashboardApprovalsData {
+    required: number;
+    approvalIds: string[];
+  }
+  interface DashboardFailuresData {
+    total: number;
+    bySource: { source: string; count: number }[];
+  }
+  interface DashboardData {
+    ruleVersion: string;
+    goal: DashboardGoalTileData;
+    directRevenue: DashboardMoneyTileData;
+    pipelineCreated: DashboardMoneyTileData;
+    qualifiedProspects: DashboardCountTileData;
+    positiveConversations: DashboardCountTileData;
+    meetings: DashboardMeetingsData;
+    opportunities: DashboardCountTileData;
+    customers: DashboardCountTileData;
+    agentActivity: { key: string; count: number }[];
+    approvalsRequired: DashboardApprovalsData;
+    workflowFailures: DashboardFailuresData;
+    hotConversations: DashboardCountTileData;
+    cost: { ruleVersion: string };
+    nextBestActions: { ruleVersion: string; recommendations: unknown[] };
+  }
+  interface DashboardPolicyData {
+    ruleVersion: string;
+    items: { key: string; label: string; availability: string; derivation: string }[];
+    refusals: { name: string; reason: string; owningPhase: string | null }[];
+    questions: { question: string; answeredBy: string[] }[];
+    neverDoes: string[];
+  }
+
+  /**
+   * A workspace with real rows behind the dashboard: a stored account, a
+   * research run the real research service completed, a `qualified`
+   * qualification, a rendered draft, a pending approval and a failed outbound
+   * action. Every row is written by the same store method the corresponding
+   * phase calls in production, so the snapshot these tests read is derived from
+   * genuine state rather than a hand-built answer.
+   */
+  function dashboardFixture(): {
+    built: ReturnType<typeof fixture>;
+    token: string;
+    workspaceId: string;
+    accountId: string;
+    approvalId: string;
+  } {
+    const built = fixture();
+    const account = built.store.createAccount({
+      workspaceId: built.workspaceA,
+      createdBy: built.userA,
+      account: {
+        name: "Northwind",
+        website: null,
+        domain: "northwind.example",
+        industry: "SaaS",
+        companySize: "50-200",
+        geography: "Germany",
+        description: null,
+        source: "manual",
+        sourceReference: null,
+        revenuePlanId: null,
+        status: "active",
+      },
+    });
+    if (!isOk(account)) throw new Error("fixture account failed");
+
+    const research = built.store.createResearchRequest({
+      workspaceId: built.workspaceA,
+      requestedBy: built.userA,
+      accountId: account.value.id,
+      provider: "account_record",
+      categories: ["company_overview"],
+    });
+    if (!isOk(research)) throw new Error("fixture research request failed");
+    const completed = built.store.updateResearchRequest(research.value.id, {
+      userId: built.userA,
+      status: "completed",
+      completedAt: "2026-06-02T00:00:00.000Z",
+      findingCount: 2,
+    });
+    if (!isOk(completed)) throw new Error("fixture research completion failed");
+
+    const qualification = built.store.createQualification({
+      workspaceId: built.workspaceA,
+      createdBy: built.userA,
+      accountId: account.value.id,
+      qualification: {
+        ruleVersion: "qualification-1.0.0",
+        revenuePlanId: null,
+        revenueGoalId: null,
+        icpId: null,
+        contextDigest: "digest-1",
+        state: "qualified",
+        score: 80,
+        confidence: "high",
+        reason: "every criterion was met by the recorded evidence",
+        evidenceIds: [],
+        claimIds: [],
+        conflictedClaimIds: [],
+        dimensions: [],
+        evaluatedAt: "2026-06-02T00:00:00.000Z",
+      },
+    });
+    if (!isOk(qualification)) throw new Error("fixture qualification failed");
+
+    const draft = built.store.createDraft({
+      workspaceId: built.workspaceA,
+      createdBy: built.userA,
+      accountId: account.value.id,
+      draft: {
+        contactId: null,
+        rendererVersion: "personalization-1.0.0",
+        contextDigest: "digest-1",
+        qualificationId: qualification.value.id,
+        offerId: null,
+        subject: "A short note for Northwind",
+        body: "A short note.",
+        personalizationPoints: [],
+        approvedClaimIds: [],
+        warnings: [],
+      },
+    });
+    if (!isOk(draft)) throw new Error("fixture draft failed");
+
+    const approval = built.store.createApprovalRequest({
+      workspaceId: built.workspaceA,
+      createdBy: built.userA,
+      approval: {
+        actionKind: "send_message",
+        riskLevel: "level_2_external_action",
+        draftId: draft.value.id,
+        draftVersion: draft.value.version,
+        previewSubject: draft.value.subject,
+        previewDigest: "digest-draft-1",
+        expiresAt: null,
+      },
+    });
+    if (!isOk(approval)) throw new Error("fixture approval failed");
+
+    return {
+      built,
+      token: built.tokenA,
+      workspaceId: built.workspaceA,
+      accountId: account.value.id,
+      approvalId: approval.value.id,
+    };
+  }
+
+  it("answers the whole dashboard for an authorized member", async () => {
+    const f = dashboardFixture();
+    const data = (await dataOf(
+      f.built.handlers.getDashboardHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    )) as DashboardData;
+
+    expect(data.ruleVersion).toBe("dashboard-1.0.0");
+    // The qualification the fixture stored is the one the tile counts.
+    expect(data.qualifiedProspects).toEqual({
+      status: "derived",
+      value: 1,
+      reason: null,
+      owningPhase: null,
+      derivation: expect.stringContaining("newest qualification"),
+    });
+    expect(data.approvalsRequired.required).toBe(1);
+    expect(data.approvalsRequired.approvalIds).toEqual([f.approvalId]);
+    // The completed research run is an accounts-researched fact.
+    const activity = new Map(data.agentActivity.map((entry) => [entry.key, entry.count]));
+    expect(activity.get("accounts_researched")).toBe(1);
+    expect(activity.get("prospects_qualified")).toBe(1);
+    expect(activity.get("drafts_rendered")).toBe(1);
+    expect(activity.get("replies_classified")).toBe(0);
+    // The two embedded pictures are Phase 16's and Phase 14's own answers.
+    expect(data.cost.ruleVersion).toBe("cost-1.0.0");
+    expect(data.nextBestActions.ruleVersion).toBe("next-action-1.0.0");
+  });
+
+  it("refuses the three tiles no Phase 0-17 row can feed, with the owning phase", async () => {
+    const f = dashboardFixture();
+    const data = (await dataOf(
+      f.built.handlers.getDashboardHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    )) as DashboardData;
+
+    for (const tile of [data.directRevenue, data.pipelineCreated]) {
+      expect(tile.status).toBe("no_data");
+      expect(tile.amountMinor).toBeNull();
+      expect(tile.currency).toBeNull();
+      expect(tile.owningPhase).toBe("Phase 23");
+    }
+    expect(data.customers.status).toBe("no_data");
+    expect(data.customers.value).toBeNull();
+    expect(data.customers.owningPhase).toBe("Phase 23");
+  });
+
+  it("answers an empty workspace honestly rather than with a fabricated outcome", async () => {
+    const f = fixture();
+    const data = (await dataOf(
+      f.handlers.getDashboardHandler(
+        request({ token: f.tokenA, params: { workspaceId: f.workspaceA } }),
+      ),
+    )) as DashboardData;
+
+    // Rows exist for every table, so a zero here is a fact.
+    expect(data.qualifiedProspects.value).toBe(0);
+    expect(data.positiveConversations.value).toBe(0);
+    expect(data.meetings.total).toBe(0);
+    expect(data.opportunities.value).toBe(0);
+    expect(data.approvalsRequired.required).toBe(0);
+    expect(data.workflowFailures.total).toBe(0);
+    expect(data.hotConversations.value).toBe(0);
+    // The goal's premise is false rather than empty, so the tile refuses.
+    expect(data.goal.status).toBe("no_data");
+    expect(data.goal.goal).toBeNull();
+    expect(data.goal.reason).toBe("this workspace has no active revenue goal");
+    expect(data.goal.reason).not.toBeNull();
+  });
+
+  it("rejects a request with no session token", async () => {
+    const f = dashboardFixture();
+    const error = await errorOf(
+      f.built.handlers.getDashboardHandler(request({ params: { workspaceId: f.workspaceId } })),
+    );
+    expect(error.code).toBe("UNAUTHENTICATED");
+  });
+
+  it("rejects an unknown session token", async () => {
+    const f = dashboardFixture();
+    const error = await errorOf(
+      f.built.handlers.getDashboardHandler(
+        request({ token: "forged", params: { workspaceId: f.workspaceId } }),
+      ),
+    );
+    expect(error.code).toBe("UNAUTHENTICATED");
+  });
+
+  it("rejects a request with no workspace id", async () => {
+    const f = dashboardFixture();
+    const error = await errorOf(
+      f.built.handlers.getDashboardHandler(request({ token: f.token, params: {} })),
+    );
+    expect(error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("does not let one tenant read another tenant's dashboard", async () => {
+    const f = dashboardFixture();
+    const error = await errorOf(
+      f.built.handlers.getDashboardHandler(
+        request({ token: f.built.tokenB, params: { workspaceId: f.workspaceId } }),
+      ),
+    );
+    expect(error.code).toBe("UNAUTHORIZED");
+  });
+
+  it("does not let a tenant forge a workspace id that does not exist", async () => {
+    const f = dashboardFixture();
+    const error = await errorOf(
+      f.built.handlers.getDashboardHandler(
+        request({ token: f.token, params: { workspaceId: "ws-does-not-exist" } }),
+      ),
+    );
+    expect(error.code).toBe("NOT_FOUND");
+  });
+
+  it("keeps two tenants' dashboards separate", async () => {
+    const f = dashboardFixture();
+    const mine = (await dataOf(
+      f.built.handlers.getDashboardHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    )) as DashboardData;
+    const theirs = (await dataOf(
+      f.built.handlers.getDashboardHandler(
+        request({ token: f.built.tokenB, params: { workspaceId: f.built.workspaceB } }),
+      ),
+    )) as DashboardData;
+
+    expect(mine.qualifiedProspects.value).toBe(1);
+    expect(theirs.qualifiedProspects.value).toBe(0);
+    expect(theirs.approvalsRequired.required).toBe(0);
+    expect(theirs.approvalsRequired.approvalIds).not.toContain(f.approvalId);
+  });
+
+  it("ignores anything a client tries to assert about the numbers", async () => {
+    const f = dashboardFixture();
+    const withoutBody = (await dataOf(
+      f.built.handlers.getDashboardHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    )) as DashboardData;
+    const withBody = (await dataOf(
+      f.built.handlers.getDashboardHandler(
+        request({
+          token: f.token,
+          params: { workspaceId: f.workspaceId },
+          body: {
+            qualifiedProspects: { value: 9999 },
+            meetings: { total: 9999 },
+            directRevenue: { amountMinor: 1_000_000, currency: "USD" },
+            cost: { totals: { totalMinor: 0 } },
+            userId: f.built.userB,
+            workspaceId: f.built.workspaceB,
+          },
+        }),
+      ),
+    )) as DashboardData;
+
+    // Every tile is recomputed from the workspace's own rows, so a body
+    // asserting a total changes nothing at all.
+    expect(JSON.stringify(withBody)).toBe(JSON.stringify(withoutBody));
+  });
+
+  it("returns a byte-identical dashboard for the same rows on every read", async () => {
+    const f = dashboardFixture();
+    const first = await dataOf(
+      f.built.handlers.getDashboardHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    );
+    const second = await dataOf(
+      f.built.handlers.getDashboardHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    );
+    expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+  });
+
+  it("publishes the dashboard vocabulary and the refusals with their owning phases", async () => {
+    const f = dashboardFixture();
+    const policy = (await dataOf(
+      f.built.handlers.getDashboardPolicyHandler(
+        request({ token: f.token, params: { workspaceId: f.workspaceId } }),
+      ),
+    )) as DashboardPolicyData;
+
+    expect(policy.ruleVersion).toBe("dashboard-1.0.0");
+    expect(policy.items.map((item) => item.key)).toEqual([
+      "revenue_goal",
+      "direct_revenue",
+      "pipeline_created",
+      "qualified_prospects",
+      "positive_conversations",
+      "meetings",
+      "opportunities",
+      "customers",
+      "agent_activity",
+      "approvals_required",
+      "workflow_failures",
+      "cost",
+      "hot_conversations",
+      "next_best_actions",
+    ]);
+    expect(policy.refusals.map((refusal) => refusal.name)).toEqual([
+      "direct_revenue",
+      "pipeline_created",
+      "customers",
+    ]);
+    for (const refusal of policy.refusals) {
+      expect(refusal.owningPhase).toBe("Phase 23");
+      expect(refusal.reason.length).toBeGreaterThan(0);
+    }
+    expect(policy.questions).toHaveLength(4);
+  });
+
+  it("authorizes the policy route exactly like the snapshot route", async () => {
+    const f = dashboardFixture();
+
+    const anonymous = await errorOf(
+      f.built.handlers.getDashboardPolicyHandler(
+        request({ params: { workspaceId: f.workspaceId } }),
+      ),
+    );
+    expect(anonymous.code).toBe("UNAUTHENTICATED");
+
+    const foreign = await errorOf(
+      f.built.handlers.getDashboardPolicyHandler(
+        request({ token: f.built.tokenB, params: { workspaceId: f.workspaceId } }),
+      ),
+    );
+    expect(foreign.code).toBe("UNAUTHORIZED");
+
+    const missing = await errorOf(
+      f.built.handlers.getDashboardPolicyHandler(request({ token: f.token, params: {} })),
+    );
+    expect(missing.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("answers the policy route before a single row exists", async () => {
+    const f = fixture();
+    const policy = (await dataOf(
+      f.handlers.getDashboardPolicyHandler(
+        request({ token: f.tokenA, params: { workspaceId: f.workspaceA } }),
+      ),
+    )) as DashboardPolicyData;
+    expect(policy.items).toHaveLength(14);
+    expect(policy.neverDoes.join(" ")).toContain("never write");
+    expect(policy.neverDoes.join(" ")).toContain("never fabricate");
   });
 });
