@@ -12,18 +12,20 @@ import { SandboxCalendarProvider } from "@dealora/meeting";
 import { declarationFor } from "@dealora/agent";
 
 /**
- * Phases 9–19 integration — one document, one decision, one effect, one response,
+ * Phases 9–20 integration — one document, one decision, one effect, one response,
  * one booking, one recommendation, one graph, one cost, one dashboard, one
- * agent registry, one evaluation.
+ * agent registry, one evaluation, one trace.
  *
  * Phase 12 added the ability to *read* what came back, Phase 13 the ability to
  * *book* what was read, Phase 14 the ability to *advise* what happens next,
  * Phase 15 the ability to *trace* everything that happened as one graph, Phase 16
- * the ability to *price* everything that happened, and Phase 17 the ability to
- * *report* everything that happened as business outcomes — without any of
- * them changing what the phases before them guarantee, and that is exactly what
- * this file proves: the same journey is walked end to end, and then the seams are
- * probed with each newer surface in play.
+ * the ability to *price* everything that happened, Phase 17 the ability to
+ * *report* everything that happened as business outcomes, Phase 18 the agent
+ * registry, Phase 19 the evaluation gate — and Phase 20 the ability to *record*
+ * what an agent's run did, without running anything — none of them changing what
+ * the phases before them guarantee, and that is exactly what this file proves:
+ * the same journey is walked end to end, and then the seams are probed with each
+ * newer surface in play.
  *
  * What is asserted here, in order:
  *
@@ -65,6 +67,13 @@ import { declarationFor } from "@dealora/agent";
  *     derived from them, and `ROADMAP.md` §26's gate refusing a promotion until
  *     every declared metric is met — and granting a governance state and no
  *     capability when it finally is (Phase 19).
+ * 16. The journey's own work is then **traced**: one production agent's run
+ *     exposes `ROADMAP.md` §27's seven stages by *reference* to the rows Phases
+ *     9–19 already wrote, derives its own status from the outcomes recorded
+ *     rather than from anything a caller may send, attributes cost through
+ *     Phase 16's own facts, stays per tenant — and creates no draft, approval,
+ *     action, meeting or judgement of its own, because a trace records what
+ *     happened and does not cause it (Phase 20).
  *
  * The research provider is a **declared test double**, the email provider is the
  * **sandbox**, and the calendar is a **sandbox** too: nothing here retrieves,
@@ -490,6 +499,8 @@ function rowCounts(): {
   registryEvents: number;
   evaluationRuns: number;
   evaluationObservations: number;
+  traceRuns: number;
+  traceEvents: number;
 } {
   const db = defaultStore.db;
   return {
@@ -503,6 +514,8 @@ function rowCounts(): {
     registryEvents: db.agentRegistryEvents?.length ?? 0,
     evaluationRuns: db.agentEvaluationRuns?.length ?? 0,
     evaluationObservations: db.agentEvaluationObservations?.length ?? 0,
+    traceRuns: db.agentTraceRuns?.length ?? 0,
+    traceEvents: db.agentTraceEvents?.length ?? 0,
   };
 }
 
@@ -537,7 +550,7 @@ afterAll(() => {
   defaultStore.destroy();
 });
 
-describe("phases 9-19 integration — document, decision, effect, response, booking, next step, graph, cost, dashboard, agents, evaluation", () => {
+describe("phases 9-20 integration — document, decision, effect, response, booking, next step, graph, cost, dashboard, agents, evaluation, trace", () => {
   it("carries one evidence-backed document through one decision to one delivery and one response", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({
@@ -1742,7 +1755,7 @@ interface IntegrationAgentPolicy {
   neverDoes: string[];
 }
 
-describe("phases 9-19 integration — the agent registry over a real journey", () => {
+describe("phases 9-20 integration — the agent registry over a real journey", () => {
   it("declares the twelve agents and their lifecycle over the state the journey produced, without touching it", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({
@@ -1933,7 +1946,7 @@ class FailingProvider {
   }
 }
 
-describe("phases 9-19 integration — agent evaluation over a real journey", () => {
+describe("phases 9-20 integration — agent evaluation over a real journey", () => {
   /** The evaluation surface, typed the way the routes return it. */
   interface IntegrationMetric {
     metric: string;
@@ -1956,6 +1969,60 @@ describe("phases 9-19 integration — agent evaluation over a real journey", () 
     metrics: IntegrationMetric[];
     status: string;
     gate: { satisfied: boolean; reason: string };
+  }
+
+  interface IntegrationTraceRun {
+    id: string;
+    agentId: string;
+    agentVersion: string;
+    status: string;
+    openedBy: string;
+    openedAt: string;
+    closedBy: string | null;
+    closedAt: string | null;
+    stepCount: number;
+  }
+
+  interface IntegrationTraceStep {
+    id: string;
+    runId: string;
+    sequence: number;
+    stepId: string;
+    attempt: number;
+    stage: string;
+    outcome: string;
+    referenceId: string | null;
+    recordedBy: string;
+  }
+
+  interface IntegrationTrace {
+    ruleVersion: string;
+    id: string;
+    agentId: string;
+    agentVersion: string;
+    status: string;
+    derivedStatus: string;
+    stepCount: number;
+    stages: {
+      stage: string;
+      count: number;
+      succeeded: number;
+      failed: number;
+      unknown: number;
+      retried: number;
+    }[];
+    usage: {
+      slowestStepMs: number | null;
+      slowestStepId: string | null;
+      toolsInvoked: string[];
+      errorCount: number;
+      retryCount: number;
+      approvalsRequested: number;
+      approvalsGranted: number;
+      externalActions: number;
+      externalActionsSucceeded: number;
+    };
+    cost: { currency: string | null; eventCount: number; totalMinor: number } | null;
   }
 
   interface IntegrationEvaluationTrail {
@@ -2227,5 +2294,241 @@ describe("phases 9-19 integration — agent evaluation over a real journey", () 
     expect(afterRounds.run?.runNumber).toBe(2);
     expect(afterRounds.status).toBe("insufficient_evidence");
     expect(afterRounds.gate.satisfied).toBe(false);
+  });
+
+  it("traces the journey's own work without running anything and without crossing tenants", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+    });
+    const { token, workspaceId } = tenant("Twenty Trace");
+    const recipient = unique("p20trace") + "@northwind.example";
+    const trip = await journey(handlers, token, workspaceId, recipient);
+
+    // The journey is real before any of it is traced: a draft was rendered, a
+    // person approved that exact version, and a message really went `sent`.
+    expect(
+      defaultStore.db.outboundActions?.filter((action) => action.workspaceId === workspaceId),
+    ).toHaveLength(1);
+
+    // A trace can only be opened for an agent this workspace has actually put
+    // into `production`, and reaching that state still took Phase 19's
+    // evaluation gate over the journey's own executions.
+    await approveAgent(handlers, token, workspaceId, "conversation");
+    const perfect = ["met", "met", "met", "met", "met"] as const;
+    await judgeJourney(handlers, token, workspaceId, "conversation", trip, {
+      response_classification_accuracy: perfect,
+      accuracy: perfect,
+      relevance: perfect,
+      tool_call_correctness: perfect,
+    });
+    const stillNoTrace = await errorOf(
+      handlers.openAgentTraceRunHandler(request(token, { workspaceId, agentId: "conversation" })),
+    );
+    expect(stillNoTrace.code).toBe("CONFLICT");
+    expect(stillNoTrace.message).toContain("approved");
+
+    await dataOf(
+      handlers.changeAgentStatusHandler(
+        request(token, { workspaceId, agentId: "conversation" }, { status: "production" }),
+      ),
+    );
+
+    // Baseline for the negative-space check, captured once the journey and the
+    // evaluation are complete and before this trace exists. `rowCounts()` is
+    // process-wide and the store persists between runs, so the invariant is the
+    // delta this tenant causes — never an absolute zero.
+    const thisWorkspace = (rows?: readonly { workspaceId: string }[]): number =>
+      rows === undefined ? 0 : rows.filter((row) => row.workspaceId === workspaceId).length;
+    expect(thisWorkspace(defaultStore.db.agentTraceRuns)).toBe(0);
+    expect(thisWorkspace(defaultStore.db.agentTraceEvents)).toBe(0);
+    const beforeTrace = rowCounts();
+
+    const opened = (await dataOf(
+      handlers.openAgentTraceRunHandler(request(token, { workspaceId, agentId: "conversation" })),
+    )) as { run: IntegrationTraceRun };
+
+    // §27's chain, recorded as **references** to the rows the earlier phases
+    // already wrote. Each step names an id; none of them copies, mutates or
+    // re-derives the thing it points at.
+    const chain: readonly [string, string, string, Record<string, unknown>][] = [
+      ["agent", "agent", "succeeded", { durationMs: 120 }],
+      ["decision", "decision", "succeeded", { durationMs: 8 }],
+      [
+        "tool",
+        "tool_call",
+        "succeeded",
+        { tool: "request_research", referenceId: trip.researchRequestId, durationMs: 340 },
+      ],
+      ["evidence", "evidence", "succeeded", { referenceId: trip.qualificationId }],
+      ["draft", "result", "succeeded", { referenceId: trip.draftId, durationMs: 60 }],
+      ["approval", "approval", "succeeded", { referenceId: trip.approvalId }],
+      ["send", "external_action", "succeeded", { referenceId: trip.sentActionId }],
+    ];
+    for (const [stepId, stage, outcome, facts] of chain) {
+      await dataOf(
+        handlers.recordAgentTraceStepHandler(
+          request(
+            token,
+            { workspaceId, runId: opened.run.id },
+            { stepId, stage, outcome, ...facts },
+          ),
+        ),
+      );
+    }
+
+    // A retry of the research tool call, recorded as the next attempt rather
+    // than as a rewrite: attempt 1 keeps its own outcome and its own row.
+    const retried = (await dataOf(
+      handlers.recordAgentTraceStepHandler(
+        request(
+          token,
+          { workspaceId, runId: opened.run.id },
+          {
+            stepId: "tool",
+            stage: "tool_call",
+            outcome: "failed",
+            tool: "request_research",
+            errorCode: "provider_timeout",
+            referenceId: trip.researchRequestId,
+          },
+        ),
+      ),
+    )) as { step: IntegrationTraceStep };
+    expect(retried.step.attempt).toBe(2);
+    expect(retried.step.sequence).toBe(8);
+
+    const closed = (await dataOf(
+      handlers.closeAgentTraceRunHandler(request(token, { workspaceId, runId: opened.run.id })),
+    )) as { run: IntegrationTraceRun };
+    // One failed attempt outranks seven successes: a run that mostly worked and
+    // then broke is never reported as succeeded, and no caller could have
+    // asserted `succeeded` because the close route reads no body at all.
+    expect(closed.run.status).toBe("failed");
+
+    const trace = (await dataOf(
+      handlers.getAgentTraceHandler(request(token, { workspaceId, runId: opened.run.id })),
+    )) as IntegrationTrace;
+    expect(trace.ruleVersion).toBe("trace-1.0.0");
+    expect(trace.agentId).toBe("conversation");
+    expect(trace.agentVersion).toBe("1.0.0");
+    expect(trace.status).toBe("failed");
+    expect(trace.derivedStatus).toBe("failed");
+    expect(trace.stepCount).toBe(8);
+    // Every stage of §27's chain is accounted for, and the tool call's retry is
+    // visible as a retry.
+    expect(trace.stages.map((stage) => stage.stage)).toEqual([
+      "agent",
+      "decision",
+      "tool_call",
+      "evidence",
+      "result",
+      "approval",
+      "external_action",
+    ]);
+    const toolStage = trace.stages.find((stage) => stage.stage === "tool_call");
+    expect(toolStage).toMatchObject({ count: 2, succeeded: 1, failed: 1, retried: 1 });
+    // The nine tracked dimensions are all answered from real recorded facts.
+    expect(trace.usage.slowestStepMs).toBe(340);
+    expect(trace.usage.errorCount).toBe(1);
+    expect(trace.usage.retryCount).toBe(1);
+    expect(trace.usage.toolsInvoked).toEqual(["request_research"]);
+    expect(trace.usage.approvalsRequested).toBe(1);
+    expect(trace.usage.approvalsGranted).toBe(1);
+    expect(trace.usage.externalActions).toBe(1);
+    expect(trace.usage.externalActionsSucceeded).toBe(1);
+
+    // Cost is attributed through Phase 16's own immutable facts under the
+    // `agent_run` execution kind this phase adds — recorded through Phase 16's
+    // own route, so no second cost table and no recomputation.
+    expect(trace.cost).toBeNull();
+    await dataOf(
+      handlers.recordCostHandler(
+        request(
+          token,
+          { workspaceId },
+          {
+            executionKind: "agent_run",
+            executionId: opened.run.id,
+            category: "llm",
+            basis: "measured",
+            amountMinor: 180,
+            currency: "USD",
+            source: "provider usage export",
+            occurredAt: "2026-10-05T00:00:00.000Z",
+            idempotencyKey: unique("p20trace-cost"),
+          },
+        ),
+      ),
+    );
+    const priced = (await dataOf(
+      handlers.getAgentTraceHandler(request(token, { workspaceId, runId: opened.run.id })),
+    )) as IntegrationTrace;
+    expect(priced.cost).toMatchObject({ currency: "USD", eventCount: 1, totalMinor: 180 });
+
+    // The trace **records** the loop; it never caused it. Every earlier table
+    // is exactly as it was, and only the trace's own two tables grew.
+    const afterTrace = rowCounts();
+    expect(afterTrace.traceRuns).toBe(beforeTrace.traceRuns + 1);
+    expect(afterTrace.traceEvents).toBe(beforeTrace.traceEvents + 8);
+    expect(afterTrace.drafts).toBe(beforeTrace.drafts);
+    expect(afterTrace.approvals).toBe(beforeTrace.approvals);
+    expect(afterTrace.actions).toBe(beforeTrace.actions);
+    expect(afterTrace.claims).toBe(beforeTrace.claims);
+    expect(afterTrace.evidence).toBe(beforeTrace.evidence);
+    expect(afterTrace.registry).toBe(beforeTrace.registry);
+    expect(afterTrace.registryEvents).toBe(beforeTrace.registryEvents);
+    expect(afterTrace.evaluationRuns).toBe(beforeTrace.evaluationRuns);
+    expect(afterTrace.evaluationObservations).toBe(beforeTrace.evaluationObservations);
+    // The referenced rows are untouched: the trace pointed at them, never
+    // copied or rewrote them.
+    expect(
+      defaultStore.db.outboundActions?.filter((action) => action.workspaceId === workspaceId)[0]
+        ?.status,
+    ).toBe("sent");
+
+    // Another tenant sees none of it: the run is invisible, not merely
+    // refused, and a trace never opens for an agent they did not promote.
+    const other = tenant("Twenty Trace Other");
+    const foreignRead = await errorOf(
+      handlers.getAgentTraceHandler(
+        request(other.token, { workspaceId: other.workspaceId, runId: opened.run.id }),
+      ),
+    );
+    expect(foreignRead.code).toBe("NOT_FOUND");
+    const foreignWrite = await errorOf(
+      handlers.recordAgentTraceStepHandler(
+        request(
+          other.token,
+          { workspaceId: other.workspaceId, runId: opened.run.id },
+          {
+            stepId: "intruder",
+            stage: "result",
+            outcome: "succeeded",
+          },
+        ),
+      ),
+    );
+    expect(foreignWrite.code).toBe("NOT_FOUND");
+    // Even promoting `conversation` there does not reveal this tenant's run.
+    await approveAgent(handlers, other.token, other.workspaceId, "conversation");
+    const foreignOpen = await errorOf(
+      handlers.openAgentTraceRunHandler(
+        request(other.token, { workspaceId: other.workspaceId, agentId: "conversation" }),
+      ),
+    );
+    expect(foreignOpen.code).toBe("CONFLICT");
+    const foreignRuns = (await dataOf(
+      handlers.listAgentTraceRunsHandler(request(other.token, { workspaceId: other.workspaceId })),
+    )) as { runs: IntegrationTraceRun[] };
+    expect(foreignRuns.runs).toEqual([]);
+
+    // And the agent this workspace promoted is still not *usable*: Phase 19
+    // granted a governance state and no capability, and Phase 20 added none.
+    const registry = (await dataOf(
+      handlers.getAgentRegistryHandler(request(token, { workspaceId })),
+    )) as IntegrationRegistry;
+    expect(registry.agents.every((entry) => entry.usable === false)).toBe(true);
   });
 });

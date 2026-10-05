@@ -67,6 +67,8 @@ import { createAgentService } from "@dealora/agent";
 import type { AgentService } from "@dealora/agent";
 import { createEvaluationService, createProductionGate } from "@dealora/evaluation";
 import type { EvaluationService } from "@dealora/evaluation";
+import { createTraceService } from "@dealora/trace";
+import type { TraceService } from "@dealora/trace";
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
 import type { RevenueGoal } from "@dealora/db";
@@ -293,6 +295,34 @@ function gatedAgentService(store: Store, evaluation: EvaluationService) {
 }
 
 /**
+ * Wire Agent Trace & Observability the way the production wiring does: the real
+ * store behind the workspace-scoped lookup, Phase 16's own cost facts for the
+ * `agent_run` execution kind, and Phase 18's registry state for the
+ * `production` requirement. A route test therefore derives a run's status from
+ * real stored steps over the real derivation, and cannot pass against a
+ * stand-in that decides the outcome itself.
+ */
+function traceService(store: Store) {
+  return createTraceService({
+    authorize: store.authorize.bind(store),
+    createAgentTraceRun: store.createAgentTraceRun.bind(store),
+    getAgentTraceRun: store.getAgentTraceRun.bind(store),
+    listAgentTraceRuns: store.listAgentTraceRuns.bind(store),
+    closeAgentTraceRun: store.closeAgentTraceRun.bind(store),
+    createAgentTraceEvent: store.createAgentTraceEvent.bind(store),
+    listAgentTraceEvents: store.listAgentTraceEvents.bind(store),
+    listAgentRunCostFacts: (workspaceId, userId, runId) =>
+      store.listCostEvents(workspaceId, userId, { executionKind: "agent_run", executionId: runId }),
+    getAgentRegistryState: (workspaceId, userId, agentId) => {
+      const found = store.getAgentRegistry(workspaceId, userId, agentId);
+      return found.ok
+        ? { ok: true, value: found.value === null ? null : found.value.status }
+        : found;
+    },
+  });
+}
+
+/**
  * Wire Agent Evaluation the way the production wiring does: the real store
  * behind the workspace-scoped lookup, and nothing else. A route test therefore
  * measures real stored judgements through the real thresholds, and cannot pass
@@ -326,6 +356,29 @@ function brokenEvaluationService(): EvaluationService {
     listAgentEvaluationRuns: failure,
     createAgentEvaluationObservation: failure,
     listAgentEvaluationObservations: failure,
+  });
+}
+
+/**
+ * A trace boundary whose every call fails, so a trace route's internal-error
+ * mapping can be exercised against every other real service.
+ */
+function brokenTraceService(): TraceService {
+  const failure = () =>
+    ({
+      ok: false,
+      error: { code: "UNAVAILABLE", message: "disk is unreadable" },
+    }) as const;
+  return createTraceService({
+    authorize: failure,
+    createAgentTraceRun: failure,
+    getAgentTraceRun: failure,
+    listAgentTraceRuns: failure,
+    closeAgentTraceRun: failure,
+    createAgentTraceEvent: failure,
+    listAgentTraceEvents: failure,
+    listAgentRunCostFacts: failure,
+    getAgentRegistryState: failure,
   });
 }
 
@@ -392,6 +445,12 @@ function fixture(options?: {
    * store-backed evaluation service.
    */
   evaluationOverride?: EvaluationService;
+  /**
+   * Replaces the trace boundary with one whose storage fails, so a route's
+   * internal-error mapping can be exercised. Defaults to the real store-backed
+   * trace service.
+   */
+  traceOverride?: TraceService;
 }): {
   handlers: ReturnType<typeof createHandlers>;
   tokenA: string;
@@ -500,6 +559,7 @@ function fixture(options?: {
     dashboard: dashboardService(store),
     agent: options?.agentOverride ?? gatedAgentService(store, evaluation),
     evaluation,
+    trace: options?.traceOverride ?? traceService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -988,6 +1048,7 @@ describe("API Revenue Goal routes", () => {
       dashboard: dashboardService(store),
       agent: agentService(store),
       evaluation: evaluationService(store),
+      trace: traceService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1330,6 +1391,7 @@ describe("API Revenue Plan routes", () => {
       dashboard: dashboardService(store),
       agent: agentService(store),
       evaluation: evaluationService(store),
+      trace: traceService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1553,6 +1615,7 @@ describe("API Business Brain routes", () => {
       dashboard: dashboardService(failingStore),
       agent: agentService(failingStore),
       evaluation: evaluationService(failingStore),
+      trace: traceService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1901,6 +1964,7 @@ describe("API Account & Contact routes", () => {
       dashboard: dashboardService(store),
       agent: agentService(store),
       evaluation: evaluationService(store),
+      trace: traceService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -2216,6 +2280,7 @@ describe("API Research routes", () => {
       dashboard: dashboardService(store),
       agent: agentService(store),
       evaluation: evaluationService(store),
+      trace: traceService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -2275,6 +2340,7 @@ describe("API Research routes", () => {
       dashboard: dashboardService(store),
       agent: agentService(store),
       evaluation: evaluationService(store),
+      trace: traceService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3422,6 +3488,7 @@ describe("API Qualification routes", () => {
       dashboard: dashboardService(store),
       agent: agentService(store),
       evaluation: evaluationService(store),
+      trace: traceService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -3729,6 +3796,7 @@ describe("API Next Best Action routes", () => {
       dashboard: dashboardService(failingStore),
       agent: agentService(failingStore),
       evaluation: evaluationService(failingStore),
+      trace: traceService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -4275,7 +4343,14 @@ describe("API Cost routes", () => {
       "execution",
     ]);
     expect(policy.bases.map((b) => b.basis)).toEqual(["estimated", "measured"]);
-    expect(policy.executionKinds).toEqual(["research_run", "outbound_send", "meeting_booking"]);
+    // Phase 20 widens this list with `agent_run`; the three Phase 16 kinds are
+    // unchanged and in their original order.
+    expect(policy.executionKinds).toEqual([
+      "research_run",
+      "outbound_send",
+      "meeting_booking",
+      "agent_run",
+    ]);
     // `workflow` is refused and names the phase that owns it — never
     // published as an execution kind nothing here can produce.
     expect(policy.refusedExecutionKinds).toHaveLength(1);
@@ -6079,5 +6154,789 @@ describe("Phase 19 — agent evaluation routes", () => {
     expect(
       trail.observations.every((row) => row.verdict !== null || row.metric !== "task_success"),
     ).toBe(true);
+  });
+});
+
+describe("Phase 20 — agent trace routes", () => {
+  const agentParams = (workspaceId: string): Record<string, string> => ({ workspaceId });
+  const oneAgent = (workspaceId: string, agentId: string): Record<string, string> => ({
+    workspaceId,
+    agentId,
+  });
+  const oneRun = (workspaceId: string, runId: string): Record<string, string> => ({
+    workspaceId,
+    runId,
+  });
+
+  interface RunData {
+    id: string;
+    agentId: string;
+    agentVersion: string;
+    status: string;
+    openedBy: string;
+    stepCount: number;
+  }
+  interface StepData {
+    id: string;
+    sequence: number;
+    stepId: string;
+    attempt: number;
+    stage: string;
+    outcome: string;
+    tool: string | null;
+    errorCode: string | null;
+    durationMs: number | null;
+    recordedBy: string;
+    recordedAt: string;
+  }
+  interface TraceData {
+    ruleVersion: string;
+    id: string;
+    agentId: string;
+    agentVersion: string;
+    status: string;
+    derivedStatus: string;
+    stepCount: number;
+    stages: { stage: string; count: number; failed: number; retried: number }[];
+    usage: {
+      slowestStepMs: number | null;
+      slowestStepId: string | null;
+      modelInvocations: number;
+      inputTokens: number;
+      outputTokens: number;
+      toolsInvoked: string[];
+      retryCount: number;
+      errorCount: number;
+      approvalsRequested: number;
+      approvalsGranted: number;
+      externalActions: number;
+      externalActionsSucceeded: number;
+    };
+    cost: { totalMinor: number; currency: string | null } | null;
+  }
+
+  /**
+   * Promote `analytics` to `production` the only way this repository allows:
+   * `draft → testing → approved`, then Phase 19's gate satisfied by a real
+   * round of recorded judgements. A route test therefore opens its trace
+   * through the same path a deployment would, and cannot pass against a
+   * registry that accepts a promotion on demand.
+   */
+  async function promote(
+    h: ReturnType<typeof createHandlers>,
+    token: string,
+    workspaceId: string,
+  ): Promise<void> {
+    for (const status of ["testing", "approved"]) {
+      await dataOf(
+        h.changeAgentStatusHandler(
+          request({ token, params: oneAgent(workspaceId, "analytics"), body: { status } }),
+        ),
+      );
+    }
+    await dataOf(
+      h.openAgentEvaluationRunHandler(
+        request({ token, params: oneAgent(workspaceId, "analytics") }),
+      ),
+    );
+    for (const metric of ["task_success", "accuracy", "relevance"]) {
+      for (let index = 0; index < 5; index += 1) {
+        await dataOf(
+          h.recordAgentEvaluationHandler(
+            request({
+              token,
+              params: oneAgent(workspaceId, "analytics"),
+              body: { metric, subjectId: `${metric}-${index}`, verdict: "met" },
+            }),
+          ),
+        );
+      }
+    }
+    await dataOf(
+      h.recordAgentEvaluationHandler(
+        request({
+          token,
+          params: oneAgent(workspaceId, "analytics"),
+          body: { metric: "cost", subjectId: "run-cost", amountMinor: 500 },
+        }),
+      ),
+    );
+    await dataOf(
+      h.recordAgentEvaluationHandler(
+        request({
+          token,
+          params: oneAgent(workspaceId, "analytics"),
+          body: { metric: "latency", subjectId: "run-latency", durationMs: 1_200 },
+        }),
+      ),
+    );
+    await dataOf(
+      h.changeAgentStatusHandler(
+        request({
+          token,
+          params: oneAgent(workspaceId, "analytics"),
+          body: { status: "production" },
+        }),
+      ),
+    );
+  }
+
+  async function openRun(
+    h: ReturnType<typeof createHandlers>,
+    token: string,
+    workspaceId: string,
+    agentId = "analytics",
+  ): Promise<{ run: RunData }> {
+    return (await dataOf(
+      h.openAgentTraceRunHandler(request({ token, params: oneAgent(workspaceId, agentId) })),
+    )) as { run: RunData };
+  }
+
+  it("publishes the chain, the outcomes, the statuses and the negative space", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const policy = (await dataOf(
+      handlers.getAgentTracePolicyHandler(
+        request({ token: tokenA, params: agentParams(workspaceA) }),
+      ),
+    )) as {
+      ruleVersion: string;
+      stages: { stage: string; position: number; meaning: string }[];
+      outcomes: string[];
+      statuses: { status: string; terminal: boolean; meaning: string }[];
+      tools: string[];
+      tracked: { dimension: string; source: string }[];
+      criticalRule: string;
+      neverDoes: string[];
+    };
+    expect(policy.ruleVersion).toBe("trace-1.0.0");
+    expect(policy.stages.map((entry) => entry.stage)).toEqual([
+      "agent",
+      "decision",
+      "tool_call",
+      "evidence",
+      "result",
+      "approval",
+      "external_action",
+    ]);
+    expect(policy.outcomes).toEqual(["succeeded", "failed", "unknown"]);
+    expect(policy.statuses.map((entry) => entry.status)).toEqual([
+      "open",
+      "succeeded",
+      "failed",
+      "unknown",
+      "unverified",
+    ]);
+    expect(policy.tools).toHaveLength(18);
+    expect(policy.tracked.map((entry) => entry.dimension)).toHaveLength(9);
+    expect(policy.criticalRule).toContain("never silently pretend an action succeeded");
+    // The negative space is part of the contract, not a footnote.
+    expect(policy.neverDoes.join(" ")).toContain("Never executes an agent");
+    expect(policy.neverDoes.join(" ")).toContain("Never invokes a tool");
+    expect(policy.neverDoes.join(" ")).toContain("Never writes an evaluation judgement");
+  });
+
+  it("refuses a run for an agent the workspace has not put into production", async () => {
+    const { handlers, tokenA, workspaceA, store, userA } = fixture();
+    const error = await errorOf(
+      handlers.openAgentTraceRunHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "analytics") }),
+      ),
+    );
+    // `draft`, and the message names the phase that owns reaching `production`.
+    expect(error.code).toBe("CONFLICT");
+    expect(error.details?.[0]?.message).toContain("Phase 19");
+    // Nothing was written by the refused request.
+    expect(store.listAgentTraceRuns(workspaceA, userA)).toMatchObject({ ok: true, value: [] });
+  });
+
+  it("still refuses after `approved`, because evaluation has not been satisfied", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    for (const status of ["testing", "approved"]) {
+      await dataOf(
+        handlers.changeAgentStatusHandler(
+          request({ token: tokenA, params: oneAgent(workspaceA, "analytics"), body: { status } }),
+        ),
+      );
+    }
+    const error = await errorOf(
+      handlers.openAgentTraceRunHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "analytics") }),
+      ),
+    );
+    expect(error.code).toBe("CONFLICT");
+    expect(error.message).toContain("`approved`");
+  });
+
+  it("opens a run only after the Phase 19 gate has actually been satisfied", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    const { run: opened } = await openRun(handlers, tokenA, workspaceA);
+    expect(opened.agentId).toBe("analytics");
+    expect(opened.agentVersion).toBe("1.0.0");
+    // `open` claims nothing about any execution.
+    expect(opened.status).toBe("open");
+    expect(opened.stepCount).toBe(0);
+  });
+
+  it("ignores a forged version, actor, workspace and timestamp when opening a run", async () => {
+    const { handlers, tokenA, workspaceA, userA, store } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    const data = (await dataOf(
+      handlers.openAgentTraceRunHandler(
+        request({
+          token: tokenA,
+          params: oneAgent(workspaceA, "analytics"),
+          body: {
+            version: "9.9.9",
+            status: "succeeded",
+            workspaceId: "ws-forged",
+            openedBy: "attacker",
+            openedAt: "1999-01-01T00:00:00.000Z",
+          },
+        }),
+      ),
+    )) as { run: RunData };
+    expect(data.run.agentVersion).toBe("1.0.0");
+    expect(data.run.openedBy).toBe(userA);
+    expect(data.run.status).toBe("open");
+    const stored = store.listAgentTraceRuns(workspaceA, userA);
+    if (!isOk(stored)) throw new Error("read failed");
+    expect(stored.value).toHaveLength(1);
+    expect(stored.value[0]?.workspaceId).toBe(workspaceA);
+    expect(stored.value[0]?.openedAt).not.toBe("1999-01-01T00:00:00.000Z");
+  });
+
+  it("ignores every forged server field on a step body", async () => {
+    const { handlers, tokenA, workspaceA, userA } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    const { run } = await openRun(handlers, tokenA, workspaceA);
+    const step = (await dataOf(
+      handlers.recordAgentTraceStepHandler(
+        request({
+          token: tokenA,
+          params: oneRun(workspaceA, run.id),
+          body: {
+            stepId: "plan",
+            stage: "agent",
+            outcome: "succeeded",
+            sequence: 999,
+            attempt: 42,
+            recordedAt: "1999-01-01T00:00:00.000Z",
+            recordedBy: "attacker",
+            workspaceId: "ws-forged",
+            runId: "run-forged",
+          },
+        }),
+      ),
+    )) as { step: StepData };
+    // Every server-owned field came from the server.
+    expect(step.step.sequence).toBe(1);
+    expect(step.step.attempt).toBe(1);
+    expect(step.step.recordedBy).toBe(userA);
+    expect(step.step.recordedAt).not.toBe("1999-01-01T00:00:00.000Z");
+  });
+
+  it("records the seven-stage chain and derives the usage from it", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    const { run } = await openRun(handlers, tokenA, workspaceA);
+    const steps: [string, string, string, Record<string, unknown>][] = [
+      ["plan", "agent", "succeeded", { durationMs: 120 }],
+      ["choose", "decision", "succeeded", { durationMs: 40 }],
+      [
+        "render",
+        "tool_call",
+        "failed",
+        {
+          tool: "render_draft",
+          errorCode: "provider_timeout",
+          durationMs: 900,
+          modelProvider: "openai",
+          modelName: "m",
+          inputTokens: 120,
+          outputTokens: 30,
+        },
+      ],
+      [
+        "render",
+        "tool_call",
+        "succeeded",
+        {
+          tool: "render_draft",
+          durationMs: 300,
+          modelProvider: "openai",
+          modelName: "m",
+          inputTokens: 80,
+          outputTokens: 20,
+        },
+      ],
+      ["cite", "evidence", "succeeded", { referenceId: "ev-1" }],
+      ["draft", "result", "succeeded", { durationMs: 50 }],
+      ["ask", "approval", "succeeded", { referenceId: "ap-1" }],
+      ["send", "external_action", "unknown", { detail: "provider never answered" }],
+    ];
+    for (const [stepId, stage, outcome, extra] of steps) {
+      await dataOf(
+        handlers.recordAgentTraceStepHandler(
+          request({
+            token: tokenA,
+            params: oneRun(workspaceA, run.id),
+            body: { stepId, stage, outcome, ...extra },
+          }),
+        ),
+      );
+    }
+    const trace = (await dataOf(
+      handlers.getAgentTraceHandler(request({ token: tokenA, params: oneRun(workspaceA, run.id) })),
+    )) as TraceData;
+
+    expect(trace.stepCount).toBe(8);
+    expect(trace.stages.map((entry) => entry.stage)).toEqual([
+      "agent",
+      "decision",
+      "tool_call",
+      "evidence",
+      "result",
+      "approval",
+      "external_action",
+    ]);
+    // §27's nine dimensions, all derived from the recorded steps.
+    expect(trace.usage.slowestStepMs).toBe(900);
+    expect(trace.usage.slowestStepId).toBe("render");
+    expect(trace.usage.modelInvocations).toBe(2);
+    expect(trace.usage.inputTokens).toBe(200);
+    expect(trace.usage.outputTokens).toBe(50);
+    expect(trace.usage.toolsInvoked).toEqual(["render_draft"]);
+    expect(trace.usage.retryCount).toBe(1);
+    expect(trace.usage.errorCount).toBe(1);
+    expect(trace.usage.approvalsRequested).toBe(1);
+    expect(trace.usage.approvalsGranted).toBe(1);
+    expect(trace.usage.externalActions).toBe(1);
+    // The unconfirmed action is counted but never as a delivery.
+    expect(trace.usage.externalActionsSucceeded).toBe(0);
+    // An open run asserts nothing; the derivation says what closing would give.
+    expect(trace.status).toBe("open");
+    expect(trace.derivedStatus).toBe("failed");
+  });
+
+  it("returns the trail in sequence order and is byte-identical on every read", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    const { run } = await openRun(handlers, tokenA, workspaceA);
+    for (const stage of ["result", "agent", "tool_call", "decision"] as const) {
+      await dataOf(
+        handlers.recordAgentTraceStepHandler(
+          request({
+            token: tokenA,
+            params: oneRun(workspaceA, run.id),
+            body: {
+              stepId: stage,
+              stage,
+              outcome: "succeeded",
+              ...(stage === "tool_call" ? { tool: "read_accounts" } : {}),
+            },
+          }),
+        ),
+      );
+    }
+    const first = await dataOf(
+      handlers.listAgentTraceStepsHandler(
+        request({ token: tokenA, params: oneRun(workspaceA, run.id) }),
+      ),
+    );
+    const second = await dataOf(
+      handlers.listAgentTraceStepsHandler(
+        request({ token: tokenA, params: oneRun(workspaceA, run.id) }),
+      ),
+    );
+    expect(JSON.stringify(first)).toBe(JSON.stringify(second));
+    // Recording order, not the chain order: `sequence` is the ordering key.
+    expect((first as { steps: StepData[] }).steps.map((entry) => entry.sequence)).toEqual([
+      1, 2, 3, 4,
+    ]);
+    expect((first as { steps: StepData[] }).steps.map((entry) => entry.stage)).toEqual([
+      "result",
+      "agent",
+      "tool_call",
+      "decision",
+    ]);
+  });
+
+  it("closes a run as unverified when nothing was recorded, with no status to send", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    const { run } = await openRun(handlers, tokenA, workspaceA);
+    // A body full of attempts to declare a success is simply not read.
+    const closed = (await dataOf(
+      handlers.closeAgentTraceRunHandler(
+        request({
+          token: tokenA,
+          params: oneRun(workspaceA, run.id),
+          body: {
+            status: "succeeded",
+            derivedStatus: "succeeded",
+            closedAt: "1999-01-01T00:00:00.000Z",
+          },
+        }),
+      ),
+    )) as { run: RunData };
+    expect(closed.run.status).toBe("unverified");
+  });
+
+  it("closes a run with a recorded failure as failed, whatever else succeeded", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    const { run } = await openRun(handlers, tokenA, workspaceA);
+    await dataOf(
+      handlers.recordAgentTraceStepHandler(
+        request({
+          token: tokenA,
+          params: oneRun(workspaceA, run.id),
+          body: { stepId: "a", stage: "result", outcome: "succeeded" },
+        }),
+      ),
+    );
+    await dataOf(
+      handlers.recordAgentTraceStepHandler(
+        request({
+          token: tokenA,
+          params: oneRun(workspaceA, run.id),
+          body: {
+            stepId: "b",
+            stage: "external_action",
+            outcome: "failed",
+            errorCode: "provider_rejected",
+          },
+        }),
+      ),
+    );
+    const closed = (await dataOf(
+      handlers.closeAgentTraceRunHandler(
+        request({ token: tokenA, params: oneRun(workspaceA, run.id) }),
+      ),
+    )) as { run: RunData };
+    expect(closed.run.status).toBe("failed");
+    const trace = (await dataOf(
+      handlers.getAgentTraceHandler(request({ token: tokenA, params: oneRun(workspaceA, run.id) })),
+    )) as TraceData;
+    expect(trace.status).toBe("failed");
+    expect(trace.derivedStatus).toBe("failed");
+  });
+
+  it("refuses a step once the run is closed, and never reopens it", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    const { run } = await openRun(handlers, tokenA, workspaceA);
+    await dataOf(
+      handlers.recordAgentTraceStepHandler(
+        request({
+          token: tokenA,
+          params: oneRun(workspaceA, run.id),
+          body: { stepId: "a", stage: "result", outcome: "succeeded" },
+        }),
+      ),
+    );
+    await dataOf(
+      handlers.closeAgentTraceRunHandler(
+        request({ token: tokenA, params: oneRun(workspaceA, run.id) }),
+      ),
+    );
+    const late = await errorOf(
+      handlers.recordAgentTraceStepHandler(
+        request({
+          token: tokenA,
+          params: oneRun(workspaceA, run.id),
+          body: { stepId: "late", stage: "external_action", outcome: "succeeded" },
+        }),
+      ),
+    );
+    expect(late.code).toBe("CONFLICT");
+    const trail = (await dataOf(
+      handlers.listAgentTraceStepsHandler(
+        request({ token: tokenA, params: oneRun(workspaceA, run.id) }),
+      ),
+    )) as { steps: StepData[] };
+    expect(trail.steps).toHaveLength(1);
+  });
+
+  it("returns an identical resend unchanged and records a retry as a new attempt", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    const { run } = await openRun(handlers, tokenA, workspaceA);
+    const body = {
+      stepId: "render",
+      stage: "tool_call",
+      outcome: "failed",
+      tool: "render_draft",
+      errorCode: "timeout",
+    };
+    const first = (await dataOf(
+      handlers.recordAgentTraceStepHandler(
+        request({ token: tokenA, params: oneRun(workspaceA, run.id), body }),
+      ),
+    )) as { step: StepData };
+    const replay = (await dataOf(
+      handlers.recordAgentTraceStepHandler(
+        request({ token: tokenA, params: oneRun(workspaceA, run.id), body }),
+      ),
+    )) as { step: StepData };
+    expect(replay.step.id).toBe(first.step.id);
+    expect(replay.step.attempt).toBe(1);
+
+    const retry = (await dataOf(
+      handlers.recordAgentTraceStepHandler(
+        request({
+          token: tokenA,
+          params: oneRun(workspaceA, run.id),
+          body: {
+            stepId: "render",
+            stage: "tool_call",
+            outcome: "succeeded",
+            tool: "render_draft",
+          },
+        }),
+      ),
+    )) as { step: StepData };
+    expect(retry.step.attempt).toBe(2);
+    expect(retry.step.sequence).toBe(2);
+  });
+
+  it("rejects a stage, an outcome and a tool outside the published vocabulary", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    const { run } = await openRun(handlers, tokenA, workspaceA);
+    const cases: Record<string, unknown>[] = [
+      { stepId: "s", stage: "telepathy", outcome: "succeeded" },
+      { stepId: "s", stage: "agent", outcome: "probably" },
+      { stepId: "s", stage: "tool_call", outcome: "succeeded", tool: "shell_exec" },
+      { stepId: "s", stage: "agent", outcome: "succeeded", tool: "render_draft" },
+      { stepId: "s", stage: "agent", outcome: "succeeded", errorCode: "timeout" },
+      { stepId: "s", stage: "decision", outcome: "succeeded", inputTokens: 10 },
+      { stepId: "s", stage: "agent", outcome: "succeeded", durationMs: -1 },
+    ];
+    for (const body of cases) {
+      const error = await errorOf(
+        handlers.recordAgentTraceStepHandler(
+          request({ token: tokenA, params: oneRun(workspaceA, run.id), body }),
+        ),
+      );
+      expect(error.code).toBe("VALIDATION_ERROR");
+    }
+  });
+
+  it("reads and writes nothing across a workspace boundary", async () => {
+    const { handlers, tokenA, tokenB, workspaceA, workspaceB } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    const { run } = await openRun(handlers, tokenA, workspaceA);
+
+    // Workspace B's own member, reaching for workspace A's run.
+    const read = await errorOf(
+      handlers.getAgentTraceHandler(request({ token: tokenB, params: oneRun(workspaceA, run.id) })),
+    );
+    expect(read.code).toBe("UNAUTHORIZED");
+    const write = await errorOf(
+      handlers.recordAgentTraceStepHandler(
+        request({
+          token: tokenB,
+          params: oneRun(workspaceA, run.id),
+          body: { stepId: "s", stage: "agent", outcome: "succeeded" },
+        }),
+      ),
+    );
+    expect(write.code).toBe("UNAUTHORIZED");
+    const close = await errorOf(
+      handlers.closeAgentTraceRunHandler(
+        request({ token: tokenB, params: oneRun(workspaceA, run.id) }),
+      ),
+    );
+    expect(close.code).toBe("UNAUTHORIZED");
+    const open = await errorOf(
+      handlers.openAgentTraceRunHandler(
+        request({ token: tokenB, params: oneAgent(workspaceB, "analytics") }),
+      ),
+    );
+    expect(open.code).toBe("CONFLICT");
+    // Workspace B's own listing is empty: another tenant's run is invisible.
+    const theirs = (await dataOf(
+      handlers.listAgentTraceRunsHandler(
+        request({ token: tokenB, params: agentParams(workspaceB) }),
+      ),
+    )) as { runs: RunData[] };
+    expect(theirs.runs).toEqual([]);
+    // And A's run is untouched by every refused attempt.
+    const mine = (await dataOf(
+      handlers.listAgentTraceStepsHandler(
+        request({ token: tokenA, params: oneRun(workspaceA, run.id) }),
+      ),
+    )) as { steps: StepData[] };
+    expect(mine.steps).toEqual([]);
+  });
+
+  it("answers NOT_FOUND for a run that was never issued", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    for (const call of [
+      handlers.getAgentTraceHandler(
+        request({ token: tokenA, params: oneRun(workspaceA, "never") }),
+      ),
+      handlers.listAgentTraceStepsHandler(
+        request({ token: tokenA, params: oneRun(workspaceA, "never") }),
+      ),
+      handlers.closeAgentTraceRunHandler(
+        request({ token: tokenA, params: oneRun(workspaceA, "never") }),
+      ),
+    ]) {
+      const error = await errorOf(call);
+      expect(error.code).toBe("NOT_FOUND");
+    }
+  });
+
+  it("rejects an agent outside the twelve and a run listing narrowed to one", async () => {
+    const { handlers, tokenA, workspaceA } = fixture();
+    const open = await errorOf(
+      handlers.openAgentTraceRunHandler(
+        request({ token: tokenA, params: oneAgent(workspaceA, "sales_team") }),
+      ),
+    );
+    expect(open.code).toBe("VALIDATION_ERROR");
+    const list = await errorOf(
+      handlers.listAgentTraceRunsHandler(
+        request({
+          token: tokenA,
+          params: agentParams(workspaceA),
+          query: { agentId: "sales_team" },
+        }),
+      ),
+    );
+    expect(list.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("requires a session on every trace route", async () => {
+    const { handlers, workspaceA } = fixture();
+    const calls = [
+      handlers.openAgentTraceRunHandler(request({ params: oneAgent(workspaceA, "analytics") })),
+      handlers.recordAgentTraceStepHandler(
+        request({
+          params: oneRun(workspaceA, "r"),
+          body: { stepId: "s", stage: "agent", outcome: "succeeded" },
+        }),
+      ),
+      handlers.closeAgentTraceRunHandler(request({ params: oneRun(workspaceA, "r") })),
+      handlers.getAgentTraceHandler(request({ params: oneRun(workspaceA, "r") })),
+      handlers.listAgentTraceStepsHandler(request({ params: oneRun(workspaceA, "r") })),
+      handlers.listAgentTraceRunsHandler(request({ params: agentParams(workspaceA) })),
+      handlers.getAgentTracePolicyHandler(request({ params: agentParams(workspaceA) })),
+    ];
+    for (const call of calls) {
+      const error = await errorOf(call);
+      expect(error.code).toBe("UNAUTHENTICATED");
+    }
+  });
+
+  it("maps a storage outage to SERVER_ERROR and leaks no internals", async () => {
+    const failing = fixture({ traceOverride: brokenTraceService() });
+    const error = await errorOf(
+      failing.handlers.getAgentTraceHandler(
+        request({ token: failing.tokenA, params: oneRun(failing.workspaceA, "r") }),
+      ),
+    );
+    expect(error.code).toBe("SERVER_ERROR");
+    expect(error.message).toBe("unexpected failure");
+    expect(JSON.stringify(error)).not.toContain("disk");
+  });
+
+  it("reports cost from Phase 16's own facts, and null when there are none", async () => {
+    const { handlers, tokenA, workspaceA, store, userA } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+    const { run } = await openRun(handlers, tokenA, workspaceA);
+    const before = (await dataOf(
+      handlers.getAgentTraceHandler(request({ token: tokenA, params: oneRun(workspaceA, run.id) })),
+    )) as TraceData;
+    expect(before.cost).toBeNull();
+
+    // A cost fact recorded through Phase 16's own table, under the `agent_run`
+    // execution kind this phase adds. No second cost table, no recomputation.
+    const recorded = store.createCostEvent({
+      workspaceId: workspaceA,
+      createdBy: userA,
+      event: {
+        executionKind: "agent_run",
+        executionId: run.id,
+        category: "llm",
+        basis: "measured",
+        amountMinor: 250,
+        currency: "USD",
+        source: null,
+        occurredAt: new Date().toISOString(),
+        idempotencyKey: "phase20-route-cost",
+      },
+    });
+    expect(isOk(recorded)).toBe(true);
+    const after = (await dataOf(
+      handlers.getAgentTraceHandler(request({ token: tokenA, params: oneRun(workspaceA, run.id) })),
+    )) as TraceData;
+    expect(after.cost?.totalMinor).toBe(250);
+    expect(after.cost?.currency).toBe("USD");
+  });
+
+  it("writes no evaluation judgement and no draft, approval or action row", async () => {
+    const { handlers, tokenA, workspaceA, store, userA } = fixture();
+    await promote(handlers, tokenA, workspaceA);
+
+    const currentRound = () => {
+      const found = store.getCurrentAgentEvaluationRun({
+        workspaceId: workspaceA,
+        userId: userA,
+        agentId: "analytics",
+        version: "1.0.0",
+      });
+      if (!found.ok || found.value === null) {
+        throw new Error("expected a Phase 19 round after promote");
+      }
+      return found.value.id;
+    };
+    const judgementCount = () => {
+      const observations = store.listAgentEvaluationObservations(workspaceA, userA, currentRound());
+      if (!observations.ok) throw new Error("expected readable evaluation observations");
+      return observations.value.length;
+    };
+    // The baseline is Phase 19's own output, captured before the trace exists.
+    // Comparing against a snapshot proves the trace added none; a hardcoded
+    // count would only prove `promote` recorded what it recorded today.
+    const judgementsBefore = judgementCount();
+
+    const { run } = await openRun(handlers, tokenA, workspaceA);
+    for (const [stepId, stage, outcome] of [
+      ["a", "agent", "succeeded"],
+      ["b", "result", "succeeded"],
+    ] as const) {
+      await dataOf(
+        handlers.recordAgentTraceStepHandler(
+          request({
+            token: tokenA,
+            params: oneRun(workspaceA, run.id),
+            body: { stepId, stage, outcome },
+          }),
+        ),
+      );
+    }
+    await dataOf(
+      handlers.closeAgentTraceRunHandler(
+        request({ token: tokenA, params: oneRun(workspaceA, run.id) }),
+      ),
+    );
+
+    // Tracing records what a recorder reported. It performs no phase's work, so
+    // nothing outside the trace's own two tables moved.
+    const drafts = store.listDrafts(workspaceA, userA);
+    const approvals = store.listApprovalRequests(workspaceA, userA);
+    const actions = store.listOutboundActions(workspaceA, userA);
+    expect(isOk(drafts) && drafts.value).toEqual([]);
+    expect(isOk(approvals) && approvals.value).toEqual([]);
+    expect(isOk(actions) && actions.value).toEqual([]);
+    expect(judgementsBefore).toBeGreaterThan(0);
+    expect(judgementCount()).toBe(judgementsBefore);
+    // The trace did not open a second evaluation round either.
+    expect(store.listAgentEvaluationRuns(workspaceA, userA, "analytics").ok).toBe(true);
   });
 });

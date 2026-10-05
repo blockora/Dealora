@@ -283,7 +283,15 @@ describe("cost policy", () => {
       "execution",
     ]);
     expect(policy.bases.map((b) => b.basis)).toEqual(["estimated", "measured"]);
-    expect(policy.executionKinds).toEqual(["research_run", "outbound_send", "meeting_booking"]);
+    // Phase 20 widens this list with `agent_run` so §27's required cost figure
+    // can come from this table rather than from a second one. The three kinds
+    // Phase 16 published are unchanged and keep their order.
+    expect(policy.executionKinds).toEqual([
+      "research_run",
+      "outbound_send",
+      "meeting_booking",
+      "agent_run",
+    ]);
     // `workflow` is refused with its owning phase, never published as an
     // execution kind no branch could produce.
     expect(policy.refusedExecutionKinds).toHaveLength(1);
@@ -760,7 +768,8 @@ describe("cost service — derived metrics and policy", () => {
     const fx = fixture();
     const policy = fx.cost.policy(fx.workspaceId, fx.ownerId);
     if (!isOk(policy)) throw new Error("policy failed");
-    expect(policy.value.executionKinds).toHaveLength(3);
+    // Phase 20 added `agent_run` to this partition, so the count is four.
+    expect(policy.value.executionKinds).toHaveLength(4);
     expect(policy.value.refusedExecutionKinds[0]?.owningPhase).toBe("Phase 24");
     expect(policy.value.metrics).toHaveLength(6);
     expect(isErr(fx.cost.policy(fx.workspaceId, fx.otherId))).toBe(true);
@@ -783,6 +792,7 @@ describe("cost factory — metric denominators", () => {
       getResearchRequest: () => ({ ok: false, error: { code: "NOT_FOUND" } }),
       getOutboundAction: () => ({ ok: false, error: { code: "NOT_FOUND" } }),
       getMeeting: () => ({ ok: false, error: { code: "NOT_FOUND" } }),
+      getAgentTraceRun: () => ({ ok: true, value: null }),
       listAccounts: () => ({ ok: true, value: rows.accounts }),
       listQualifications: () => ({ ok: true, value: rows.qualifications }),
       listMeetings: () => ({ ok: true, value: rows.meetings }),

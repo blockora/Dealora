@@ -731,9 +731,20 @@ describe("Phase 16 gate — the published partition", () => {
     for (const entry of policy.categories) expect(entry.semantics.length).toBeGreaterThan(0);
     expect(policy.bases.map((entry) => entry.basis)).toEqual(["estimated", "measured"]);
 
-    // Three executable kinds; `workflow` refused with its owning phase —
+    // Four executable kinds; `workflow` refused with its owning phase —
     // unreachable vocabulary is never published as available.
-    expect(policy.executionKinds).toEqual(["research_run", "outbound_send", "meeting_booking"]);
+    //
+    // `agent_run` is Phase 20's one addition to this list, and it is a
+    // **widening of an existing vocabulary** rather than a new table: §27
+    // requires a traced production agent run to report its cost, and Phase 16's
+    // own rule is that cost belongs on `cost_events`. The three kinds Phase 16
+    // published are unchanged and in their original order.
+    expect(policy.executionKinds).toEqual([
+      "research_run",
+      "outbound_send",
+      "meeting_booking",
+      "agent_run",
+    ]);
     expect(policy.refusedExecutionKinds).toHaveLength(1);
     expect(policy.refusedExecutionKinds[0]?.name).toBe("workflow");
     expect(policy.refusedExecutionKinds[0]?.owningPhase).toBe("Phase 24");

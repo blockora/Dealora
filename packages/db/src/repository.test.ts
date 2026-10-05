@@ -4713,3 +4713,555 @@ describe("agent evaluation runs and observations", () => {
     expect(migrated.users).toEqual(document.users);
   });
 });
+
+describe("agent trace runs and events", () => {
+  /** A workspace, an owner, and a traced run against `analytics`. */
+  const traceFixture = () => {
+    const store = seed();
+    const owner = makeOwner(store, "trace-owner@example.com");
+    const workspaceId = makeWorkspace(store, owner.id, "Trace Co");
+    const opened = store.createAgentTraceRun({
+      workspaceId,
+      userId: owner.id,
+      agentId: "analytics",
+      version: "1.0.0",
+    });
+    if (!isOk(opened)) throw new Error("trace run open failed");
+    return { store, owner, workspaceId, run: opened.value };
+  };
+
+  const step = (
+    runId: string,
+    overrides?: Partial<{
+      workspaceId: string;
+      userId: string;
+      stepId: string;
+      stage: string;
+      outcome: string;
+      detail: string | null;
+      tool: string | null;
+      referenceId: string | null;
+      errorCode: string | null;
+      durationMs: number | null;
+      modelProvider: string | null;
+      modelName: string | null;
+      inputTokens: number | null;
+      outputTokens: number | null;
+    }>,
+  ) => ({
+    workspaceId: "",
+    userId: "",
+    runId,
+    stepId: "step-1",
+    stage: "agent",
+    outcome: "succeeded",
+    detail: null,
+    tool: null,
+    referenceId: null,
+    errorCode: null,
+    durationMs: null,
+    modelProvider: null,
+    modelName: null,
+    inputTokens: null,
+    outputTokens: null,
+    ...overrides,
+  });
+
+  it("opens a run pinned to the version it was given, with server-side attribution", () => {
+    const fx = traceFixture();
+    expect(fx.run.agentId).toBe("analytics");
+    expect(fx.run.version).toBe("1.0.0");
+    expect(fx.run.openedBy).toBe(fx.owner.id);
+    expect(fx.run.openedAt).not.toBe("");
+    // `open` is a lifecycle state, not a verdict: nothing has been claimed.
+    expect(fx.run.status).toBe("open");
+    expect(fx.run.closedAt).toBeNull();
+    expect(fx.run.closedBy).toBeNull();
+  });
+
+  it("refuses an agent outside the twelve and a version that is not a dotted number", () => {
+    const fx = traceFixture();
+    expect(
+      isErr(
+        fx.store.createAgentTraceRun({
+          workspaceId: fx.workspaceId,
+          userId: fx.owner.id,
+          agentId: "sales_team",
+          version: "1.0.0",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isErr(
+        fx.store.createAgentTraceRun({
+          workspaceId: fx.workspaceId,
+          userId: fx.owner.id,
+          agentId: "strategy",
+          version: "latest",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("gives every run its own identity, so two invocations are two runs", () => {
+    const fx = traceFixture();
+    const second = fx.store.createAgentTraceRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "analytics",
+      version: "1.0.0",
+    });
+    if (!isOk(second)) throw new Error("second run failed");
+    expect(second.value.id).not.toBe(fx.run.id);
+    const listed = fx.store.listAgentTraceRuns(fx.workspaceId, fx.owner.id, "analytics");
+    if (!isOk(listed)) throw new Error("list failed");
+    expect(listed.value).toHaveLength(2);
+  });
+
+  it("allocates sequence and attempt server-side", () => {
+    const fx = traceFixture();
+    const first = fx.store.createAgentTraceEvent(
+      step(fx.run.id, { workspaceId: fx.workspaceId, userId: fx.owner.id, stepId: "plan" }),
+    );
+    const second = fx.store.createAgentTraceEvent(
+      step(fx.run.id, {
+        workspaceId: fx.workspaceId,
+        userId: fx.owner.id,
+        stepId: "render",
+        stage: "tool_call",
+        tool: "render_draft",
+        outcome: "failed",
+        errorCode: "timeout",
+      }),
+    );
+    if (!isOk(first) || !isOk(second)) throw new Error("step write failed");
+    expect(first.value.sequence).toBe(1);
+    expect(first.value.attempt).toBe(1);
+    expect(second.value.sequence).toBe(2);
+    expect(second.value.attempt).toBe(1);
+    expect(second.value.recordedBy).toBe(fx.owner.id);
+  });
+
+  it("counts a retry as the next attempt of the same step", () => {
+    const fx = traceFixture();
+    const base = { workspaceId: fx.workspaceId, userId: fx.owner.id, stepId: "render" };
+    fx.store.createAgentTraceEvent(
+      step(fx.run.id, {
+        ...base,
+        stage: "tool_call",
+        tool: "render_draft",
+        outcome: "failed",
+        errorCode: "timeout",
+      }),
+    );
+    const retry = fx.store.createAgentTraceEvent(
+      step(fx.run.id, { ...base, stage: "tool_call", tool: "render_draft", outcome: "succeeded" }),
+    );
+    if (!isOk(retry)) throw new Error("retry write failed");
+    expect(retry.value.attempt).toBe(2);
+    expect(retry.value.sequence).toBe(2);
+  });
+
+  it("returns an identical replay unchanged, and records a different one as the next attempt", () => {
+    const fx = traceFixture();
+    const base = { workspaceId: fx.workspaceId, userId: fx.owner.id, stepId: "plan" };
+    const first = fx.store.createAgentTraceEvent(step(fx.run.id, base));
+    if (!isOk(first)) throw new Error("first write failed");
+
+    // An identical resend — what a retried request looks like — adds nothing.
+    const replay = fx.store.createAgentTraceEvent(step(fx.run.id, base));
+    if (!isOk(replay)) throw new Error("replay failed");
+    expect(replay.value.id).toBe(first.value.id);
+    expect(replay.value.sequence).toBe(first.value.sequence);
+    expect(replay.value.attempt).toBe(1);
+
+    // A different outcome on the same step is a **retry**, which §27 asks the
+    // trace to record rather than refuse. The earlier attempt stays on record.
+    const retry = fx.store.createAgentTraceEvent(
+      step(fx.run.id, { ...base, outcome: "failed", errorCode: "changed" }),
+    );
+    if (!isOk(retry)) throw new Error("retry failed");
+    expect(retry.value.id).not.toBe(first.value.id);
+    expect(retry.value.attempt).toBe(2);
+    expect(retry.value.sequence).toBe(2);
+
+    const trail = fx.store.listAgentTraceEvents(fx.workspaceId, fx.owner.id, fx.run.id);
+    if (!isOk(trail)) throw new Error("list failed");
+    // Both attempts survive: a trace whose history can be edited is not a trace.
+    expect(trail.value.map((row) => row.attempt)).toEqual([1, 2]);
+    expect(trail.value[0]?.outcome).toBe("succeeded");
+    expect(trail.value[1]?.outcome).toBe("failed");
+  });
+
+  it("refuses a step against a run that does not exist in this workspace", () => {
+    const fx = traceFixture();
+    expect(
+      isErr(
+        fx.store.createAgentTraceEvent(
+          step("never-issued", { workspaceId: fx.workspaceId, userId: fx.owner.id }),
+        ),
+      ),
+    ).toBe(true);
+    expect(isErr(fx.store.listAgentTraceEvents(fx.workspaceId, fx.owner.id, "never-issued"))).toBe(
+      true,
+    );
+    // A missing run is answered with `null`, which the domain reports as
+    // NOT_FOUND — the two are different shapes on purpose.
+    const missing = fx.store.getAgentTraceRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      runId: "never-issued",
+    });
+    if (!isOk(missing)) throw new Error("get failed");
+    expect(missing.value).toBeNull();
+    expect(
+      isErr(
+        fx.store.closeAgentTraceRun({
+          workspaceId: fx.workspaceId,
+          userId: fx.owner.id,
+          runId: "never-issued",
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("refuses a stage, outcome or tool outside the published vocabulary", () => {
+    const fx = traceFixture();
+    const base = { workspaceId: fx.workspaceId, userId: fx.owner.id, stepId: "s" };
+    expect(
+      isErr(fx.store.createAgentTraceEvent(step(fx.run.id, { ...base, stage: "telepathy" }))),
+    ).toBe(true);
+    expect(
+      isErr(fx.store.createAgentTraceEvent(step(fx.run.id, { ...base, outcome: "probably" }))),
+    ).toBe(true);
+    expect(
+      isErr(fx.store.createAgentTraceEvent(step(fx.run.id, { ...base, tool: "shell_exec" }))),
+    ).toBe(true);
+    // A tool is only meaningful on a tool_call step.
+    expect(
+      isErr(fx.store.createAgentTraceEvent(step(fx.run.id, { ...base, tool: "render_draft" }))),
+    ).toBe(true);
+  });
+
+  it("refuses an error code on a step that did not fail", () => {
+    const fx = traceFixture();
+    expect(
+      isErr(
+        fx.store.createAgentTraceEvent(
+          step(fx.run.id, {
+            workspaceId: fx.workspaceId,
+            userId: fx.owner.id,
+            stepId: "s",
+            outcome: "succeeded",
+            errorCode: "timeout",
+          }),
+        ),
+      ),
+    ).toBe(true);
+    // …and accepts it on one that did.
+    expect(
+      isOk(
+        fx.store.createAgentTraceEvent(
+          step(fx.run.id, {
+            workspaceId: fx.workspaceId,
+            userId: fx.owner.id,
+            stepId: "s2",
+            outcome: "failed",
+            errorCode: "timeout",
+          }),
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("refuses negative or fractional durations, tokens and counts", () => {
+    const fx = traceFixture();
+    const base = { workspaceId: fx.workspaceId, userId: fx.owner.id, stepId: "s" };
+    for (const durationMs of [-1, 1.5, Number.NaN]) {
+      expect(isErr(fx.store.createAgentTraceEvent(step(fx.run.id, { ...base, durationMs })))).toBe(
+        true,
+      );
+    }
+    expect(
+      isErr(
+        fx.store.createAgentTraceEvent(
+          step(fx.run.id, { ...base, modelName: "m", inputTokens: -1 }),
+        ),
+      ),
+    ).toBe(true);
+    // Tokens without the model that reported them cannot be interpreted.
+    expect(
+      isErr(fx.store.createAgentTraceEvent(step(fx.run.id, { ...base, inputTokens: 5 }))),
+    ).toBe(true);
+  });
+
+  it("refuses a blank or over-long stepId, reference or detail", () => {
+    const fx = traceFixture();
+    const base = { workspaceId: fx.workspaceId, userId: fx.owner.id };
+    expect(isErr(fx.store.createAgentTraceEvent(step(fx.run.id, { ...base, stepId: "   " })))).toBe(
+      true,
+    );
+    expect(
+      isErr(fx.store.createAgentTraceEvent(step(fx.run.id, { ...base, stepId: "x".repeat(201) }))),
+    ).toBe(true);
+    expect(
+      isErr(
+        fx.store.createAgentTraceEvent(
+          step(fx.run.id, { ...base, stepId: "ok", detail: "d".repeat(1001) }),
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      isErr(
+        fx.store.createAgentTraceEvent(
+          step(fx.run.id, { ...base, stepId: "ok2", referenceId: "r".repeat(201) }),
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("derives the close verdict from the recorded outcomes, with no status argument", () => {
+    const fx = traceFixture();
+    const closedEmpty = fx.store.closeAgentTraceRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      runId: fx.run.id,
+    });
+    if (!isOk(closedEmpty)) throw new Error("close failed");
+    // Closing a run that recorded nothing can never report a success.
+    expect(closedEmpty.value.status).toBe("unverified");
+    expect(closedEmpty.value.closedBy).toBe(fx.owner.id);
+    expect(closedEmpty.value.closedAt).not.toBeNull();
+
+    const okRun = fx.store.createAgentTraceRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "analytics",
+      version: "1.0.0",
+    });
+    if (!isOk(okRun)) throw new Error("run failed");
+    fx.store.createAgentTraceEvent(
+      step(okRun.value.id, { workspaceId: fx.workspaceId, userId: fx.owner.id }),
+    );
+    const closedOk = fx.store.closeAgentTraceRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      runId: okRun.value.id,
+    });
+    if (!isOk(closedOk)) throw new Error("close failed");
+    expect(closedOk.value.status).toBe("succeeded");
+
+    const mixedRun = fx.store.createAgentTraceRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "analytics",
+      version: "1.0.0",
+    });
+    if (!isOk(mixedRun)) throw new Error("run failed");
+    const base = { workspaceId: fx.workspaceId, userId: fx.owner.id };
+    fx.store.createAgentTraceEvent(step(mixedRun.value.id, { ...base, stepId: "a" }));
+    fx.store.createAgentTraceEvent(
+      step(mixedRun.value.id, { ...base, stepId: "b", outcome: "failed", errorCode: "boom" }),
+    );
+    const closedMixed = fx.store.closeAgentTraceRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      runId: mixedRun.value.id,
+    });
+    if (!isOk(closedMixed)) throw new Error("close failed");
+    expect(closedMixed.value.status).toBe("failed");
+
+    const unknownRun = fx.store.createAgentTraceRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      agentId: "analytics",
+      version: "1.0.0",
+    });
+    if (!isOk(unknownRun)) throw new Error("run failed");
+    fx.store.createAgentTraceEvent(
+      step(unknownRun.value.id, {
+        ...base,
+        stepId: "a",
+        stage: "external_action",
+        outcome: "unknown",
+      }),
+    );
+    const closedUnknown = fx.store.closeAgentTraceRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      runId: unknownRun.value.id,
+    });
+    if (!isOk(closedUnknown)) throw new Error("close failed");
+    expect(closedUnknown.value.status).toBe("unknown");
+  });
+
+  it("refuses a step on a closed run and never rewrites a closed one", () => {
+    const fx = traceFixture();
+    fx.store.closeAgentTraceRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      runId: fx.run.id,
+    });
+    expect(
+      isErr(
+        fx.store.createAgentTraceEvent(
+          step(fx.run.id, { workspaceId: fx.workspaceId, userId: fx.owner.id, stepId: "late" }),
+        ),
+      ),
+    ).toBe(true);
+    const again = fx.store.closeAgentTraceRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      runId: fx.run.id,
+    });
+    if (!isOk(again)) throw new Error("second close failed");
+    expect(again.value.status).toBe("unverified");
+    const reread = fx.store.getAgentTraceRun({
+      workspaceId: fx.workspaceId,
+      userId: fx.owner.id,
+      runId: fx.run.id,
+    });
+    if (!isOk(reread) || reread.value === null) throw new Error("reread failed");
+    // The row on disk still carries the verdict the first close derived.
+    expect(reread.value.status).toBe("unverified");
+    expect(reread.value.closedBy).toBe(fx.owner.id);
+  });
+
+  it("reads nothing across a workspace boundary", () => {
+    const fx = traceFixture();
+    const other = makeOwner(fx.store, "trace-stranger@example.com");
+    const otherWorkspaceId = makeWorkspace(fx.store, other.id, "Other Trace Co");
+    const base = { runId: fx.run.id };
+
+    expect(
+      isErr(fx.store.getAgentTraceRun({ ...base, workspaceId: fx.workspaceId, userId: other.id })),
+    ).toBe(true);
+    expect(isErr(fx.store.listAgentTraceEvents(fx.workspaceId, other.id, fx.run.id))).toBe(true);
+    expect(
+      isErr(
+        fx.store.createAgentTraceEvent(
+          step(fx.run.id, { workspaceId: fx.workspaceId, userId: other.id }),
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      isErr(
+        fx.store.closeAgentTraceRun({
+          workspaceId: fx.workspaceId,
+          userId: other.id,
+          runId: fx.run.id,
+        }),
+      ),
+    ).toBe(true);
+    expect(isErr(fx.store.listAgentTraceRuns(fx.workspaceId, other.id))).toBe(true);
+
+    // The other tenant's own workspace sees none of this run — and cannot even
+    // tell it exists, because a foreign id reads as missing exactly as an
+    // unissued one does.
+    const foreign = fx.store.getAgentTraceRun({
+      ...base,
+      workspaceId: otherWorkspaceId,
+      userId: other.id,
+    });
+    if (!isOk(foreign)) throw new Error("get failed");
+    expect(foreign.value).toBeNull();
+    const theirs = fx.store.listAgentTraceRuns(otherWorkspaceId, other.id);
+    if (!isOk(theirs)) throw new Error("list failed");
+    expect(theirs.value).toEqual([]);
+    // …and this run is untouched by the refused attempts.
+    const mine = fx.store.listAgentTraceEvents(fx.workspaceId, fx.owner.id, fx.run.id);
+    if (!isOk(mine)) throw new Error("list failed");
+    expect(mine.value).toHaveLength(0);
+  });
+
+  it("attributes a cost fact to a traced run under the `agent_run` execution kind", () => {
+    const fx = traceFixture();
+    const cost = fx.store.createCostEvent({
+      workspaceId: fx.workspaceId,
+      createdBy: fx.owner.id,
+      event: {
+        executionKind: "agent_run",
+        executionId: fx.run.id,
+        category: "llm",
+        basis: "measured",
+        amountMinor: 120,
+        currency: "USD",
+        source: null,
+        occurredAt: toDateTime(new Date()),
+        idempotencyKey: "trace-cost-1",
+      },
+    });
+    if (!isOk(cost)) throw new Error("cost write failed");
+    const listed = fx.store.listCostEvents(fx.workspaceId, fx.owner.id, {
+      executionKind: "agent_run",
+      executionId: fx.run.id,
+    });
+    if (!isOk(listed)) throw new Error("cost list failed");
+    expect(listed.value).toHaveLength(1);
+  });
+
+  it("refuses a cost attributed to a traced run that does not exist", () => {
+    const fx = traceFixture();
+    expect(
+      isErr(
+        fx.store.createCostEvent({
+          workspaceId: fx.workspaceId,
+          createdBy: fx.owner.id,
+          event: {
+            executionKind: "agent_run",
+            executionId: "never-issued",
+            category: "llm",
+            basis: "estimated",
+            amountMinor: 10,
+            currency: "USD",
+            source: null,
+            occurredAt: toDateTime(new Date()),
+            idempotencyKey: "trace-cost-2",
+          },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("migrates a v17 document forward by adding only the trace tables", () => {
+    const fx = traceFixture();
+    fx.store.createAgentTraceEvent(
+      step(fx.run.id, { workspaceId: fx.workspaceId, userId: fx.owner.id }),
+    );
+    const document = JSON.parse(JSON.stringify(fx.store.db)) as typeof fx.store.db;
+    const v17 = {
+      ...document,
+      schemaVersion: 17,
+      agentTraceRuns: undefined,
+      agentTraceEvents: undefined,
+    };
+    const migrated = migrateState(v17 as unknown as Parameters<typeof migrateState>[0]);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    // The new tables exist and start empty; nothing before them is rewritten.
+    expect(migrated.agentTraceRuns).toEqual([]);
+    expect(migrated.agentTraceEvents).toEqual([]);
+    expect(migrated.agentEvaluationRuns).toEqual(document.agentEvaluationRuns);
+    expect(migrated.agentEvaluationObservations).toEqual(document.agentEvaluationObservations);
+    expect(migrated.agentRegistry).toEqual(document.agentRegistry);
+    expect(migrated.costEvents).toEqual(document.costEvents);
+    expect(migrated.users).toEqual(document.users);
+  });
+
+  it("keeps the migration chain contiguous from 2 to the latest version", () => {
+    expect(LATEST_SCHEMA_VERSION).toBe(18);
+    // Every intermediate version migrates without throwing, so no step in the
+    // chain is skipped.
+    for (let version = 1; version <= LATEST_SCHEMA_VERSION; version += 1) {
+      const migrated = migrateState({
+        schemaVersion: version,
+        users: [],
+        workspaces: [],
+        members: [],
+        profiles: [],
+      } as DbState);
+      expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+      expect(migrated.agentTraceRuns).toEqual([]);
+      expect(migrated.agentTraceEvents).toEqual([]);
+    }
+  });
+});
