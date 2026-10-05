@@ -45,6 +45,7 @@
         "@dealora/cost": "workspace:*",
         "@dealora/dashboard": "workspace:*",
         "@dealora/db": "workspace:*",
+        "@dealora/evaluation": "workspace:*",
         "@dealora/evidence": "workspace:*",
         "@dealora/goal": "workspace:*",
         "@dealora/meeting": "workspace:*",
@@ -118,6 +119,15 @@
       "version": "0.1.0",
       "dependencies": {
         "@dealora/core": "workspace:*",
+      },
+    },
+    "packages/evaluation": {
+      "name": "@dealora/evaluation",
+      "version": "0.1.0",
+      "dependencies": {
+        "@dealora/agent": "workspace:*",
+        "@dealora/core": "workspace:*",
+        "@dealora/db": "workspace:*",
       },
     },
     "packages/evidence": {
@@ -234,6 +244,8 @@
     "@dealora/dashboard": ["@dealora/dashboard@workspace:packages/dashboard"],
 
     "@dealora/db": ["@dealora/db@workspace:packages/db"],
+
+    "@dealora/evaluation": ["@dealora/evaluation@workspace:packages/evaluation"],
 
     "@dealora/evidence": ["@dealora/evidence@workspace:packages/evidence"],
 

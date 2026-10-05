@@ -22,6 +22,7 @@
     { "path": "packages/cost" },
     { "path": "packages/dashboard" },
     { "path": "packages/agent" },
+    { "path": "packages/evaluation" },
     { "path": "packages/api" }
   ]
 }
