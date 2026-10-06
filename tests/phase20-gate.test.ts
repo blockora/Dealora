@@ -1047,7 +1047,9 @@ describe("Phase 20 gate — Agent Trace & Observability (ROADMAP.md §27)", () =
 
   it("persists the trace in schema v18 behind foreign keys and CHECK constraints", async () => {
     expect(defaultStore.db.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
-    expect(LATEST_SCHEMA_VERSION).toBe(18);
+    // Phase 22 appended v19 additively; this gate's pin is the version the
+    // trace tables landed at, updated when the next migration was added.
+    expect(LATEST_SCHEMA_VERSION).toBeGreaterThanOrEqual(18);
 
     // The two tables exist in the published schema, with the invariants the
     // domain relies on stated in the DDL rather than only in TypeScript.

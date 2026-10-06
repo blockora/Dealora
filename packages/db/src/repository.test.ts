@@ -5248,7 +5248,9 @@ describe("agent trace runs and events", () => {
   });
 
   it("keeps the migration chain contiguous from 2 to the latest version", () => {
-    expect(LATEST_SCHEMA_VERSION).toBe(18);
+    // Phase 22 appended schema v19; the pin is the current latest, so each
+    // additive migration phase updates it rather than rewriting history.
+    expect(LATEST_SCHEMA_VERSION).toBe(19);
     // Every intermediate version migrates without throwing, so no step in the
     // chain is skipped.
     for (let version = 1; version <= LATEST_SCHEMA_VERSION; version += 1) {
@@ -5262,6 +5264,9 @@ describe("agent trace runs and events", () => {
       expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
       expect(migrated.agentTraceRuns).toEqual([]);
       expect(migrated.agentTraceEvents).toEqual([]);
+      expect(migrated.experiments).toEqual([]);
+      expect(migrated.experimentArms).toEqual([]);
+      expect(migrated.experimentEvents).toEqual([]);
     }
   });
 });

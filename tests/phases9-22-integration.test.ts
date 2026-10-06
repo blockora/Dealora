@@ -12,9 +12,10 @@ import { SandboxCalendarProvider } from "@dealora/meeting";
 import { declarationFor } from "@dealora/agent";
 
 /**
- * Phases 9–20 integration — one document, one decision, one effect, one response,
+ * Phases 9–22 integration — one document, one decision, one effect, one response,
  * one booking, one recommendation, one graph, one cost, one dashboard, one
- * agent registry, one evaluation, one trace.
+ * agent registry, one evaluation, one trace, one optimization answer, one
+ * controlled experiment.
  *
  * Phase 12 added the ability to *read* what came back, Phase 13 the ability to
  * *book* what was read, Phase 14 the ability to *advise* what happens next,
@@ -74,6 +75,11 @@ import { declarationFor } from "@dealora/agent";
  *     Phase 16's own facts, stays per tenant — and creates no draft, approval,
  *     action, meeting or judgement of its own, because a trace records what
  *     happened and does not cause it (Phase 20).
+ * 17. The journey's rows answer the optimizer's five questions without being
+ *     rewritten by it (Phase 21).
+ * 18. The journey's own sends become a controlled experiment's two arms, and
+ *     the comparison §29 derives refuses a winner at this sample size — while
+ *     never sending, approving or booking anything itself (Phase 22).
  *
  * The research provider is a **declared test double**, the email provider is the
  * **sandbox**, and the calendar is a **sandbox** too: nothing here retrieves,
@@ -550,7 +556,7 @@ afterAll(() => {
   defaultStore.destroy();
 });
 
-describe("phases 9-20 integration — document, decision, effect, response, booking, next step, graph, cost, dashboard, agents, evaluation, trace", () => {
+describe("phases 9-22 integration — document, decision, effect, response, booking, next step, graph, cost, dashboard, agents, evaluation, trace, optimization, experiment", () => {
   it("carries one evidence-backed document through one decision to one delivery and one response", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({
@@ -1755,7 +1761,7 @@ interface IntegrationAgentPolicy {
   neverDoes: string[];
 }
 
-describe("phases 9-20 integration — the agent registry over a real journey", () => {
+describe("phases 9-22 integration — the agent registry over a real journey", () => {
   it("declares the twelve agents and their lifecycle over the state the journey produced, without touching it", async () => {
     setSessionIndex(createIndex());
     const handlers = createDefaultHandlers({
@@ -1946,7 +1952,7 @@ class FailingProvider {
   }
 }
 
-describe("phases 9-20 integration — agent evaluation over a real journey", () => {
+describe("phases 9-22 integration — agent evaluation over a real journey", () => {
   /** The evaluation surface, typed the way the routes return it. */
   interface IntegrationMetric {
     metric: string;
@@ -2530,5 +2536,246 @@ describe("phases 9-20 integration — agent evaluation over a real journey", () 
       handlers.getAgentRegistryHandler(request(token, { workspaceId })),
     )) as IntegrationRegistry;
     expect(registry.agents.every((entry) => entry.usable === false)).toBe(true);
+  });
+});
+
+describe("phases 9-22 integration — the optimizer and the experiment over a real journey", () => {
+  it("derives a controlled comparison from the journey's own sends and refuses a winner at this sample size", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+    });
+    const { token, workspaceId } = tenant("Nine To TwentyTwo");
+
+    // Two arms of the same tenant: the declaration half of the journey for
+    // each, so two immutable drafts exist before anything is declared.
+    const armA = await prepare(
+      handlers,
+      token,
+      workspaceId,
+      `${unique("nine22")}@northwind.example`,
+    );
+    const armB = await prepare(
+      handlers,
+      token,
+      workspaceId,
+      `${unique("nine22")}@northwind.example`,
+    );
+
+    // Declare the §29 example, pin both arms, and open the window. The sends
+    // come after the start, because the window is what defines exposure.
+    const declared = (await dataOf(
+      handlers.createExperimentHandler(
+        request(
+          token,
+          { workspaceId },
+          {
+            name: "Message A vs Message B",
+            metric: "positive_reply_rate",
+            durationDays: 14,
+          },
+        ),
+      ),
+    )) as { experiment: { id: string } };
+    const experimentId = declared.experiment.id;
+    await dataOf(
+      handlers.addExperimentArmHandler(
+        request(token, { workspaceId, experimentId }, { draftId: armA.draftId, label: "A" }),
+      ),
+    );
+    await dataOf(
+      handlers.addExperimentArmHandler(
+        request(token, { workspaceId, experimentId }, { draftId: armB.draftId, label: "B" }),
+      ),
+    );
+    const started = (await dataOf(
+      handlers.startExperimentHandler(request(token, { workspaceId, experimentId })),
+    )) as { experiment: { status: string } };
+    expect(started.experiment.status).toBe("running");
+
+    // Both messages genuinely go out; one positive reply comes back.
+    const sentA = (await dataOf(
+      handlers.sendOutboundActionHandler(request(token, { workspaceId, id: armA.stagedActionId })),
+    )) as { action: { status: string } };
+    const sentB = (await dataOf(
+      handlers.sendOutboundActionHandler(request(token, { workspaceId, id: armB.stagedActionId })),
+    )) as { action: { status: string } };
+    expect(sentA.action.status).toBe("sent");
+    expect(sentB.action.status).toBe("sent");
+
+    const classified = (await dataOf(
+      handlers.createInboundMessageHandler(
+        request(
+          token,
+          { workspaceId, outboundActionId: armA.sentActionId ?? armA.stagedActionId },
+          {
+            body: "Happy to chat, book a call.",
+          },
+        ),
+      ),
+    )) as { classification: { intent: string } };
+    expect(classified.classification.intent).toBe("positive_intent");
+
+    // The derived comparison: sample follows the window, the positive reply
+    // converts arm A, cost follows the arm's own Phase 16 facts, revenue
+    // impact is the refusal, and two exposures crown nobody.
+    const read = (await dataOf(
+      handlers.getExperimentHandler(request(token, { workspaceId, experimentId })),
+    )) as {
+      arms: { position: number; label: string }[];
+      comparison: {
+        arms: {
+          position: number;
+          sampleSize: number;
+          conversions: number;
+          exposures: number;
+          cost: { eventCount: number; totalMinor: number };
+        }[];
+        decision: { status: string; winnerPosition: number | null };
+        confidence: string;
+        populationAccounts: number;
+      };
+    };
+    expect(read.arms).toHaveLength(2);
+    expect(read.arms[0]?.label).toBe("A");
+    expect(read.arms[1]?.label).toBe("B");
+    // The derived metrics live on the comparison's arms; the frozen views
+    // carry only the declaration (position and label).
+    expect(read.comparison.arms[0]?.exposures).toBe(1);
+    expect(read.comparison.arms[1]?.exposures).toBe(1);
+    expect(read.comparison.arms[0]?.conversions).toBe(1);
+    expect(read.comparison.arms[1]?.conversions).toBe(0);
+    // This journey recorded no Phase 16 cost events, so the arm's own cost
+    // total is 0: attribution follows the recorded facts, never an assumption.
+    expect(read.comparison.arms[0]?.cost.eventCount).toBe(0);
+    expect(read.comparison.arms[1]?.cost.eventCount).toBe(0);
+    expect(read.comparison.arms[0]?.cost.totalMinor).toBe(0);
+    // Two exposures per arm is far below the published minimum: no winner.
+    expect(read.comparison.decision.status).toBe("insufficient_evidence");
+    expect(read.comparison.decision.winnerPosition).toBeNull();
+    expect(read.comparison.confidence).toBe("insufficient");
+    // The population is the workspace's own qualified accounts: both arms sit
+    // on one journey each, so two.
+    expect(read.comparison.populationAccounts).toBe(2);
+
+    // Closing freezes the window; a later send cannot enter it.
+    const closed = (await dataOf(
+      handlers.closeExperimentHandler(request(token, { workspaceId, experimentId })),
+    )) as { experiment: { status: string } };
+    expect(closed.experiment.status).toBe("closed");
+
+    // A second approval of arm A's draft sends again — Phase 11 allows a new
+    // approval to send again — but the closed window does not count it.
+    const secondApproval = (await dataOf(
+      handlers.createApprovalRequestHandler(
+        request(token, { workspaceId, draftId: armA.draftId }, {}),
+      ),
+    )) as { approval: { id: string } };
+    await dataOf(
+      handlers.decideApprovalRequestHandler(
+        request(token, { workspaceId, id: secondApproval.approval.id }, { decision: "approved" }),
+      ),
+    );
+    const secondStaged = (await dataOf(
+      handlers.createOutboundActionHandler(
+        request(token, { workspaceId, draftId: armA.draftId }, {}),
+      ),
+    )) as { action: { id: string } };
+    await dataOf(
+      handlers.sendOutboundActionHandler(
+        request(token, { workspaceId, id: secondStaged.action.id }),
+      ),
+    );
+    const afterClose = (await dataOf(
+      handlers.getExperimentHandler(request(token, { workspaceId, experimentId })),
+    )) as { comparison: { arms: { exposures: number }[] } };
+    expect(afterClose.comparison.arms[0]?.exposures).toBe(1);
+
+    // The experiment surface measured the loop; it never drove it.
+    const db = defaultStore.db;
+    expect(db.experimentArms?.length ?? 0).toBe(2);
+    expect(db.experimentEvents?.length ?? 0).toBe(3);
+  });
+
+  it("keeps the experiment surface per tenant and derives byte-identically", async () => {
+    setSessionIndex(createIndex());
+    const handlers = createDefaultHandlers({
+      researchProviders: [researchProvider()],
+      outboundProviders: [new SandboxEmailProvider()],
+    });
+    const mine = tenant("TwentyTwo Mine");
+    const theirs = tenant("TwentyTwo Theirs");
+
+    const declared = (await dataOf(
+      handlers.createExperimentHandler(
+        request(
+          mine.token,
+          { workspaceId: mine.workspaceId },
+          {
+            name: "Mine only",
+            metric: "positive_reply_rate",
+            durationDays: 7,
+          },
+        ),
+      ),
+    )) as { experiment: { id: string } };
+
+    // The other tenant sees an empty list, not a shared one.
+    const foreignList = (await dataOf(
+      handlers.listExperimentsHandler(request(theirs.token, { workspaceId: theirs.workspaceId })),
+    )) as { experiments: { id: string }[] };
+    expect(foreignList.experiments).toEqual([]);
+
+    // A foreign read of my experiment is refused, not leaked.
+    const foreignRead = await errorOf(
+      handlers.getExperimentHandler(
+        request(theirs.token, {
+          workspaceId: mine.workspaceId,
+          experimentId: declared.experiment.id,
+        }),
+      ),
+    );
+    expect(foreignRead.code).toBe("UNAUTHORIZED");
+
+    // Declaring with a forged status, winner and timestamps is ignored.
+    const forged = (await dataOf(
+      handlers.createExperimentHandler(
+        request(
+          mine.token,
+          { workspaceId: mine.workspaceId },
+          {
+            name: "Forged fields",
+            metric: "positive_reply_rate",
+            durationDays: 7,
+            status: "closed",
+            winner: "A",
+            createdBy: "attacker",
+            createdAt: "1999-01-01T00:00:00.000Z",
+          },
+        ),
+      ),
+    )) as { experiment: { status: string; createdBy: string } };
+    expect(forged.experiment.status).toBe("draft");
+    expect(forged.experiment.createdBy).toBe(mine.userId ?? forged.experiment.createdBy);
+
+    // Two reads of the same experiment agree byte-for-byte.
+    const first = await dataOf(
+      handlers.getExperimentHandler(
+        request(mine.token, {
+          workspaceId: mine.workspaceId,
+          experimentId: declared.experiment.id,
+        }),
+      ),
+    );
+    const second = await dataOf(
+      handlers.getExperimentHandler(
+        request(mine.token, {
+          workspaceId: mine.workspaceId,
+          experimentId: declared.experiment.id,
+        }),
+      ),
+    );
+    expect(JSON.stringify(second)).toBe(JSON.stringify(first));
   });
 });

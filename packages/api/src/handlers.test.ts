@@ -69,6 +69,7 @@ import { createEvaluationService, createProductionGate } from "@dealora/evaluati
 import type { EvaluationService } from "@dealora/evaluation";
 import { createTraceService } from "@dealora/trace";
 import type { TraceService } from "@dealora/trace";
+import { createExperimentService } from "@dealora/experiment";
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
 import type { RevenueGoal } from "@dealora/db";
@@ -323,6 +324,34 @@ function traceService(store: Store) {
 }
 
 /**
+ * Wire the Experiment Engine the way the production wiring does: the real
+ * store behind the workspace-scoped lookup, and nothing else. A route test
+ * therefore measures real stored rows through the real derivation, and the
+ * declaration/lifecycle routes exercise the real transitions.
+ */
+function experimentService(store: Store) {
+  return createExperimentService({
+    authorize: store.authorize.bind(store),
+    createExperiment: store.createExperiment.bind(store),
+    getExperiment: store.getExperiment.bind(store),
+    listExperiments: store.listExperiments.bind(store),
+    addExperimentArm: store.addExperimentArm.bind(store),
+    listExperimentArms: store.listExperimentArms.bind(store),
+    startExperiment: store.startExperiment.bind(store),
+    closeExperiment: store.closeExperiment.bind(store),
+    cancelExperiment: store.cancelExperiment.bind(store),
+    listExperimentEvents: store.listExperimentEvents.bind(store),
+    listAccounts: store.listAccounts.bind(store),
+    listContacts: store.listContacts.bind(store),
+    listQualifications: store.listQualifications.bind(store),
+    listOutboundActions: store.listOutboundActions.bind(store),
+    listConversationClassifications: store.listConversationClassifications.bind(store),
+    listMeetings: store.listMeetings.bind(store),
+    listCostEvents: store.listCostEvents.bind(store),
+  });
+}
+
+/**
  * Wire Agent Evaluation the way the production wiring does: the real store
  * behind the workspace-scoped lookup, and nothing else. A route test therefore
  * measures real stored judgements through the real thresholds, and cannot pass
@@ -560,6 +589,7 @@ function fixture(options?: {
     agent: options?.agentOverride ?? gatedAgentService(store, evaluation),
     evaluation,
     trace: options?.traceOverride ?? traceService(store),
+    experiment: experimentService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -1049,6 +1079,7 @@ describe("API Revenue Goal routes", () => {
       agent: agentService(store),
       evaluation: evaluationService(store),
       trace: traceService(store),
+      experiment: experimentService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1392,6 +1423,7 @@ describe("API Revenue Plan routes", () => {
       agent: agentService(store),
       evaluation: evaluationService(store),
       trace: traceService(store),
+      experiment: experimentService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1616,6 +1648,7 @@ describe("API Business Brain routes", () => {
       agent: agentService(failingStore),
       evaluation: evaluationService(failingStore),
       trace: traceService(failingStore),
+      experiment: experimentService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1965,6 +1998,7 @@ describe("API Account & Contact routes", () => {
       agent: agentService(store),
       evaluation: evaluationService(store),
       trace: traceService(store),
+      experiment: experimentService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -2281,6 +2315,7 @@ describe("API Research routes", () => {
       agent: agentService(store),
       evaluation: evaluationService(store),
       trace: traceService(store),
+      experiment: experimentService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -2341,6 +2376,7 @@ describe("API Research routes", () => {
       agent: agentService(store),
       evaluation: evaluationService(store),
       trace: traceService(store),
+      experiment: experimentService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3489,6 +3525,7 @@ describe("API Qualification routes", () => {
       agent: agentService(store),
       evaluation: evaluationService(store),
       trace: traceService(store),
+      experiment: experimentService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -3797,6 +3834,7 @@ describe("API Next Best Action routes", () => {
       agent: agentService(failingStore),
       evaluation: evaluationService(failingStore),
       trace: traceService(failingStore),
+      experiment: experimentService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     });
 
