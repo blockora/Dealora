@@ -127,6 +127,8 @@ export type {
   AgentRegistryEventKind,
   AgentEvaluationObservation,
   AgentEvaluationRun,
+  AgentTraceRun,
+  AgentTraceEvent,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 

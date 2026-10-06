@@ -1,0 +1,19 @@
+{
+  "name": "@dealora/optimization",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DEALORA Phase 21 Optimization Engine (ROADMAP.md §28): derives the five optimization answers from the existing workspace tables — what worked, what failed, where conversion is dropping, what should be tested, and the likely impact — together with eighteen optimization facets and the rule version. The phase does not execute agents, does not send external actions, and does not run live providers.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "dependencies": {
+    "@dealora/db": "workspace:*",
+    "@dealora/agent": "workspace:*",
+    "@dealora/cost": "workspace:*"
+  },
+  "devDependencies": {}
+}

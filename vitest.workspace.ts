@@ -90,12 +90,16 @@ export default defineConfig({
         replacement: new URL("./packages/evaluation/src/index.ts", import.meta.url).pathname,
       },
       {
+        find: "@dealora/api",
+        replacement: new URL("./packages/api/src/index.ts", import.meta.url).pathname,
+      },
+      {
         find: "@dealora/trace",
         replacement: new URL("./packages/trace/src/index.ts", import.meta.url).pathname,
       },
       {
-        find: "@dealora/api",
-        replacement: new URL("./packages/api/src/index.ts", import.meta.url).pathname,
+        find: "@dealora/optimization",
+        replacement: new URL("./packages/optimization/src/index.ts", import.meta.url).pathname,
       },
     ],
   },

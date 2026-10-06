@@ -165,6 +165,15 @@
         "@dealora/db": "workspace:*",
       },
     },
+    "packages/optimization": {
+      "name": "@dealora/optimization",
+      "version": "0.1.0",
+      "dependencies": {
+        "@dealora/agent": "workspace:*",
+        "@dealora/cost": "workspace:*",
+        "@dealora/db": "workspace:*",
+      },
+    },
     "packages/outbound": {
       "name": "@dealora/outbound",
       "version": "0.1.0",
@@ -265,6 +274,8 @@
     "@dealora/meeting": ["@dealora/meeting@workspace:packages/meeting"],
 
     "@dealora/nextaction": ["@dealora/nextaction@workspace:packages/nextaction"],
+
+    "@dealora/optimization": ["@dealora/optimization@workspace:packages/optimization"],
 
     "@dealora/outbound": ["@dealora/outbound@workspace:packages/outbound"],
 
