@@ -70,6 +70,11 @@ import type { EvaluationService } from "@dealora/evaluation";
 import { createTraceService } from "@dealora/trace";
 import type { TraceService } from "@dealora/trace";
 import { createExperimentService } from "@dealora/experiment";
+import {
+  createIntegrationRegistry,
+  createIntegrationService,
+  SandboxCrmAdapter,
+} from "@dealora/integration";
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
 import type { RevenueGoal } from "@dealora/db";
@@ -352,6 +357,39 @@ function experimentService(store: Store) {
 }
 
 /**
+ * Wire Phase 23's CRM boundary the way the production wiring does: the real
+ * store behind the workspace-scoped lookup, and the real sandbox adapter
+ * behind the registry. A route test therefore measures real stored
+ * connections and real derived change-sets, and cannot pass against a
+ * stand-in that always says the adapter accepted.
+ */
+function integrationService(store: Store) {
+  return createIntegrationService(
+    {
+      authorize: store.authorize.bind(store),
+      connectIntegration: store.connectIntegration.bind(store),
+      getIntegrationConnection: store.getIntegrationConnection.bind(store),
+      listIntegrationConnections: store.listIntegrationConnections.bind(store),
+      revokeIntegrationConnection: store.revokeIntegrationConnection.bind(store),
+      prepareCrmSync: store.prepareCrmSync.bind(store),
+      getCrmSync: store.getCrmSync.bind(store),
+      listCrmSyncs: store.listCrmSyncs.bind(store),
+      decideCrmSync: store.decideCrmSync.bind(store),
+      recordCrmSyncOutcome: store.recordCrmSyncOutcome.bind(store),
+      cancelCrmSync: store.cancelCrmSync.bind(store),
+      listCrmSyncEvents: store.listCrmSyncEvents.bind(store),
+      getAccount: store.getAccount.bind(store),
+      listContacts: store.listContacts.bind(store),
+      listQualifications: store.listQualifications.bind(store),
+      listOutboundActions: store.listOutboundActions.bind(store),
+      listConversationClassifications: store.listConversationClassifications.bind(store),
+      listMeetings: store.listMeetings.bind(store),
+    },
+    createIntegrationRegistry([new SandboxCrmAdapter()]),
+  );
+}
+
+/**
  * Wire Agent Evaluation the way the production wiring does: the real store
  * behind the workspace-scoped lookup, and nothing else. A route test therefore
  * measures real stored judgements through the real thresholds, and cannot pass
@@ -590,6 +628,7 @@ function fixture(options?: {
     evaluation,
     trace: options?.traceOverride ?? traceService(store),
     experiment: experimentService(store),
+    integration: integrationService(store),
     resolveSession: (token) => {
       const userId = sessions.get(token);
       return userId ? { userId } : null;
@@ -1080,6 +1119,7 @@ describe("API Revenue Goal routes", () => {
       evaluation: evaluationService(store),
       trace: traceService(store),
       experiment: experimentService(store),
+      integration: integrationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1424,6 +1464,7 @@ describe("API Revenue Plan routes", () => {
       evaluation: evaluationService(store),
       trace: traceService(store),
       experiment: experimentService(store),
+      integration: integrationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -1649,6 +1690,7 @@ describe("API Business Brain routes", () => {
       evaluation: evaluationService(failingStore),
       trace: traceService(failingStore),
       experiment: experimentService(failingStore),
+      integration: integrationService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -1999,6 +2041,7 @@ describe("API Account & Contact routes", () => {
       evaluation: evaluationService(store),
       trace: traceService(store),
       experiment: experimentService(store),
+      integration: integrationService(store),
       resolveSession: () => ({ userId: "u1" }),
     };
 
@@ -2316,6 +2359,7 @@ describe("API Research routes", () => {
       evaluation: evaluationService(store),
       trace: traceService(store),
       experiment: experimentService(store),
+      integration: integrationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -2377,6 +2421,7 @@ describe("API Research routes", () => {
       evaluation: evaluationService(store),
       trace: traceService(store),
       experiment: experimentService(store),
+      integration: integrationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
     const error = await errorOf(
@@ -3526,6 +3571,7 @@ describe("API Qualification routes", () => {
       evaluation: evaluationService(store),
       trace: traceService(store),
       experiment: experimentService(store),
+      integration: integrationService(store),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -3835,6 +3881,7 @@ describe("API Next Best Action routes", () => {
       evaluation: evaluationService(failingStore),
       trace: traceService(failingStore),
       experiment: experimentService(failingStore),
+      integration: integrationService(failingStore),
       resolveSession: () => ({ userId: "u1" }),
     });
 
@@ -4388,6 +4435,7 @@ describe("API Cost routes", () => {
       "outbound_send",
       "meeting_booking",
       "agent_run",
+      "crm_sync",
     ]);
     // `workflow` is refused and names the phase that owns it — never
     // published as an execution kind nothing here can produce.

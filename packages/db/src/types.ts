@@ -2097,7 +2097,13 @@ export type CostBasis = "estimated" | "measured";
  * its facts rather than in a second table. `workflow` is still refused with the
  * phase that owns it rather than published as an unreachable kind.
  */
-export type CostExecutionKind = "research_run" | "outbound_send" | "meeting_booking" | "agent_run";
+export type CostExecutionKind =
+  | "research_run"
+  | "outbound_send"
+  | "meeting_booking"
+  | "agent_run"
+  /** Phase 23's CRM sync execution, so an integration's cost stays attributable. */
+  | "crm_sync";
 
 /**
  * An immutable recorded cost fact — `DEALORA_BLUEPRINT.md` §33's "every run
@@ -2515,5 +2521,286 @@ export interface ExperimentEvent {
   /** The transition's reason in the actor's words. Optional, capped. */
   detail: string | null;
   /** Server-derived: when the transition happened. */
+  createdAt: DateTime;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 23 — CRM Integrations (ROADMAP.md §30, DEALORA_BLUEPRINT.md §23/§42/§44)
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 23 — the systems `ROADMAP.md` §30 names as potential integrations.
+ *
+ * The vocabulary is closed on the roadmap's own list and published for every
+ * member of it, configured or not: the architecture must accommodate a system
+ * before the deployment has an adapter for it, or the product would hard-code
+ * today's vendors and §30's "do not hard-code the entire product around one
+ * vendor" would be false at read time.
+ */
+export type IntegrationSystem = "crm" | "calendar" | "email" | "slack" | "github" | "data_provider";
+
+/**
+ * Phase 23 — the permission scopes an adapter can request and a connection can
+ * grant (`DEALORA_BLUEPRINT.md` §44: "Every external tool should have explicit
+ * permission scopes").
+ *
+ * Closed and explicit: a scope name outside this list cannot be requested,
+ * granted or checked, and every CRM operation in the change-set names exactly
+ * one scope it needs. Fail-closed — an operation whose scope the connection
+ * does not grant is refused rather than attempted.
+ */
+export type IntegrationPermissionScope =
+  | "contacts:read"
+  | "contacts:write"
+  | "activities:write"
+  | "lifecycle:write"
+  | "opportunities:write"
+  | "notes:write"
+  | "conversations:write";
+
+/** Phase 23 — a workspace's link to one adapter instance. */
+export type IntegrationConnectionStatus = "active" | "revoked";
+
+/**
+ * Phase 23 — one workspace-scoped connection to an adapter.
+ *
+ * The connection records **which scopes the workspace granted**, not any
+ * credential: no token, secret or OAuth artifact is stored anywhere in this
+ * phase (§18's OAuth requirement stays open for the first real adapter, as
+ * ADR 0011 recorded). `adapterId` deliberately carries no foreign key — the
+ * adapter is code this deployment registers, not a row — and revocation is
+ * terminal, so a revoked connection can never silently regain its scopes.
+ */
+export interface IntegrationConnection {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** Stable adapter identity, resolved server-side against the registry. */
+  adapterId: string;
+  system: IntegrationSystem;
+  /** The scopes this workspace granted, as requested. Never widened silently. */
+  grantedScopes: IntegrationPermissionScope[];
+  status: IntegrationConnectionStatus;
+  /** Server-derived: who connected it. */
+  createdBy: EntityId;
+  createdAt: DateTime;
+  /** Server-derived on revocation. `null` exactly while `active`. */
+  revokedBy: EntityId | null;
+  revokedAt: DateTime | null;
+}
+
+/**
+ * Phase 23 — the operations a CRM change-set can carry.
+ *
+ * These are exactly `DEALORA_BLUEPRINT.md` §23's CRM AGENT responsibilities:
+ * create/update contacts, create activities, update lifecycle stages, update
+ * opportunity status, attach notes, synchronize conversations — plus source
+ * attribution, which every operation carries as `derivedFrom` so a synced
+ * record traces back to the rows it came from rather than to a claim.
+ */
+export type CrmOperationKind =
+  | "upsert_contact"
+  | "create_activity"
+  | "update_lifecycle_stage"
+  | "update_opportunity_status"
+  | "attach_note"
+  | "sync_conversation";
+
+/**
+ * Phase 23 — CRM lifecycle stages, derived from the loop's own stored rows.
+ *
+ * The furthest stage reached wins: `meeting_booked` beats `engaged` beats
+ * `contacted` beats `qualified` beats `new`. Each stage is sourced from rows
+ * Phases 8–13 already wrote (qualification, sends, replies, meetings), never
+ * asserted by a caller.
+ */
+export type CrmLifecycleStage = "new" | "qualified" | "contacted" | "engaged" | "meeting_booked";
+
+/**
+ * Phase 23 — opportunity status, the Phase 15 definition in CRM words.
+ *
+ * The revenue graph defines an opportunity as "the account's newest
+ * qualification is `qualified`", so the opportunity status is that verdict,
+ * mapped one-to-one and never resolved here: `contested` travels as
+ * `contested`, because Phase 7 preserves conflicts and this phase does not
+ * settle them. `insufficient_data` produces no operation at all — an
+ * un-researched account is neither an open nor a closed opportunity. There is
+ * deliberately **no value or amount field**: the Phase 4 plan's CRM policy
+ * prohibits writing an opportunity value without a human-confirmed figure.
+ */
+export type CrmOpportunityStatus = "open" | "closed" | "contested";
+
+/** One upsert of a contact at the account, with the record's own provenance. */
+export interface CrmUpsertContactOperation {
+  kind: "upsert_contact";
+  contactId: EntityId;
+  fullName: string;
+  email: string | null;
+  jobTitle: string | null;
+  /** Where this contact record came from — never re-labelled on sync. */
+  source: RecordSource;
+  sourceReference: string | null;
+  /** The exact stored rows this operation was derived from. */
+  derivedFrom: readonly { kind: string; id: EntityId }[];
+}
+
+/** One recorded interaction, quoted from the rows that recorded it. */
+export interface CrmCreateActivityOperation {
+  kind: "create_activity";
+  activityKind: "message_sent" | "meeting_recorded";
+  /** The instant the stored row records, never the sync time. */
+  occurredAt: DateTime;
+  /** Channel or meeting state, exactly as the source row carries it. */
+  detail: string;
+  derivedFrom: readonly { kind: string; id: EntityId }[];
+}
+
+/** The account's furthest stage along the loop, with the rows that prove it. */
+export interface CrmUpdateLifecycleStageOperation {
+  kind: "update_lifecycle_stage";
+  stage: CrmLifecycleStage;
+  reason: string;
+  derivedFrom: readonly { kind: string; id: EntityId }[];
+}
+
+/** The opportunity verdict, sourced from one qualification row. */
+export interface CrmUpdateOpportunityStatusOperation {
+  kind: "update_opportunity_status";
+  status: CrmOpportunityStatus;
+  qualificationId: EntityId;
+  derivedFrom: readonly { kind: string; id: EntityId }[];
+}
+
+/**
+ * A note quoting the qualification verdict verbatim — a Level 1 draft whose
+ * attach happens inside the Level 2 bundle a person approves as a whole.
+ */
+export interface CrmAttachNoteOperation {
+  kind: "attach_note";
+  qualificationId: EntityId;
+  body: string;
+  derivedFrom: readonly { kind: string; id: EntityId }[];
+}
+
+/** One classified conversation, synchronized with its classification fields. */
+export interface CrmSyncConversationOperation {
+  kind: "sync_conversation";
+  classificationId: EntityId;
+  contactId: EntityId;
+  intent: ConversationIntent;
+  confidence: ConversationConfidence;
+  recommendedNextAction: ConversationDisposition;
+  occurredAt: DateTime;
+  derivedFrom: readonly { kind: string; id: EntityId }[];
+}
+
+export type CrmOperation =
+  | CrmUpsertContactOperation
+  | CrmCreateActivityOperation
+  | CrmUpdateLifecycleStageOperation
+  | CrmUpdateOpportunityStatusOperation
+  | CrmAttachNoteOperation
+  | CrmSyncConversationOperation;
+
+/**
+ * Phase 23 — one prepared, immutable change-set: the exact payload a reviewer
+ * approves before anything reaches a CRM.
+ *
+ * Derived server-side from stored rows on prepare and never re-derived
+ * afterwards: the digest a decision is bound to is computed from this document
+ * as it stands, so "I approved *this* sync" stays checkable even if the
+ * account's rows change after preparation. Carries the Phase 4 plan's CRM
+ * record fields — account identity, source attribution, plan and goal version —
+ * and no opportunity value, per that policy's prohibited writes.
+ */
+export interface CrmChangeSet {
+  accountId: EntityId;
+  accountName: string;
+  source: RecordSource;
+  sourceReference: string | null;
+  /** The plan this account was sourced against, when it has one. */
+  revenuePlanId: EntityId | null;
+  /** The goal the governing qualification was evaluated against, when known. */
+  revenueGoalId: EntityId | null;
+  operations: CrmOperation[];
+}
+
+/** Phase 23 lifecycle states for a prepared sync. Exactly one is a yes. */
+export type CrmSyncStatus =
+  "prepared" | "approved" | "rejected" | "cancelled" | "executed" | "failed";
+
+/** The decision a reviewer recorded. Mirrors two of the terminal states. */
+export type CrmSyncDecision = "approved" | "rejected";
+
+/** Why an adapter did not confirm a change-set. Closed vocabulary. */
+export type CrmSyncFailureCode = "adapter_unavailable" | "adapter_rejected" | "invalid_change_set";
+
+/**
+ * Phase 23 — one prepared CRM sync: a Level 2 external action under
+ * `DEALORA_BLUEPRINT.md` §17, bound to the exact change-set a person saw.
+ *
+ * `previewDigest` is the fingerprint of `changeSet`, re-derived at decision
+ * time and again before execution, exactly as Phase 10 re-derives its preview
+ * digest and Phase 13 re-derives its booking digest. Identity fields are
+ * server-only: `decidedBy`/`decidedAt` and `executedBy`/`executedAt` resolve
+ * from the session, so a body that carries them is ignored rather than
+ * believed. There is no auto-approval path: only an explicit decision moves
+ * `prepared` to `approved`, and only an adapter confirmation moves `approved`
+ * to `executed`.
+ */
+export interface CrmSyncRequest {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** The connection this sync executes through, resolved server-side. */
+  connectionId: EntityId;
+  /** The subject account, resolved server-side from storage. */
+  accountId: EntityId;
+  /** The exact payload a reviewer approves. Immutable once prepared. */
+  changeSet: CrmChangeSet;
+  /** Fingerprint of the change-set as previewed; re-derived before decisions. */
+  previewDigest: string;
+  status: CrmSyncStatus;
+  /** The recorded decision. `null` while prepared. */
+  decision: CrmSyncDecision | null;
+  /** Who decided. Set from the session, never from the body. */
+  decidedBy: EntityId | null;
+  decidedAt: DateTime | null;
+  /** Required for `rejected`; optional for `approved`. */
+  decisionReason: string | null;
+  /** Server-derived: who executed it against the adapter. */
+  executedBy: EntityId | null;
+  executedAt: DateTime | null;
+  /** The adapter's own reference, on confirmation. Null until then. */
+  providerReference: string | null;
+  /** The adapter's refusal, closed vocabulary. Present with `failed`. */
+  failureCode: CrmSyncFailureCode | null;
+  failureMessage: string | null;
+  /** Server-derived: who withdrew it. Set exactly while `cancelled`. */
+  cancelledBy: EntityId | null;
+  cancelledAt: DateTime | null;
+  cancelReason: string | null;
+  createdBy: EntityId;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}
+
+/** The kinds of append-only event a CRM sync records. */
+export type CrmSyncEventKind =
+  "prepared" | "approved" | "rejected" | "cancelled" | "executed" | "failed";
+
+/**
+ * Phase 23 — one append-only audit record for a CRM sync.
+ *
+ * What was approved, by whom, when, and what the adapter confirmed, survives
+ * any later change: events are written by the server and never edited.
+ */
+export interface CrmSyncEvent {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** Denormalized so events can never outlive their tenant boundary. */
+  crmSyncId: EntityId;
+  /** Server-derived: who made the transition. */
+  actorUserId: EntityId;
+  kind: CrmSyncEventKind;
+  detail: string | null;
   createdAt: DateTime;
 }

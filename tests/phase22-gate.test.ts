@@ -1930,7 +1930,9 @@ describe("Phase 22 gate — Experiment Engine (ROADMAP.md §29)", () => {
 
   it("keeps the schema honest: the §29 tables sit behind foreign keys and CHECK constraints in v19", () => {
     expect(defaultStore.db.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
-    expect(LATEST_SCHEMA_VERSION).toBe(19);
+    // Phase 23 appends v20 additively; v19 — this phase's own tables — must
+    // still be part of the chain.
+    expect(LATEST_SCHEMA_VERSION).toBeGreaterThanOrEqual(19);
 
     const ddl = SCHEMA;
     const expStart = ddl.indexOf(`CREATE TABLE IF NOT EXISTS "${experimentTable}"`);

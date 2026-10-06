@@ -305,3 +305,28 @@ export type {
   PersonalizationOfferSnapshot,
   PersonalizationQualificationSnapshot,
 } from "@dealora/personalization";
+
+/**
+ * The CRM Integrations public surface, re-exported so API consumers can type
+ * an integration response without depending on the domain package directly.
+ *
+ * Note what is *not* here: no credential type, no token type and no
+ * execution input, because `DEALORA_BLUEPRINT.md` §17's critical rule is
+ * structural — no Level 2 external action reaches an adapter without a
+ * stored human decision bound to the change-set's digest, and no request
+ * can supply either.
+ */
+export type {
+  CrmApplyRequest,
+  CrmApplyResult,
+  CrmChangeSetAdapter,
+  CrmSyncEventView,
+  CrmSyncView,
+  IntegrationAdapter,
+  IntegrationAdapterView,
+  IntegrationConnectionView,
+  IntegrationError,
+  IntegrationErrorCode,
+  IntegrationPolicyView,
+  IntegrationRegistry,
+} from "@dealora/integration";

@@ -64,6 +64,19 @@ import type {
   ExperimentEventKind,
   ExperimentMetric,
   ExperimentStatus,
+  IntegrationConnection,
+  IntegrationPermissionScope,
+  IntegrationSystem,
+  CrmSyncRequest,
+  CrmSyncEvent,
+  CrmSyncEventKind,
+  CrmSyncStatus,
+  CrmSyncDecision,
+  CrmSyncFailureCode,
+  CrmOperationKind,
+  CrmLifecycleStage,
+  CrmOpportunityStatus,
+  CrmChangeSet,
   NextBestAction,
   NextBestActionKind,
   NextBestActionRiskLevel,
@@ -414,6 +427,296 @@ function isStoredExperimentStatus(value: string): value is ExperimentStatus {
   return (EXPERIMENT_STATUS_VALUES as readonly string[]).includes(value);
 }
 
+// Phase 23 storage vocabulary — CRM Integrations (ROADMAP.md §30)
+// ---------------------------------------------------------------------------
+
+/**
+ * The six systems `ROADMAP.md` §30 names as potential integrations. Storage
+ * accepts a connection to any of them; whether an adapter exists for one is
+ * the registry's answer, not the row's.
+ */
+const INTEGRATION_SYSTEMS: readonly IntegrationSystem[] = [
+  "crm",
+  "calendar",
+  "email",
+  "slack",
+  "github",
+  "data_provider",
+];
+
+/** The closed permission-scope catalog (`DEALORA_BLUEPRINT.md` §44). */
+const INTEGRATION_PERMISSION_SCOPES: readonly IntegrationPermissionScope[] = [
+  "contacts:read",
+  "contacts:write",
+  "activities:write",
+  "lifecycle:write",
+  "opportunities:write",
+  "notes:write",
+  "conversations:write",
+];
+
+const CRM_SYNC_STATUS_VALUES: readonly CrmSyncStatus[] = [
+  "prepared",
+  "approved",
+  "rejected",
+  "cancelled",
+  "executed",
+  "failed",
+];
+
+const CRM_SYNC_DECISION_VALUES: readonly CrmSyncDecision[] = ["approved", "rejected"];
+
+const CRM_SYNC_FAILURE_CODES: readonly CrmSyncFailureCode[] = [
+  "adapter_unavailable",
+  "adapter_rejected",
+  "invalid_change_set",
+];
+
+const CRM_OPERATION_KIND_VALUES: readonly CrmOperationKind[] = [
+  "upsert_contact",
+  "create_activity",
+  "update_lifecycle_stage",
+  "update_opportunity_status",
+  "attach_note",
+  "sync_conversation",
+];
+
+const CRM_LIFECYCLE_STAGE_VALUES: readonly CrmLifecycleStage[] = [
+  "new",
+  "qualified",
+  "contacted",
+  "engaged",
+  "meeting_booked",
+];
+
+const CRM_OPPORTUNITY_STATUS_VALUES: readonly CrmOpportunityStatus[] = [
+  "open",
+  "closed",
+  "contested",
+];
+
+/** Row caps, mirroring the trace phase: a row stays a fact or is refused. */
+const MAX_ADAPTER_ID_LENGTH = 64;
+const MAX_SYNC_DETAIL_LENGTH = 280;
+const MAX_SYNC_REASON_LENGTH = 280;
+const MAX_SYNC_NOTE_LENGTH = 1000;
+const MAX_SYNC_DIGEST_LENGTH = 64;
+
+/** Declared limits, re-checked by the domain; storage refuses out-of-range. */
+const MAX_SYNC_OPERATIONS = 500;
+
+function isStoredIntegrationSystem(value: string): value is IntegrationSystem {
+  return (INTEGRATION_SYSTEMS as readonly string[]).includes(value);
+}
+
+function isStoredIntegrationScope(value: string): value is IntegrationPermissionScope {
+  return (INTEGRATION_PERMISSION_SCOPES as readonly string[]).includes(value);
+}
+
+function isStoredCrmSyncStatus(value: string): value is CrmSyncStatus {
+  return (CRM_SYNC_STATUS_VALUES as readonly string[]).includes(value);
+}
+
+function isStoredCrmSyncFailure(value: string): value is CrmSyncFailureCode {
+  return (CRM_SYNC_FAILURE_CODES as readonly string[]).includes(value);
+}
+
+/**
+ * Structural validation of a prepared change-set, independent of any caller.
+ *
+ * The service derives this document from the workspace's own rows, so the
+ * deep field values are already typed facts by the time they arrive here;
+ * what storage re-checks is what makes a *stored* payload approvable: the
+ * subject account matches, the vocabulary members are the published ones,
+ * the caps hold, and **every operation names at least one source row** — a
+ * change-set without provenance could not be audited against anything, so it
+ * is refused rather than frozen into an approvable document. Returns the
+ * refusal message, or `null` when the document is storable.
+ */
+function validateCrmChangeSet(value: unknown, accountId: EntityId): string | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return "changeSet must be an object";
+  }
+  const changeSet = value as {
+    accountId?: unknown;
+    accountName?: unknown;
+    source?: unknown;
+    sourceReference?: unknown;
+    revenuePlanId?: unknown;
+    revenueGoalId?: unknown;
+    operations?: unknown;
+  };
+  if (changeSet.accountId !== accountId) {
+    return "changeSet must be derived for the account being synchronized";
+  }
+  if (typeof changeSet.accountName !== "string" || changeSet.accountName.trim() === "") {
+    return "changeSet.accountName is required";
+  }
+  if (changeSet.accountName.length > 500) {
+    return "changeSet.accountName must be at most 500 characters";
+  }
+  const sources = ["manual", "csv", "approved_integration"];
+  if (typeof changeSet.source !== "string" || !sources.includes(changeSet.source)) {
+    return "changeSet.source is not a record source";
+  }
+  if (
+    changeSet.sourceReference !== null &&
+    (typeof changeSet.sourceReference !== "string" || changeSet.sourceReference.length > 500)
+  ) {
+    return "changeSet.sourceReference must be null or at most 500 characters";
+  }
+  if (
+    changeSet.revenuePlanId !== null &&
+    (typeof changeSet.revenuePlanId !== "string" || changeSet.revenuePlanId === "")
+  ) {
+    return "changeSet.revenuePlanId must be null or an id";
+  }
+  if (
+    changeSet.revenueGoalId !== null &&
+    (typeof changeSet.revenueGoalId !== "string" || changeSet.revenueGoalId === "")
+  ) {
+    return "changeSet.revenueGoalId must be null or an id";
+  }
+  if (!Array.isArray(changeSet.operations)) {
+    return "changeSet.operations must be an array";
+  }
+  if (changeSet.operations.length === 0) {
+    return "changeSet.operations must contain at least one operation";
+  }
+  if (changeSet.operations.length > MAX_SYNC_OPERATIONS) {
+    return `changeSet.operations must contain at most ${MAX_SYNC_OPERATIONS} operations`;
+  }
+
+  const instant = (value: unknown): boolean =>
+    typeof value === "string" && !Number.isNaN(Date.parse(value));
+  const nonEmpty = (value: unknown, max: number): boolean =>
+    typeof value === "string" && value.trim() !== "" && value.length <= max;
+  const nullableString = (value: unknown, max: number): boolean =>
+    value === null || (typeof value === "string" && value.length <= max);
+  const identifier = (value: unknown): boolean =>
+    typeof value === "string" && value.trim() !== "" && value.length <= 128;
+
+  for (const raw of changeSet.operations) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      return "every operation must be an object";
+    }
+    const op = raw as {
+      kind?: unknown;
+      derivedFrom?: unknown;
+      contactId?: unknown;
+      fullName?: unknown;
+      email?: unknown;
+      jobTitle?: unknown;
+      source?: unknown;
+      sourceReference?: unknown;
+      activityKind?: unknown;
+      occurredAt?: unknown;
+      detail?: unknown;
+      stage?: unknown;
+      reason?: unknown;
+      status?: unknown;
+      qualificationId?: unknown;
+      body?: unknown;
+      classificationId?: unknown;
+      intent?: unknown;
+      confidence?: unknown;
+      recommendedNextAction?: unknown;
+    };
+    if (
+      typeof op.kind !== "string" ||
+      !CRM_OPERATION_KIND_VALUES.includes(op.kind as CrmOperationKind)
+    ) {
+      return "operation kind is not part of the CRM vocabulary";
+    }
+    // Provenance is mandatory: an operation with no source row is a claim.
+    if (!Array.isArray(op.derivedFrom) || op.derivedFrom.length === 0) {
+      return "every operation must name the stored rows it was derived from";
+    }
+    for (const ref of op.derivedFrom) {
+      if (
+        typeof ref !== "object" ||
+        ref === null ||
+        typeof (ref as { kind?: unknown }).kind !== "string" ||
+        (ref as { kind: string }).kind.trim() === "" ||
+        !identifier((ref as { id?: unknown }).id)
+      ) {
+        return "derivedFrom entries must name a kind and an id";
+      }
+    }
+    switch (op.kind) {
+      case "upsert_contact":
+        if (!identifier(op.contactId)) return "upsert_contact requires a contactId";
+        if (!nonEmpty(op.fullName, 200)) return "upsert_contact requires a fullName";
+        if (op.email !== null && !nonEmpty(op.email, 320)) {
+          return "upsert_contact email must be null or at most 320 characters";
+        }
+        if (op.jobTitle !== null && !nonEmpty(op.jobTitle, 200)) {
+          return "upsert_contact jobTitle must be null or at most 200 characters";
+        }
+        if (
+          typeof op.source !== "string" ||
+          !["manual", "csv", "approved_integration"].includes(op.source)
+        ) {
+          return "upsert_contact source is not a record source";
+        }
+        if (!nullableString(op.sourceReference, 500)) {
+          return "upsert_contact sourceReference must be null or at most 500 characters";
+        }
+        break;
+      case "create_activity":
+        if (op.activityKind !== "message_sent" && op.activityKind !== "meeting_recorded") {
+          return "create_activity activityKind must be message_sent or meeting_recorded";
+        }
+        if (!instant(op.occurredAt)) return "create_activity requires an occurredAt instant";
+        if (!nonEmpty(op.detail, MAX_SYNC_DETAIL_LENGTH)) {
+          return `create_activity detail must be 1 to ${MAX_SYNC_DETAIL_LENGTH} characters`;
+        }
+        break;
+      case "update_lifecycle_stage":
+        if (
+          typeof op.stage !== "string" ||
+          !CRM_LIFECYCLE_STAGE_VALUES.includes(op.stage as CrmLifecycleStage)
+        ) {
+          return "update_lifecycle_stage stage is not a lifecycle stage";
+        }
+        if (!nonEmpty(op.reason, MAX_SYNC_DETAIL_LENGTH)) {
+          return `update_lifecycle_stage reason must be 1 to ${MAX_SYNC_DETAIL_LENGTH} characters`;
+        }
+        break;
+      case "update_opportunity_status":
+        if (
+          typeof op.status !== "string" ||
+          !CRM_OPPORTUNITY_STATUS_VALUES.includes(op.status as CrmOpportunityStatus)
+        ) {
+          return "update_opportunity_status status is not an opportunity status";
+        }
+        if (!identifier(op.qualificationId)) {
+          return "update_opportunity_status requires its qualificationId";
+        }
+        break;
+      case "attach_note":
+        if (!identifier(op.qualificationId)) return "attach_note requires its qualificationId";
+        if (!nonEmpty(op.body, MAX_SYNC_NOTE_LENGTH)) {
+          return `attach_note body must be 1 to ${MAX_SYNC_NOTE_LENGTH} characters`;
+        }
+        break;
+      case "sync_conversation":
+        if (!identifier(op.classificationId)) {
+          return "sync_conversation requires its classificationId";
+        }
+        if (!identifier(op.contactId)) return "sync_conversation requires a contactId";
+        if (!instant(op.occurredAt)) return "sync_conversation requires an occurredAt instant";
+        if (!nonEmpty(op.intent, 64)) return "sync_conversation requires an intent";
+        if (!nonEmpty(op.confidence, 64)) return "sync_conversation requires a confidence";
+        if (!nonEmpty(op.recommendedNextAction, 64)) {
+          return "sync_conversation requires a recommendedNextAction";
+        }
+        break;
+    }
+  }
+  return null;
+}
+
 /**
  * Phase 2 migration.
  *
@@ -424,7 +727,7 @@ function isStoredExperimentStatus(value: string): value is ExperimentStatus {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 19;
+export const LATEST_SCHEMA_VERSION = 20;
 
 export interface DbState {
   schemaVersion?: number;
@@ -471,6 +774,9 @@ export interface DbState {
   experiments?: Experiment[];
   experimentArms?: ExperimentArm[];
   experimentEvents?: ExperimentEvent[];
+  integrationConnections?: IntegrationConnection[];
+  crmSyncRequests?: CrmSyncRequest[];
+  crmSyncEvents?: CrmSyncEvent[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -522,6 +828,9 @@ export function emptyState(): CompleteDbState {
     experiments: [],
     experimentArms: [],
     experimentEvents: [],
+    integrationConnections: [],
+    crmSyncRequests: [],
+    crmSyncEvents: [],
   };
 }
 
@@ -814,6 +1123,28 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.experimentEvents;
   }
 
+  // Phase 23 adds the integration connections and the prepared CRM syncs the
+  // CRM boundary works with: one row per workspace-to-adapter link with its
+  // granted permission scopes, one row per prepared Level 2 sync, one
+  // append-only row per lifecycle transition. Additive like every step before
+  // it: a Phase 22 document gains three empty tables and keeps every
+  // experiment it could already derive, because the upgrade adds no way to
+  // *reach* anything — a sync is prepared, approved by a person and executed
+  // through an adapter that performs no network I/O. Nothing before it is
+  // touched, no row is rewritten, and no stored result appears: the change-set
+  // is derived at prepare time and frozen, so there is nothing to migrate.
+  if (version >= 20) {
+    state.integrationConnections = Array.isArray(input.integrationConnections)
+      ? input.integrationConnections
+      : base.integrationConnections;
+    state.crmSyncRequests = Array.isArray(input.crmSyncRequests)
+      ? input.crmSyncRequests
+      : base.crmSyncRequests;
+    state.crmSyncEvents = Array.isArray(input.crmSyncEvents)
+      ? input.crmSyncEvents
+      : base.crmSyncEvents;
+  }
+
   return state;
 }
 
@@ -876,6 +1207,9 @@ type RowTable =
   | "experiments"
   | "experimentArms"
   | "experimentEvents"
+  | "integrationConnections"
+  | "crmSyncRequests"
+  | "crmSyncEvents"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -907,6 +1241,7 @@ const COST_EXECUTION_KINDS: readonly CostExecutionKind[] = [
   "outbound_send",
   "meeting_booking",
   "agent_run",
+  "crm_sync",
 ];
 /** The currencies this repository accepts — one per workspace, never mixed. */
 const COST_CURRENCIES = ["USD", "EUR", "GBP", "JPY"] as const;
@@ -4671,6 +5006,8 @@ export class Store {
           return this.findById("meetings", event.executionId);
         case "agent_run":
           return this.findById("agentTraceRuns", event.executionId);
+        case "crm_sync":
+          return this.findById("crmSyncRequests", event.executionId);
       }
     })();
     if (subject === null || subject.workspaceId !== input.workspaceId) {
@@ -6000,6 +6337,614 @@ export class Store {
       );
     });
   }
+
+  // Phase 23 — CRM Integrations (ROADMAP.md §30)
+  //
+  // A connection records which adapter a workspace connected and which
+  // permission scopes it granted — never a credential, and never a status a
+  // caller may choose. A sync request is a Level 2 external action
+  // (`DEALORA_BLUEPRINT.md` §17): the change-set is derived server-side at
+  // prepare time and frozen, the decision binds to its digest, and only an
+  // adapter's own confirmation can mark it executed. Identity and timestamps
+  // are always the session's and the server's; a body carrying `status`,
+  // `decision`, `decidedBy`, `executedBy` or `createdAt` is refused here
+  // rather than believed.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Connect one adapter to this workspace with an explicit scope grant.
+   *
+   * The scope list is validated against the closed catalog storage publishes
+   * independently of any adapter, so a grant can never smuggle an unknown
+   * scope name; whether the adapter itself declares those scopes is the
+   * registry's answer, checked again by the service. One connection per
+   * adapter per workspace — the UNIQUE pair keeps "what is this workspace
+   * connected to" with exactly one answer.
+   */
+  connectIntegration(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    adapterId: string;
+    system: string;
+    grantedScopes: readonly string[];
+  }): Result<IntegrationConnection, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+
+    const adapterId = typeof input.adapterId === "string" ? input.adapterId.trim() : "";
+    if (adapterId === "" || adapterId.length > MAX_ADAPTER_ID_LENGTH) {
+      return {
+        ok: false,
+        error: toError("INVALID", `adapterId must be 1 to ${MAX_ADAPTER_ID_LENGTH} characters`),
+      };
+    }
+    if (typeof input.system !== "string" || !isStoredIntegrationSystem(input.system)) {
+      return { ok: false, error: toError("INVALID", "unknown integration system") };
+    }
+    if (!Array.isArray(input.grantedScopes) || input.grantedScopes.length === 0) {
+      return {
+        ok: false,
+        error: toError("INVALID", "at least one permission scope must be granted"),
+      };
+    }
+    const scopes: IntegrationPermissionScope[] = [];
+    for (const entry of input.grantedScopes) {
+      if (typeof entry !== "string" || !isStoredIntegrationScope(entry)) {
+        return { ok: false, error: toError("INVALID", "unknown permission scope") };
+      }
+      if (scopes.includes(entry)) {
+        return { ok: false, error: toError("INVALID", "duplicate permission scope") };
+      }
+      scopes.push(entry);
+    }
+
+    const existing = this.rows("integrationConnections").find(
+      (row) => row.workspaceId === input.workspaceId && row.adapterId === adapterId,
+    );
+    if (existing) {
+      return {
+        ok: false,
+        error: toError("CONFLICT", "this adapter is already connected in this workspace"),
+      };
+    }
+
+    const stamp = toDateTime(now());
+    const row: IntegrationConnection = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      adapterId,
+      system: input.system,
+      grantedScopes: scopes,
+      status: "active",
+      createdBy: input.userId,
+      createdAt: stamp,
+      revokedBy: null,
+      revokedAt: null,
+    };
+    this.mutate("integrationConnections", (rows) => (rows as IntegrationConnection[]).push(row));
+    return { ok: true, value: row };
+  }
+
+  /** One connection in this workspace, or `null` when it is not here. */
+  getIntegrationConnection(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    connectionId: EntityId;
+  }): Result<IntegrationConnection | null, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("integrationConnections").find(
+      (row) => row.id === input.connectionId && row.workspaceId === input.workspaceId,
+    );
+    return { ok: true, value: found ?? null };
+  }
+
+  /** Every connection in this workspace, connected-at then id. */
+  listIntegrationConnections(
+    workspaceId: EntityId,
+    userId: EntityId,
+  ): Result<IntegrationConnection[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const scoped = this.rows("integrationConnections").filter(
+      (row) => row.workspaceId === workspaceId,
+    );
+    return {
+      ok: true,
+      value: [...scoped].sort((a, b) => {
+        if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      }),
+    };
+  }
+
+  /**
+   * Revoke a connection — terminal, so an approved-but-unexecuted sync can
+   * never ride a connection back into scope. Revocation is the only state
+   * change a connection accepts; there is no re-activation path.
+   */
+  revokeIntegrationConnection(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    connectionId: EntityId;
+  }): Result<IntegrationConnection, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("integrationConnections").find(
+      (row) => row.id === input.connectionId && row.workspaceId === input.workspaceId,
+    );
+    if (!found) {
+      return { ok: false, error: toError("NOT_FOUND", "connection not found") };
+    }
+    if (found.status === "revoked") {
+      return { ok: false, error: toError("CONFLICT", "this connection is already revoked") };
+    }
+    const stamp = toDateTime(now());
+    const next: IntegrationConnection = {
+      ...found,
+      status: "revoked",
+      revokedBy: input.userId,
+      revokedAt: stamp,
+    };
+    this.mutate("integrationConnections", (rows) => {
+      const typed = rows as IntegrationConnection[];
+      const index = typed.findIndex((row) => row.id === next.id);
+      typed.splice(index, 1, next);
+    });
+    return { ok: true, value: next };
+  }
+
+  /**
+   * Freeze one derived change-set as a prepared Level 2 action.
+   *
+   * The change-set arrives already derived by the service from this
+   * workspace's own rows; storage re-validates its shape, its caps and its
+   * provenance — every operation must name at least one source row — so a
+   * document without provenance or beyond the published caps is refused
+   * rather than stored as an approvable payload. Nothing about the row's
+   * status, decision or identity is caller-writable: it starts `prepared`
+   * with the session as its author.
+   */
+  prepareCrmSync(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    connectionId: EntityId;
+    accountId: EntityId;
+    changeSet: CrmChangeSet;
+    previewDigest: string;
+  }): Result<CrmSyncRequest, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+
+    const connection = this.rows("integrationConnections").find(
+      (row) => row.id === input.connectionId && row.workspaceId === input.workspaceId,
+    );
+    if (!connection) {
+      return { ok: false, error: toError("NOT_FOUND", "connection not found") };
+    }
+    if (connection.status !== "active") {
+      return { ok: false, error: toError("CONFLICT", "this connection is revoked") };
+    }
+    const account = this.findById("accounts", input.accountId);
+    if (!account || account.workspaceId !== input.workspaceId) {
+      return { ok: false, error: toError("NOT_FOUND", "account not found") };
+    }
+    if (account.status !== "active") {
+      return {
+        ok: false,
+        error: toError("INVALID", "archived accounts are not synchronized to a CRM"),
+      };
+    }
+    const invalidChangeSet = validateCrmChangeSet(input.changeSet, input.accountId);
+    if (invalidChangeSet !== null) {
+      return { ok: false, error: toError("INVALID", invalidChangeSet) };
+    }
+    const digest = typeof input.previewDigest === "string" ? input.previewDigest.trim() : "";
+    if (digest === "" || digest.length > MAX_SYNC_DIGEST_LENGTH) {
+      return {
+        ok: false,
+        error: toError(
+          "INVALID",
+          `previewDigest must be 1 to ${MAX_SYNC_DIGEST_LENGTH} characters`,
+        ),
+      };
+    }
+
+    const stamp = toDateTime(now());
+    const row: CrmSyncRequest = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      connectionId: connection.id,
+      accountId: account.id,
+      changeSet: input.changeSet,
+      previewDigest: digest,
+      status: "prepared",
+      decision: null,
+      decidedBy: null,
+      decidedAt: null,
+      decisionReason: null,
+      executedBy: null,
+      executedAt: null,
+      providerReference: null,
+      failureCode: null,
+      failureMessage: null,
+      cancelledBy: null,
+      cancelledAt: null,
+      cancelReason: null,
+      createdBy: input.userId,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    this.mutate("crmSyncRequests", (rows) => (rows as CrmSyncRequest[]).push(row));
+    this.appendCrmSyncEvent(
+      input.workspaceId,
+      input.userId,
+      row.id,
+      "prepared",
+      `${input.changeSet.operations.length} operation(s) prepared for review`,
+    );
+    return { ok: true, value: row };
+  }
+
+  /** One prepared sync in this workspace, or `null` when it is not here. */
+  getCrmSync(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    syncId: EntityId;
+  }): Result<CrmSyncRequest | null, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("crmSyncRequests").find(
+      (row) => row.id === input.syncId && row.workspaceId === input.workspaceId,
+    );
+    return { ok: true, value: found ?? null };
+  }
+
+  /**
+   * One sync resolved by id alone, authorized against its own workspace.
+   *
+   * Reported as not found for a foreign id, exactly like `getMeeting`, so a
+   * cost filed against another tenant's execution is indistinguishable from
+   * one that was never issued. This is the cost engine's existence gate.
+   */
+  getCrmSyncById(id: EntityId, userId: EntityId): Result<CrmSyncRequest, StorageError> {
+    const sync = this.findById("crmSyncRequests", id);
+    if (!sync) return { ok: false, error: toError("NOT_FOUND", "crm sync not found") };
+    const auth = this.requireWorkspace(sync.workspaceId, userId);
+    if (!auth.ok) return { ok: false, error: toError("NOT_FOUND", "crm sync not found") };
+    return { ok: true, value: sync };
+  }
+
+  /** Every sync in this workspace, optionally narrowed, prepared-at then id. */
+  listCrmSyncs(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: { status?: CrmSyncStatus; accountId?: EntityId },
+  ): Result<CrmSyncRequest[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    if (filter?.status !== undefined && !isStoredCrmSyncStatus(filter.status)) {
+      return { ok: false, error: toError("INVALID", "unknown crm sync status") };
+    }
+    const scoped = this.rows("crmSyncRequests").filter(
+      (row) =>
+        row.workspaceId === workspaceId &&
+        (filter?.status === undefined || row.status === filter.status) &&
+        (filter?.accountId === undefined || row.accountId === filter.accountId),
+    );
+    return {
+      ok: true,
+      value: [...scoped].sort((a, b) => {
+        if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      }),
+    };
+  }
+
+  /**
+   * Record a human decision on a prepared sync.
+   *
+   * Only `prepared` can be decided — a decision is once — and the digest the
+   * caller re-derived must still equal the one the row was prepared with, so
+   * a change-set that no longer matches what was previewed is refused instead
+   * of decided. `rejected` must say why; `approved` may stay silent, exactly
+   * as Phase 10's approval request. The decision instant and actor are the
+   * server's and the session's.
+   */
+  decideCrmSync(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    syncId: EntityId;
+    decision: string;
+    reason: string | null;
+    previewDigest: string;
+  }): Result<CrmSyncRequest, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("crmSyncRequests").find(
+      (row) => row.id === input.syncId && row.workspaceId === input.workspaceId,
+    );
+    if (!found) {
+      return { ok: false, error: toError("NOT_FOUND", "crm sync not found") };
+    }
+    if (found.status !== "prepared") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this sync is already ${found.status}`),
+      };
+    }
+    if (
+      typeof input.decision !== "string" ||
+      !(CRM_SYNC_DECISION_VALUES as readonly string[]).includes(input.decision)
+    ) {
+      return { ok: false, error: toError("INVALID", "decision must be approved or rejected") };
+    }
+    if (input.previewDigest !== found.previewDigest) {
+      return {
+        ok: false,
+        error: toError("CONFLICT", "the change-set no longer matches what was previewed"),
+      };
+    }
+    let reason: string | null = null;
+    if (input.reason !== null && input.reason !== undefined) {
+      if (typeof input.reason !== "string") {
+        return { ok: false, error: toError("INVALID", "reason must be null or a string") };
+      }
+      const trimmed = input.reason.trim();
+      if (trimmed.length > MAX_SYNC_REASON_LENGTH) {
+        return {
+          ok: false,
+          error: toError("INVALID", `reason must be at most ${MAX_SYNC_REASON_LENGTH} characters`),
+        };
+      }
+      reason = trimmed === "" ? null : trimmed;
+    }
+    if (input.decision === "rejected" && reason === null) {
+      return { ok: false, error: toError("INVALID", "a rejection must say why") };
+    }
+
+    const stamp = toDateTime(now());
+    const decision = input.decision as CrmSyncDecision;
+    const next: CrmSyncRequest = {
+      ...found,
+      status: decision === "approved" ? "approved" : "rejected",
+      decision,
+      decidedBy: input.userId,
+      decidedAt: stamp,
+      decisionReason: reason,
+      updatedAt: stamp,
+    };
+    this.replaceCrmSync(next);
+    this.appendCrmSyncEvent(
+      input.workspaceId,
+      input.userId,
+      next.id,
+      decision === "approved" ? "approved" : "rejected",
+      reason,
+    );
+    return { ok: true, value: next };
+  }
+
+  /**
+   * Record the outcome of one execution attempt against the adapter.
+   *
+   * Only an `approved` (or previously `failed`) sync may be attempted, so no
+   * status can reach an execution column without a person's decision. On
+   * confirmation, the adapter's own reference is stored and the failure
+   * columns are cleared; on a refusal, the closed failure code is stored and
+   * no reference is invented. Every attempt leaves an event, so a retry after
+   * a failure stays visible as two attempts rather than being overwritten.
+   */
+  recordCrmSyncOutcome(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    syncId: EntityId;
+    outcome: string;
+    providerReference: string | null;
+    failureCode: string | null;
+    failureMessage: string | null;
+  }): Result<CrmSyncRequest, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("crmSyncRequests").find(
+      (row) => row.id === input.syncId && row.workspaceId === input.workspaceId,
+    );
+    if (!found) {
+      return { ok: false, error: toError("NOT_FOUND", "crm sync not found") };
+    }
+    if (found.status !== "approved" && found.status !== "failed") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `a ${found.status} sync cannot be executed`),
+      };
+    }
+    if (input.outcome !== "executed" && input.outcome !== "failed") {
+      return { ok: false, error: toError("INVALID", "outcome must be executed or failed") };
+    }
+
+    const stamp = toDateTime(now());
+    if (input.outcome === "executed") {
+      const reference =
+        typeof input.providerReference === "string" ? input.providerReference.trim() : "";
+      if (reference === "" || reference.length > MAX_SYNC_DETAIL_LENGTH) {
+        return {
+          ok: false,
+          error: toError(
+            "INVALID",
+            `providerReference must be 1 to ${MAX_SYNC_DETAIL_LENGTH} characters`,
+          ),
+        };
+      }
+      const next: CrmSyncRequest = {
+        ...found,
+        status: "executed",
+        executedBy: input.userId,
+        executedAt: stamp,
+        providerReference: reference,
+        failureCode: null,
+        failureMessage: null,
+        updatedAt: stamp,
+      };
+      this.replaceCrmSync(next);
+      this.appendCrmSyncEvent(
+        input.workspaceId,
+        input.userId,
+        next.id,
+        "executed",
+        `confirmed by the adapter as ${reference}`,
+      );
+      return { ok: true, value: next };
+    }
+
+    if (typeof input.failureCode !== "string" || !isStoredCrmSyncFailure(input.failureCode)) {
+      return { ok: false, error: toError("INVALID", "unknown failure code") };
+    }
+    let message: string | null = null;
+    if (input.failureMessage !== null && input.failureMessage !== undefined) {
+      if (typeof input.failureMessage !== "string") {
+        return { ok: false, error: toError("INVALID", "failureMessage must be null or a string") };
+      }
+      const trimmed = input.failureMessage.trim();
+      if (trimmed.length > MAX_SYNC_DETAIL_LENGTH) {
+        return {
+          ok: false,
+          error: toError(
+            "INVALID",
+            `failureMessage must be at most ${MAX_SYNC_DETAIL_LENGTH} characters`,
+          ),
+        };
+      }
+      message = trimmed === "" ? null : trimmed;
+    }
+    const next: CrmSyncRequest = {
+      ...found,
+      status: "failed",
+      executedBy: input.userId,
+      executedAt: stamp,
+      providerReference: null,
+      failureCode: input.failureCode,
+      failureMessage: message,
+      updatedAt: stamp,
+    };
+    this.replaceCrmSync(next);
+    this.appendCrmSyncEvent(
+      input.workspaceId,
+      input.userId,
+      next.id,
+      "failed",
+      message === null ? next.failureCode : `${next.failureCode}: ${message}`,
+    );
+    return { ok: true, value: next };
+  }
+
+  /**
+   * Withdraw a sync before any execution. Allowed from `prepared` and from
+   * `approved` — a person may change their mind up to the moment the adapter
+   * is reached — and terminal afterwards. A rejection is the reviewer's; a
+   * cancellation is the requester's; both leave their own event.
+   */
+  cancelCrmSync(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    syncId: EntityId;
+    reason: string | null;
+  }): Result<CrmSyncRequest, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("crmSyncRequests").find(
+      (row) => row.id === input.syncId && row.workspaceId === input.workspaceId,
+    );
+    if (!found) {
+      return { ok: false, error: toError("NOT_FOUND", "crm sync not found") };
+    }
+    if (found.status !== "prepared" && found.status !== "approved") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `a ${found.status} sync cannot be cancelled`),
+      };
+    }
+    let reason: string | null = null;
+    if (input.reason !== null && input.reason !== undefined) {
+      if (typeof input.reason !== "string") {
+        return { ok: false, error: toError("INVALID", "reason must be null or a string") };
+      }
+      const trimmed = input.reason.trim();
+      if (trimmed.length > MAX_SYNC_REASON_LENGTH) {
+        return {
+          ok: false,
+          error: toError("INVALID", `reason must be at most ${MAX_SYNC_REASON_LENGTH} characters`),
+        };
+      }
+      reason = trimmed === "" ? null : trimmed;
+    }
+
+    const stamp = toDateTime(now());
+    const next: CrmSyncRequest = {
+      ...found,
+      status: "cancelled",
+      cancelReason: reason,
+      cancelledBy: input.userId,
+      cancelledAt: stamp,
+      updatedAt: stamp,
+    };
+    this.replaceCrmSync(next);
+    this.appendCrmSyncEvent(input.workspaceId, input.userId, next.id, "cancelled", reason);
+    return { ok: true, value: next };
+  }
+
+  /** One sync's append-only lifecycle trail, in the order it was written. */
+  listCrmSyncEvents(
+    workspaceId: EntityId,
+    userId: EntityId,
+    syncId: EntityId,
+  ): Result<CrmSyncEvent[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const exists = this.rows("crmSyncRequests").find(
+      (row) => row.id === syncId && row.workspaceId === workspaceId,
+    );
+    if (!exists) {
+      return { ok: false, error: toError("NOT_FOUND", "crm sync not found") };
+    }
+    return {
+      ok: true,
+      value: this.rows("crmSyncEvents").filter(
+        (row) => row.workspaceId === workspaceId && row.crmSyncId === syncId,
+      ),
+    };
+  }
+
+  /** One append-only audit record for a CRM sync. Written by the server. */
+  private appendCrmSyncEvent(
+    workspaceId: EntityId,
+    actorUserId: EntityId,
+    crmSyncId: EntityId,
+    kind: CrmSyncEventKind,
+    detail: string | null,
+  ): void {
+    const row: CrmSyncEvent = {
+      id: newId(),
+      workspaceId,
+      crmSyncId,
+      actorUserId,
+      kind,
+      detail,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("crmSyncEvents", (rows) => (rows as CrmSyncEvent[]).push(row));
+  }
+
+  /** Replace one sync row in place, preserving insertion order. */
+  private replaceCrmSync(next: CrmSyncRequest): void {
+    this.mutate("crmSyncRequests", (rows) => {
+      const typed = rows as CrmSyncRequest[];
+      typed.splice(
+        typed.findIndex((row) => row.id === next.id),
+        1,
+        next,
+      );
+    });
+  }
 }
 
 /** Default single-process store for local runs. */
@@ -6174,6 +7119,19 @@ export const db = {
   closeExperiment: store.closeExperiment.bind(store),
   cancelExperiment: store.cancelExperiment.bind(store),
   listExperimentEvents: store.listExperimentEvents.bind(store),
+
+  connectIntegration: store.connectIntegration.bind(store),
+  getIntegrationConnection: store.getIntegrationConnection.bind(store),
+  listIntegrationConnections: store.listIntegrationConnections.bind(store),
+  revokeIntegrationConnection: store.revokeIntegrationConnection.bind(store),
+  prepareCrmSync: store.prepareCrmSync.bind(store),
+  getCrmSync: store.getCrmSync.bind(store),
+  getCrmSyncById: store.getCrmSyncById.bind(store),
+  listCrmSyncs: store.listCrmSyncs.bind(store),
+  decideCrmSync: store.decideCrmSync.bind(store),
+  recordCrmSyncOutcome: store.recordCrmSyncOutcome.bind(store),
+  cancelCrmSync: store.cancelCrmSync.bind(store),
+  listCrmSyncEvents: store.listCrmSyncEvents.bind(store),
 
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),

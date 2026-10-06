@@ -26,6 +26,7 @@
     { "path": "packages/trace" },
     { "path": "packages/api" },
     { "path": "packages/optimization" },
-    { "path": "packages/experiment" }
+    { "path": "packages/experiment" },
+    { "path": "packages/integration" }
   ]
 }

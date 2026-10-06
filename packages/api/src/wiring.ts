@@ -66,6 +66,12 @@ import { createTraceService } from "@dealora/trace";
 import type { TraceLookup } from "@dealora/trace";
 import { createExperimentService } from "@dealora/experiment";
 import type { ExperimentStoreAdapter } from "@dealora/experiment";
+import {
+  createIntegrationRegistry,
+  createIntegrationService,
+  SandboxCrmAdapter,
+} from "@dealora/integration";
+import type { IntegrationAdapter, IntegrationStoreAdapter } from "@dealora/integration";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -100,6 +106,21 @@ export function createDefaultHandlers(options?: {
    * integrations in Phase 23.
    */
   calendarProviders?: readonly MeetingCalendarProvider[];
+  /**
+   * The adapters this deployment registers for the Phase 23 integration
+   * boundary (ROADMAP.md §30).
+   *
+   * Nothing is registered by default beyond the **sandbox** CRM adapter,
+   * which performs no network I/O at all and records what it accepted. That
+   * is deliberate: no CRM credential exists in this repository, and an
+   * adapter that pretended to sync would make the phase's central claim
+   * unverifiable. Supplying a list **replaces** the default — including an
+   * empty one, because a deployment that configured no adapter must reach
+   * the "not configured" refusal rather than silently receiving a sandbox.
+   * The boundary resolves adapters only by id through the registry, so
+   * adding a vendor is this decision, never a code change.
+   */
+  integrationAdapters?: readonly IntegrationAdapter[];
 }): ReturnType<typeof createHandlers> {
   const identity: IdentityService = {
     signup,
@@ -150,6 +171,7 @@ export function createDefaultHandlers(options?: {
     getResearchRequest: store.getResearchRequest.bind(store),
     getOutboundAction: store.getOutboundAction.bind(store),
     getMeeting: store.getMeeting.bind(store),
+    getCrmSyncById: store.getCrmSyncById.bind(store),
     /**
      * Phase 20's `agent_run` execution kind, resolved through the store's own
      * workspace-scoped read. The gate in `@dealora/cost` compares the returned
@@ -316,6 +338,40 @@ export function createDefaultHandlers(options?: {
   };
 
   const experiment = createExperimentService(experimentStore);
+
+  /**
+   * The integration boundary: it prepares a change-set from the workspace's
+   * own rows, binds a person's decision to its digest, and reaches exactly
+   * one registered adapter — which performs no network I/O. It is given no
+   * sender, no scheduler, no model, no credential and no way to approve its
+   * own sync: the strongest thing it can do is record what the adapter
+   * confirmed.
+   */
+  const integrationStore: IntegrationStoreAdapter = {
+    authorize: store.authorize.bind(store),
+    connectIntegration: store.connectIntegration.bind(store),
+    getIntegrationConnection: store.getIntegrationConnection.bind(store),
+    listIntegrationConnections: store.listIntegrationConnections.bind(store),
+    revokeIntegrationConnection: store.revokeIntegrationConnection.bind(store),
+    prepareCrmSync: store.prepareCrmSync.bind(store),
+    getCrmSync: store.getCrmSync.bind(store),
+    listCrmSyncs: store.listCrmSyncs.bind(store),
+    decideCrmSync: store.decideCrmSync.bind(store),
+    recordCrmSyncOutcome: store.recordCrmSyncOutcome.bind(store),
+    cancelCrmSync: store.cancelCrmSync.bind(store),
+    listCrmSyncEvents: store.listCrmSyncEvents.bind(store),
+    getAccount: store.getAccount.bind(store),
+    listContacts: store.listContacts.bind(store),
+    listQualifications: store.listQualifications.bind(store),
+    listOutboundActions: store.listOutboundActions.bind(store),
+    listConversationClassifications: store.listConversationClassifications.bind(store),
+    listMeetings: store.listMeetings.bind(store),
+  };
+
+  const integration = createIntegrationService(
+    integrationStore,
+    createIntegrationRegistry(options?.integrationAdapters ?? [new SandboxCrmAdapter()]),
+  );
 
   const deps: HandlerDeps = {
     identity,
@@ -677,6 +733,7 @@ export function createDefaultHandlers(options?: {
      */
     trace,
     experiment,
+    integration,
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());

@@ -5247,10 +5247,51 @@ describe("agent trace runs and events", () => {
     expect(migrated.users).toEqual(document.users);
   });
 
+  it("migrates a v19 document forward by adding only the integration tables", () => {
+    // A real v19-era document with a row before the migration, so the
+    // "nothing before it is rewritten" claim is checked against data.
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspace = store.createWorkspace({ ownerId: owner.id, name: "Migrate" });
+    if (!isOk(workspace)) throw new Error("workspace failed");
+    const experiment = store.createExperiment({
+      workspaceId: workspace.value.id,
+      userId: owner.id,
+      name: "A/B",
+      metric: "positive_reply_rate",
+      durationDays: 14,
+    });
+    if (!isOk(experiment)) throw new Error("experiment failed");
+    const document = JSON.parse(JSON.stringify(store.db)) as typeof store.db;
+    // A v19 document genuinely does not carry the three Phase 23 tables, so
+    // they are omitted from the object rather than set to `undefined`:
+    // `DbState` declares them optional, so the rest of the document is
+    // already a valid v19 state.
+    const {
+      integrationConnections: _omittedConnections,
+      crmSyncRequests: _omittedSyncs,
+      crmSyncEvents: _omittedSyncEvents,
+      ...before
+    } = document;
+    const v19: DbState = { ...before, schemaVersion: 19 };
+    const migrated = migrateState(v19);
+    expect(migrated.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+    // The new tables exist and start empty; nothing before them is rewritten.
+    expect(migrated.integrationConnections).toEqual([]);
+    expect(migrated.crmSyncRequests).toEqual([]);
+    expect(migrated.crmSyncEvents).toEqual([]);
+    expect(migrated.experiments).toEqual(document.experiments);
+    expect(migrated.experiments).toHaveLength(1);
+    expect(migrated.experimentArms).toEqual(document.experimentArms);
+    expect(migrated.experimentEvents).toEqual(document.experimentEvents);
+    expect(migrated.costEvents).toEqual(document.costEvents);
+    expect(migrated.users).toEqual(document.users);
+  });
+
   it("keeps the migration chain contiguous from 2 to the latest version", () => {
-    // Phase 22 appended schema v19; the pin is the current latest, so each
+    // Phase 23 appended schema v20; the pin is the current latest, so each
     // additive migration phase updates it rather than rewriting history.
-    expect(LATEST_SCHEMA_VERSION).toBe(19);
+    expect(LATEST_SCHEMA_VERSION).toBe(20);
     // Every intermediate version migrates without throwing, so no step in the
     // chain is skipped.
     for (let version = 1; version <= LATEST_SCHEMA_VERSION; version += 1) {
@@ -5267,6 +5308,9 @@ describe("agent trace runs and events", () => {
       expect(migrated.experiments).toEqual([]);
       expect(migrated.experimentArms).toEqual([]);
       expect(migrated.experimentEvents).toEqual([]);
+      expect(migrated.integrationConnections).toEqual([]);
+      expect(migrated.crmSyncRequests).toEqual([]);
+      expect(migrated.crmSyncEvents).toEqual([]);
     }
   });
 });

@@ -35,6 +35,7 @@ import type { AgentError, AgentService } from "@dealora/agent";
 import type { EvaluationError, EvaluationService } from "@dealora/evaluation";
 import { TraceService, type TraceError } from "@dealora/trace";
 import type { ExperimentError, ExperimentService } from "@dealora/experiment";
+import type { IntegrationError, IntegrationService } from "@dealora/integration";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -529,6 +530,34 @@ function fromExperimentError(error: ExperimentError): ApiError {
 }
 
 /**
+ * Map a CRM Integrations domain error onto the transport vocabulary. The
+ * mapping is exhaustive: `UNAVAILABLE` — the only code that means an internal
+ * condition — becomes a generic `SERVER_ERROR`, so storage internals never
+ * reach a client, while scope refusals travel as the `CONFLICT` they are
+ * (the connection's state, not the caller's identity).
+ */
+function fromIntegrationError(error: IntegrationError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+        return "VALIDATION_ERROR";
+      case "CONFLICT":
+        return "CONFLICT";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = [...error.details];
+  return mapped;
+}
+
+/**
  * Map a dashboard domain error onto the transport vocabulary. The mapping is
  * exhaustive: `UNAVAILABLE` — the only code that means an internal condition —
  * becomes a generic `SERVER_ERROR`, so storage internals never reach a client.
@@ -674,6 +703,7 @@ export interface HandlerDeps {
   evaluation: EvaluationService;
   trace: TraceService;
   experiment: ExperimentService;
+  integration: IntegrationService;
   resolveSession: SessionResolver;
 }
 
@@ -3666,6 +3696,184 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok(result.value) };
     });
 
+  // Phase 23 — CRM Integrations
+  // -------------------------------------------------------------------------
+
+  /** The integration rule set: systems, scopes, per-operation scopes, refusals. */
+  const getIntegrationPolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.integration.policy(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromIntegrationError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** Every adapter this deployment registered — catalog rows, no grants. */
+  const listIntegrationAdaptersHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.integration.listAdapters(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromIntegrationError(result.error) };
+      return { ok: true, value: ok({ adapters: result.value }) };
+    });
+
+  /** Connect a registered adapter with an explicit scope grant. */
+  const connectIntegrationHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.integration.connect(workspaceId, actor.userId, {
+        adapterId: body.adapterId,
+        scopes: body.scopes,
+      });
+      if (!result.ok) return { ok: false, error: fromIntegrationError(result.error) };
+      return { ok: true, value: ok({ connection: result.value }) };
+    });
+
+  /** This workspace's connections, connected-at then id. */
+  const listIntegrationConnectionsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.integration.listConnections(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromIntegrationError(result.error) };
+      return { ok: true, value: ok({ connections: result.value }) };
+    });
+
+  /** Revoke a connection — terminal, so an approved sync cannot ride it back. */
+  const disconnectIntegrationHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const connectionId = param(req, "connectionId");
+      if (isApiError(connectionId)) return { ok: false, error: connectionId };
+
+      const result = deps.integration.disconnect(workspaceId, actor.userId, connectionId);
+      if (!result.ok) return { ok: false, error: fromIntegrationError(result.error) };
+      return { ok: true, value: ok({ connection: result.value }) };
+    });
+
+  /**
+   * Prepare the derived change-set for one account as a Level 2 action.
+   * The body names the subject; the payload itself is derived from storage.
+   */
+  const prepareCrmSyncHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.integration.prepare(workspaceId, actor.userId, {
+        connectionId: body.connectionId,
+        accountId: body.accountId,
+      });
+      if (!result.ok) return { ok: false, error: fromIntegrationError(result.error) };
+      return { ok: true, value: ok({ sync: result.value }) };
+    });
+
+  /** One sync read back complete — the change-set, the digest, the state. */
+  const getCrmSyncHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const syncId = param(req, "syncId");
+      if (isApiError(syncId)) return { ok: false, error: syncId };
+
+      const result = deps.integration.get(workspaceId, actor.userId, syncId);
+      if (!result.ok) return { ok: false, error: fromIntegrationError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** Every sync in this workspace, optionally narrowed by status or account. */
+  const listCrmSyncsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.integration.list(
+        workspaceId,
+        actor.userId,
+        req.query.status,
+        req.query.accountId,
+      );
+      if (!result.ok) return { ok: false, error: fromIntegrationError(result.error) };
+      return { ok: true, value: ok({ syncs: result.value }) };
+    });
+
+  /** Record a human decision. The reviewer identity is the session's. */
+  const decideCrmSyncHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const syncId = param(req, "syncId");
+      if (isApiError(syncId)) return { ok: false, error: syncId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.integration.decide(workspaceId, actor.userId, syncId, {
+        decision: body.decision,
+        reason: body.reason,
+      });
+      if (!result.ok) return { ok: false, error: fromIntegrationError(result.error) };
+      return { ok: true, value: ok({ sync: result.value }) };
+    });
+
+  /**
+   * Execute an approved sync through its adapter. The outcome the adapter
+   * confirmed is the response: `executed` with its reference, or `failed`
+   * with a closed code — never a silent success.
+   */
+  const executeCrmSyncHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const syncId = param(req, "syncId");
+      if (isApiError(syncId)) return { ok: false, error: syncId };
+
+      const result = await deps.integration.execute(workspaceId, actor.userId, syncId);
+      if (!result.ok) return { ok: false, error: fromIntegrationError(result.error) };
+      return { ok: true, value: ok({ sync: result.value }) };
+    });
+
+  /** Withdraw a sync before execution. Terminal afterwards. */
+  const cancelCrmSyncHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const syncId = param(req, "syncId");
+      if (isApiError(syncId)) return { ok: false, error: syncId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.integration.cancel(workspaceId, actor.userId, syncId, {
+        reason: body.reason,
+      });
+      if (!result.ok) return { ok: false, error: fromIntegrationError(result.error) };
+      return { ok: true, value: ok({ sync: result.value }) };
+    });
+
+  /** One sync's append-only lifecycle trail, oldest first. */
+  const getCrmSyncHistoryHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const syncId = param(req, "syncId");
+      if (isApiError(syncId)) return { ok: false, error: syncId };
+
+      const result = deps.integration.history(workspaceId, actor.userId, syncId);
+      if (!result.ok) return { ok: false, error: fromIntegrationError(result.error) };
+      return { ok: true, value: ok({ events: result.value }) };
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -3854,6 +4062,22 @@ export function createHandlers(deps: HandlerDeps) {
     cancelExperimentHandler,
     getExperimentHistoryHandler,
     getExperimentPolicyHandler,
+
+    // -------------------------------------------------------------------------
+    // Phase 23 — CRM Integrations
+    // -------------------------------------------------------------------------
+    getIntegrationPolicyHandler,
+    listIntegrationAdaptersHandler,
+    connectIntegrationHandler,
+    listIntegrationConnectionsHandler,
+    disconnectIntegrationHandler,
+    prepareCrmSyncHandler,
+    getCrmSyncHandler,
+    listCrmSyncsHandler,
+    decideCrmSyncHandler,
+    executeCrmSyncHandler,
+    cancelCrmSyncHandler,
+    getCrmSyncHistoryHandler,
   };
 }
 

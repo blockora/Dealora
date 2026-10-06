@@ -26,6 +26,7 @@
     "@dealora/evaluation": "workspace:*",
     "@dealora/experiment": "workspace:*",
     "@dealora/goal": "workspace:*",
+    "@dealora/integration": "workspace:*",
     "@dealora/meeting": "workspace:*",
     "@dealora/nextaction": "workspace:*",
     "@dealora/outbound": "workspace:*",

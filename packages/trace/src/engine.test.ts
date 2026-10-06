@@ -237,6 +237,7 @@ describe("trace rules — no drift from the schema", () => {
       "outbound_send",
       "meeting_booking",
       "agent_run",
+      "crm_sync",
     ]);
   });
 

@@ -333,6 +333,26 @@ export const COLUMNS = {
   // across every phase that touches it. A recommendation's `risk_level` is
   // Phase 10's `DEALORA_BLUEPRINT.md` §17 vocabulary — the same ladder a
   // draft's approval request climbs — not a second scale.
+
+  // Phase 23 — CRM Integrations
+  adapterId: "adapter_id",
+  system: "system",
+  grantedScopes: "granted_scopes",
+  connectionId: "connection_id",
+  changeSet: "change_set",
+  crmSyncId: "crm_sync_id",
+  executedBy: "executed_by",
+  executedAt: "executed_at",
+  revokedBy: "revoked_by",
+  revokedAt: "revoked_at",
+  // `previewDigest`, `decision`, `decidedBy`, `decidedAt`, `decisionReason`,
+  // `providerReference`, `failureCode`, `failureMessage`, `cancelReason`,
+  // `cancelledBy`, `cancelledAt`, `status`, `kind`, `detail`, `source` and
+  // `sourceReference` are already declared above and are reused here for the
+  // same reason: one concept, one column name. A sync's preview digest is
+  // Phase 10's own binding of "the exact content a reviewer saw", and the
+  // decision pair is Phase 10's approval vocabulary — this phase adds no
+  // second scale for either.
 } as const;
 
 export type ColumnName = (typeof COLUMNS)[keyof typeof COLUMNS];
@@ -758,6 +778,38 @@ export const experimentTable = "experiments" as const;
 export const experimentArmTable = "experiment_arms" as const;
 export const experimentEventTable = "experiment_events" as const;
 
+/**
+ * Phase 23 — CRM Integrations (`ROADMAP.md` §30,
+ * `DEALORA_BLUEPRINT.md` §23/§42/§44).
+ *
+ * `integration_connections` is one row per workspace-to-adapter link: which
+ * adapter (by stable id, not a foreign key — the adapter is registered code),
+ * which §30 system, and **which permission scopes the workspace granted**.
+ * No credential of any kind is stored here — §18's OAuth requirement stays
+ * open for the first real adapter, as ADR 0011 recorded — and revocation is
+ * terminal, so a revoked connection can never quietly regain its scopes.
+ * The pair of columns `(workspace_id, adapter_id)` is unique: one connection
+ * per adapter per workspace, so "what is this workspace connected to" has one
+ * answer.
+ *
+ * `crm_sync_requests` is one prepared Level 2 action: the immutable derived
+ * change-set, the digest of the exact payload a reviewer was shown, and the
+ * decision/execution agreement columns. The CHECK pairs keep the row honest —
+ * `executed` requires an approved decision and the adapter's own reference,
+ * `failed` requires the same decision and a closed failure code, `rejected`
+ * requires a reason, and no path reaches an execution column without a
+ * person's decision first. There is deliberately no amount or value column:
+ * the Phase 4 plan's CRM policy prohibits writing an opportunity value
+ * without a human-confirmed figure.
+ *
+ * `crm_sync_events` is the append-only lifecycle trail: prepared, approved,
+ * rejected, cancelled, executed, failed — who and when, written by the server,
+ * never edited.
+ */
+export const integrationConnectionTable = "integration_connections" as const;
+export const crmSyncTable = "crm_sync_requests" as const;
+export const crmSyncEventTable = "crm_sync_events" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -803,6 +855,9 @@ export const tables = [
   experimentTable,
   experimentArmTable,
   experimentEventTable,
+  integrationConnectionTable,
+  crmSyncTable,
+  crmSyncEventTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -1072,6 +1127,32 @@ export const indexes = {
     `${COLUMN(experimentEventTable, COLUMNS.experimentId)} NOT NULL`,
     `${COLUMN(experimentEventTable, COLUMNS.actorUserId)} NOT NULL`,
     `${COLUMN(experimentEventTable, COLUMNS.kind)} NOT NULL`,
+  ],
+  integrationConnections: [
+    `${COLUMN(integrationConnectionTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(integrationConnectionTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(integrationConnectionTable, COLUMNS.adapterId)} NOT NULL`,
+    `${COLUMN(integrationConnectionTable, COLUMNS.system)} NOT NULL`,
+    `${COLUMN(integrationConnectionTable, COLUMNS.grantedScopes)} NOT NULL`,
+    `${COLUMN(integrationConnectionTable, COLUMNS.status)} NOT NULL`,
+    `UNIQUE(${COLUMN(integrationConnectionTable, COLUMNS.workspaceId)}, ${COLUMN(integrationConnectionTable, COLUMNS.adapterId)})`,
+  ],
+  crmSyncs: [
+    `${COLUMN(crmSyncTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(crmSyncTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(crmSyncTable, COLUMNS.connectionId)} NOT NULL`,
+    `${COLUMN(crmSyncTable, COLUMNS.accountId)} NOT NULL`,
+    `${COLUMN(crmSyncTable, COLUMNS.changeSet)} NOT NULL`,
+    `${COLUMN(crmSyncTable, COLUMNS.previewDigest)} NOT NULL`,
+    `${COLUMN(crmSyncTable, COLUMNS.status)} NOT NULL`,
+    `${COLUMN(crmSyncTable, COLUMNS.decision)} NOT NULL`,
+  ],
+  crmSyncEvents: [
+    `${COLUMN(crmSyncEventTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(crmSyncEventTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(crmSyncEventTable, COLUMNS.crmSyncId)} NOT NULL`,
+    `${COLUMN(crmSyncEventTable, COLUMNS.actorUserId)} NOT NULL`,
+    `${COLUMN(crmSyncEventTable, COLUMNS.kind)} NOT NULL`,
   ],
 };
 
@@ -1860,7 +1941,7 @@ ${COLUMN(nextBestActionTable, COLUMNS.approvalRequired)} CHECK (${COLUMN(nextBes
     `${COLUMN(costEventTable, COLUMNS.id)} PRIMARY KEY,
 ${COLUMN(costEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(costEventTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
-${COLUMN(costEventTable, COLUMNS.executionKind)} CHECK (${COLUMN(costEventTable, COLUMNS.executionKind)} IN ('research_run','outbound_send','meeting_booking','agent_run')),
+${COLUMN(costEventTable, COLUMNS.executionKind)} CHECK (${COLUMN(costEventTable, COLUMNS.executionKind)} IN ('research_run','outbound_send','meeting_booking','agent_run','crm_sync')),
 ${COLUMN(costEventTable, COLUMNS.category)} CHECK (${COLUMN(costEventTable, COLUMNS.category)} IN ('llm','search','data','tool','infrastructure','execution')),
 ${COLUMN(costEventTable, COLUMNS.basis)} CHECK (${COLUMN(costEventTable, COLUMNS.basis)} IN ('estimated','measured')),
 ${COLUMN(costEventTable, COLUMNS.amountMinor)} CHECK (${COLUMN(costEventTable, COLUMNS.amountMinor)} >= 0),
@@ -2098,6 +2179,94 @@ ${COLUMN(experimentEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTabl
 ${COLUMN(experimentEventTable, COLUMNS.experimentId)} REFERENCES "${experimentTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(experimentEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(experimentEventTable, COLUMNS.kind)} CHECK (${COLUMN(experimentEventTable, COLUMNS.kind)} IN ('created','started','closed','cancelled'))`,
+  ),
+  createTableSql(
+    integrationConnectionTable,
+    [
+      COLUMN(integrationConnectionTable, COLUMNS.id),
+      COLUMN(integrationConnectionTable, COLUMNS.workspaceId),
+      COLUMN(integrationConnectionTable, COLUMNS.adapterId),
+      COLUMN(integrationConnectionTable, COLUMNS.system),
+      COLUMN(integrationConnectionTable, COLUMNS.grantedScopes),
+      COLUMN(integrationConnectionTable, COLUMNS.status),
+      COLUMN(integrationConnectionTable, COLUMNS.createdBy),
+      COLUMN(integrationConnectionTable, COLUMNS.revokedBy),
+      COLUMN(integrationConnectionTable, COLUMNS.revokedAt),
+    ],
+    `${COLUMN(integrationConnectionTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(integrationConnectionTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(integrationConnectionTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(integrationConnectionTable, COLUMNS.revokedBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(integrationConnectionTable, COLUMNS.adapterId)} CHECK (length(${COLUMN(integrationConnectionTable, COLUMNS.adapterId)}) > 0),
+${COLUMN(integrationConnectionTable, COLUMNS.system)} CHECK (${COLUMN(integrationConnectionTable, COLUMNS.system)} IN ('crm','calendar','email','slack','github','data_provider')),
+${COLUMN(integrationConnectionTable, COLUMNS.grantedScopes)} CHECK (length(${COLUMN(integrationConnectionTable, COLUMNS.grantedScopes)}) > 0),
+${COLUMN(integrationConnectionTable, COLUMNS.status)} CHECK (${COLUMN(integrationConnectionTable, COLUMNS.status)} IN ('active','revoked')),
+UNIQUE(${COLUMN(integrationConnectionTable, COLUMNS.workspaceId)}, ${COLUMN(integrationConnectionTable, COLUMNS.adapterId)}),
+${COLUMN(integrationConnectionTable, COLUMNS.status)} CHECK (
+  (${COLUMN(integrationConnectionTable, COLUMNS.status)} = 'active' AND ${COLUMN(integrationConnectionTable, COLUMNS.revokedAt)} IS NULL AND ${COLUMN(integrationConnectionTable, COLUMNS.revokedBy)} IS NULL)
+  OR (${COLUMN(integrationConnectionTable, COLUMNS.status)} = 'revoked' AND ${COLUMN(integrationConnectionTable, COLUMNS.revokedAt)} IS NOT NULL AND ${COLUMN(integrationConnectionTable, COLUMNS.revokedBy)} IS NOT NULL)
+)`,
+  ),
+  createTableSql(
+    crmSyncTable,
+    [
+      COLUMN(crmSyncTable, COLUMNS.id),
+      COLUMN(crmSyncTable, COLUMNS.workspaceId),
+      COLUMN(crmSyncTable, COLUMNS.connectionId),
+      COLUMN(crmSyncTable, COLUMNS.accountId),
+      COLUMN(crmSyncTable, COLUMNS.changeSet),
+      COLUMN(crmSyncTable, COLUMNS.previewDigest),
+      COLUMN(crmSyncTable, COLUMNS.status),
+      COLUMN(crmSyncTable, COLUMNS.decision),
+      COLUMN(crmSyncTable, COLUMNS.decidedBy),
+      COLUMN(crmSyncTable, COLUMNS.decidedAt),
+      COLUMN(crmSyncTable, COLUMNS.decisionReason),
+      COLUMN(crmSyncTable, COLUMNS.executedBy),
+      COLUMN(crmSyncTable, COLUMNS.executedAt),
+      COLUMN(crmSyncTable, COLUMNS.providerReference),
+      COLUMN(crmSyncTable, COLUMNS.failureCode),
+      COLUMN(crmSyncTable, COLUMNS.failureMessage),
+      COLUMN(crmSyncTable, COLUMNS.cancelReason),
+      COLUMN(crmSyncTable, COLUMNS.createdBy),
+      COLUMN(crmSyncTable, COLUMNS.cancelledBy),
+      COLUMN(crmSyncTable, COLUMNS.cancelledAt),
+    ],
+    `${COLUMN(crmSyncTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(crmSyncTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(crmSyncTable, COLUMNS.connectionId)} REFERENCES "${integrationConnectionTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(crmSyncTable, COLUMNS.accountId)} REFERENCES "${accountTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(crmSyncTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(crmSyncTable, COLUMNS.decidedBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(crmSyncTable, COLUMNS.executedBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(crmSyncTable, COLUMNS.cancelledBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(crmSyncTable, COLUMNS.changeSet)} CHECK (length(${COLUMN(crmSyncTable, COLUMNS.changeSet)}) > 0),
+${COLUMN(crmSyncTable, COLUMNS.previewDigest)} CHECK (length(${COLUMN(crmSyncTable, COLUMNS.previewDigest)}) > 0),
+${COLUMN(crmSyncTable, COLUMNS.status)} CHECK (${COLUMN(crmSyncTable, COLUMNS.status)} IN ('prepared','approved','rejected','cancelled','executed','failed')),
+${COLUMN(crmSyncTable, COLUMNS.decision)} CHECK (${COLUMN(crmSyncTable, COLUMNS.decision)} IS NULL OR ${COLUMN(crmSyncTable, COLUMNS.decision)} IN ('approved','rejected')),
+${COLUMN(crmSyncTable, COLUMNS.status)} CHECK (
+  (${COLUMN(crmSyncTable, COLUMNS.status)} = 'prepared' AND ${COLUMN(crmSyncTable, COLUMNS.decision)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.decidedBy)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.decidedAt)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.executedBy)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.executedAt)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.providerReference)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.failureCode)} IS NULL)
+  OR (${COLUMN(crmSyncTable, COLUMNS.status)} = 'approved' AND ${COLUMN(crmSyncTable, COLUMNS.decision)} = 'approved' AND ${COLUMN(crmSyncTable, COLUMNS.decidedBy)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.decidedAt)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.executedBy)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.executedAt)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.providerReference)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.failureCode)} IS NULL)
+  OR (${COLUMN(crmSyncTable, COLUMNS.status)} = 'rejected' AND ${COLUMN(crmSyncTable, COLUMNS.decision)} = 'rejected' AND ${COLUMN(crmSyncTable, COLUMNS.decidedBy)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.decidedAt)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.decisionReason)} IS NOT NULL AND length(${COLUMN(crmSyncTable, COLUMNS.decisionReason)}) > 0 AND ${COLUMN(crmSyncTable, COLUMNS.executedBy)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.executedAt)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.providerReference)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.failureCode)} IS NULL)
+  OR (${COLUMN(crmSyncTable, COLUMNS.status)} = 'executed' AND ${COLUMN(crmSyncTable, COLUMNS.decision)} = 'approved' AND ${COLUMN(crmSyncTable, COLUMNS.decidedBy)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.decidedAt)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.executedBy)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.executedAt)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.providerReference)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.failureCode)} IS NULL)
+  OR (${COLUMN(crmSyncTable, COLUMNS.status)} = 'failed' AND ${COLUMN(crmSyncTable, COLUMNS.decision)} = 'approved' AND ${COLUMN(crmSyncTable, COLUMNS.decidedBy)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.decidedAt)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.executedBy)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.executedAt)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.providerReference)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.failureCode)} IS NOT NULL)
+  OR (${COLUMN(crmSyncTable, COLUMNS.status)} = 'cancelled' AND (${COLUMN(crmSyncTable, COLUMNS.decision)} IS NULL OR ${COLUMN(crmSyncTable, COLUMNS.decision)} = 'approved') AND ${COLUMN(crmSyncTable, COLUMNS.cancelledBy)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.cancelledAt)} IS NOT NULL AND ${COLUMN(crmSyncTable, COLUMNS.executedBy)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.executedAt)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.providerReference)} IS NULL AND ${COLUMN(crmSyncTable, COLUMNS.failureCode)} IS NULL)
+)`,
+  ),
+  createTableSql(
+    crmSyncEventTable,
+    [
+      COLUMN(crmSyncEventTable, COLUMNS.id),
+      COLUMN(crmSyncEventTable, COLUMNS.workspaceId),
+      COLUMN(crmSyncEventTable, COLUMNS.crmSyncId),
+      COLUMN(crmSyncEventTable, COLUMNS.actorUserId),
+      COLUMN(crmSyncEventTable, COLUMNS.kind),
+      COLUMN(crmSyncEventTable, COLUMNS.detail),
+    ],
+    `${COLUMN(crmSyncEventTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(crmSyncEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(crmSyncEventTable, COLUMNS.crmSyncId)} REFERENCES "${crmSyncTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(crmSyncEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(crmSyncEventTable, COLUMNS.kind)} CHECK (${COLUMN(crmSyncEventTable, COLUMNS.kind)} IN ('prepared','approved','rejected','cancelled','executed','failed'))`,
   ),
 ].join("\n\n");
 

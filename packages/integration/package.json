@@ -1,0 +1,18 @@
+{
+  "name": "@dealora/integration",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DEALORA Phase 23 CRM Integrations (ROADMAP.md §30): a standardized adapter interface with explicit permission scopes and a registry that never hard-codes a vendor. Prepares a CRM change-set from stored rows, binds a human Level 2 decision to its digest, and executes only through an adapter confirmation. No credential is stored, no adapter performs network I/O in this repository, and no opportunity value is ever written.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "dependencies": {
+    "@dealora/core": "workspace:*",
+    "@dealora/db": "workspace:*"
+  },
+  "devDependencies": {}
+}

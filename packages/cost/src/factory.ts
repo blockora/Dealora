@@ -58,6 +58,8 @@ export interface CostLookup {
   getResearchRequest(id: string, userId: string): StorageResult<{ workspaceId: string }>;
   getOutboundAction(id: string, userId: string): StorageResult<{ workspaceId: string }>;
   getMeeting(id: string, userId: string): StorageResult<{ workspaceId: string }>;
+  /** Phase 23's execution kind: one prepared CRM sync. */
+  getCrmSyncById(id: string, userId: string): StorageResult<{ workspaceId: string }>;
   /** Phase 20's execution kind: a traced production agent run. */
   getAgentTraceRun(input: {
     workspaceId: string;
@@ -102,6 +104,8 @@ export function createCostService(lookup: CostLookup): CostService {
             return lookup.getOutboundAction(executionId, userId);
           case "meeting_booking":
             return lookup.getMeeting(executionId, userId);
+          case "crm_sync":
+            return lookup.getCrmSyncById(executionId, userId);
           case "agent_run": {
             // Phase 20's traced run. A run that does not exist is refused here
             // with the same NOT_FOUND every other kind returns, so this branch

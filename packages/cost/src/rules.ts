@@ -94,6 +94,7 @@ export const COST_EXECUTION_KINDS: readonly CostExecutionKind[] = [
   "outbound_send",
   "meeting_booking",
   "agent_run",
+  "crm_sync",
 ];
 
 /**

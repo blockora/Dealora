@@ -744,6 +744,7 @@ describe("Phase 16 gate — the published partition", () => {
       "outbound_send",
       "meeting_booking",
       "agent_run",
+      "crm_sync",
     ]);
     expect(policy.refusedExecutionKinds).toHaveLength(1);
     expect(policy.refusedExecutionKinds[0]?.name).toBe("workflow");
