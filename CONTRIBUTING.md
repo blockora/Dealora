@@ -183,6 +183,53 @@ has to say so:
   instants, which is the nondeterminism this repository has kept out since
   Phase 14.
 
+## Phase 22 implementation and testing expectations
+
+The experiment engine is real production code over three real tables, and its
+one non-negotiable property is `ROADMAP.md` §29's critical rule: **do not
+claim a winning experiment when evidence is insufficient.** Specifically:
+
+- **Nothing derived is stored.** No column may hold a sample size, a rate, a
+  confidence, a total, a conversion or a winner — the DDL test asserts it.
+  Every tracked number is recomputed on read from the rows Phases 10–13
+  wrote; if you add a cache column, you have made the comparison capable of
+  disagreeing with its own evidence.
+- **The thresholds are published product judgements, and they are the rule.**
+  The minimum sample and the minimum lift live in `EXPERIMENT_*` constants,
+  are returned by the policy route, and are enforced by the same arithmetic
+  that publishes them. If a bar moves, bump `EXPERIMENT_RULE_VERSION` in the
+  same commit so a stored answer keeps the version that judged it.
+- **Cross-multiply, never divide.** Rates are exact integer basis points —
+  quotient plus remainder — and arm-vs-arm comparison is decided by
+  cross-multiplication, exactly as Phases 16 and 19 decided theirs. A float
+  comparison or an epsilon reintroduces the off-by-one and the
+  not-quite-decidable boundary those phases removed.
+- **A cancelled experiment never crowns, and that branch comes first.** The
+  derivation order is the contract: cancellation, then fewer than two
+  compared arms, then the minimum sample, then the lift. Reordering it can
+  manufacture a winner out of a withdrawn comparison.
+- **Exposure is a sent action inside the window, and the window has no
+  clock.** `experimentWindow` derives from the declared start, the declared
+  duration and the close instant — nothing else. If a derivation reads the
+  current time, the same stored rows answer differently at different
+  instants, which is the nondeterminism this repository has kept out since
+  Phase 14.
+- **Cross-arm contacts are excluded, not averaged.** A contact reached by two
+  arms inside the window is removed from both and disclosed in
+  `excludedCrossArmContacts`. Silently averaging contaminated subjects is
+  the quietest way to make a controlled experiment uncontrolled.
+- **One owner per word.** Conversion is Phase 12's classification read
+  through Phase 13's `MEETABLE_INTENTS`; the population is Phases 15/16's
+  newest-qualification rule; cost is Phase 16's `deriveBreakdown`. Do not
+  restate any of them — a second copy is the drift ADR 0017 warned about —
+  and do not add a metric the rule table has not decided; refusal with an
+  owning phase is the honest form of "not yet".
+- **The arm is history, and the negative space is tested.** `draftId` carries
+  no foreign key on purpose, arms freeze at start, and there is no sender,
+  assigner, scheduler or network client anywhere in the package. The gate
+  snapshots row counts precisely so a future change that made the experiment
+  *drive* the loop would fail loudly instead of quietly.
+
 ## Phase 20 implementation and testing expectations
 
 Agent tracing is real production code over two real tables, and its one

@@ -27,8 +27,9 @@ The repository has completed **Phase 0 — Repository & Engineering Foundation**
 Engine**, **Phase 13 — Meeting Workflow**, **Phase 14 — Next Best Action**,
 **Phase 15 — Revenue Graph**, **Phase 16 — Cost Engine**,
 **Phase 17 — Revenue Dashboard**, **Phase 18 — Agent System**,
-**Phase 19 — Agent Evaluation** and **Phase 20 — Agent Trace &
-Observability** (see [`ROADMAP.md`](./ROADMAP.md)).
+**Phase 19 — Agent Evaluation**, **Phase 20 — Agent Trace &
+Observability**, **Phase 21 — Optimization Engine** and
+**Phase 22 — Experiment Engine** (see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
 with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
@@ -249,7 +250,7 @@ and evidence by id rather than copying them, and writes every `§22` section it
 has no record for into `gaps` instead of filling it in. Nothing in this phase
 sends an invitation, schedules anything on a timer, or turns a meeting into a
 fact. Its gate is covered by `tests/phase13-gate.test.ts`, and Phases 9–20
-together by `tests/phases9-20-integration.test.ts`.
+together by `tests/phases9-22-integration.test.ts`.
 
 Phase 14 adds the Next Best Action Engine: it answers *what should happen next?*
 for one account and for a whole workspace, reading stored rows and applying a
@@ -393,7 +394,7 @@ tile numbers, `userId` or `workspaceId` in a request body are ignored because
 every read is workspace-scoped with the session's own identity. Its gate — a
 user can see the loop as outcomes — is covered by `tests/phase17-gate.test.ts`,
 and it end to end after the send, the booking and the cost by
-`tests/phases9-20-integration.test.ts`.
+`tests/phases9-22-integration.test.ts`.
 
 Phase 18 adds the Agent System: `ROADMAP.md` §25's **twelve agents** — Strategy,
 Market Intelligence, Account Research, Prospect Discovery, Qualification,
@@ -430,7 +431,7 @@ a request contributes: forged `updatedBy`, `createdAt`, `workspaceId`,
 `actorUserId` and `kind` in a body are ignored. Its gate — twelve agents,
 twelve fields, seven states, and nothing executable — is covered by
 `tests/phase18-gate.test.ts`, and end to end after the send, the booking, the
-cost and the dashboard by `tests/phases9-20-integration.test.ts`.
+cost and the dashboard by `tests/phases9-22-integration.test.ts`.
 
 Phase 19 adds Agent Evaluation: `ROADMAP.md` §26's **thirteen metrics** are now
 **measured** rather than declared, and `approved → production` is decided by
@@ -480,7 +481,7 @@ status in a body are ignored and answered byte-identically. Its gate — all
 thirteen metrics measured, every way to fail the gate, and nothing executed — is
 covered by `tests/phase19-gate.test.ts`, and end to end after the send, the
 booking, the cost, the dashboard and the registry by
-`tests/phases9-20-integration.test.ts`.
+`tests/phases9-22-integration.test.ts`.
 
 Phase 20 adds Agent Trace & Observability: `ROADMAP.md` §27's chain is now a
 real, inspectable record, and §27's critical rule — **never silently pretend an
@@ -556,14 +557,63 @@ and timestamps in a body are ignored. Its gate — the seven stages, the nine
 dimensions, every way to be derived a status that was not earned, and nothing
 executed — is covered by `tests/phase20-gate.test.ts`, and end to end after the
 send, the booking, the cost, the dashboard, the registry and the evaluation by
-`tests/phases9-20-integration.test.ts`.
+`tests/phases9-22-integration.test.ts`.
 
 The honest limitation: every trace in this repository today records work
 performed **outside** it. This phase makes the recording checkable; the
 executor that will produce real runs is not here, and nothing in this phase
 becomes usable as a result of it.
 
-Next is **Phase 21 — Optimization Engine**.
+Phase 21 adds the Optimization Engine: `ROADMAP.md` §28's eight dimensions —
+audiences, messages, signals, channels, timing, qualification rules,
+follow-up sequences and offers — become eighteen facets, each read against
+the loop's own rows to answer the five questions the roadmap asks (what
+worked, what failed, where conversion is dropping, what should be tested,
+and the likely impact). The phase is read-only by construction: it executes
+no agent, sends nothing, books nothing, evaluates nothing and writes no cost
+row; the derivation is deterministic (byte-identical output for the same
+input) and every answer carries the audit tuple naming the rows it read. It
+adds no table, no migration and no route. Its gate — the eighteen facets,
+the five answers, determinism, auditability, workspace isolation and the
+negative space — is covered by `tests/phase21-gate.test.ts`.
+
+Phase 22 adds the Experiment Engine: `ROADMAP.md` §29's controlled
+experiments — Message A vs Message B on the positive reply rate over a
+qualified population — with §29's critical rule (*do not claim a winning
+experiment when evidence is insufficient*) enforced as arithmetic rather
+than mood. The declaration is stored; every tracked number is derived on
+each read from rows Phases 10–13 already wrote: exposure is a confirmed,
+human-approved send inside the declared window (the declared start plus the
+declared duration, capped by a close — never a clock), conversion is
+Phase 12's classification read through Phase 13's own `MEETABLE_INTENTS`,
+the population is accounts whose newest qualification is `qualified` — the
+same rule Phases 15 and 16 use — and cost per arm is Phase 16's own
+breakdown over the arm's `outbound_send` facts. Revenue impact is refused:
+`revenue_per_arm` names Phase 23 as its owner, `revenueImpactMinor` is null
+with a reason beside it, and the revenue-adjacent outcome this system
+actually records is meetings on a calendar. A winner requires every compared
+arm to hold at least the published minimum sample of thirty distinct
+exposed contacts and to lead by at least the published two hundred basis
+points, decided by cross-multiplication in exact integer basis points — an
+exact tie is `no_material_difference`, a smaller gap is real data that is
+not a decision, and a cancelled experiment can never crown anything.
+Nothing derived is ever stored — no column holds a sample, a rate, a
+confidence, a total or a winner — so nothing can go stale, and a contact
+reached by two arms is excluded from both and disclosed rather than
+averaged. The phase adds `experiments`, `experiment_arms` and
+`experiment_events` (schema v19) with status↔timestamp agreement pairs as
+`CHECK` constraints, arms frozen at start (`UNIQUE(experiment, position)`,
+`UNIQUE(experiment, draftId)`, and a `draftId` deliberately without a
+foreign key so the arm survives its draft's archive), and nine
+workspace-scoped routes whose write bodies carry no status, timestamp,
+identity or position — those come from the session and the store. Its gate —
+declare, derive on read, every refusal, tenant isolation, forged fields and
+the negative space — is covered by `tests/phase22-gate.test.ts`, and end to
+end over a real journey (both messages genuinely sent through the approval
+and send path, one positive reply, the comparison refusing a winner at this
+sample) by `tests/phases9-22-integration.test.ts`.
+
+Next is **Phase 23 — CRM Integrations**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
