@@ -2396,3 +2396,124 @@ export interface AgentTraceEvent {
   /** Server-derived: when it was recorded. Never client-controlled. */
   recordedAt: DateTime;
 }
+
+/**
+ * Phase 22 — the one comparison metric this phase derives.
+ *
+ * `ROADMAP.md` §29's worked example names exactly one metric — *Positive Reply
+ * Rate* — and the vocabulary is closed on it rather than opened in advance:
+ * a metric this phase cannot compute from stored rows is refused at the
+ * boundary with its owning phase, never published as a promise.
+ */
+export type ExperimentMetric = "positive_reply_rate";
+
+/**
+ * Phase 22 lifecycle states.
+ *
+ * `draft` is a declared comparison nobody has started; `running` counts
+ * exposures inside its window; `closed` freezes the window at the close
+ * instant; `cancelled` is a terminal withdrawal that preserves what was
+ * collected for audit while forbidding a winner. There is no edit: the
+ * definition is frozen at creation, because changing the question mid-flight
+ * would silently invalidate the answer.
+ */
+export type ExperimentStatus = "draft" | "running" | "closed" | "cancelled";
+
+/** The lifecycle transitions an experiment's audit trail records. */
+export type ExperimentEventKind = "created" | "started" | "closed" | "cancelled";
+
+/**
+ * Phase 22 — one declared controlled experiment.
+ *
+ * The row is the **declaration**, not a result: which drafts are compared,
+ * on which metric, over how many days. Every derived number — sample size,
+ * conversion, confidence, cost, revenue impact, the decision itself — is
+ * recomputed on read from the rows earlier phases already stored, so no
+ * column here holds a rate, a total or a verdict.
+ *
+ * The status and its timestamps are decided by the store's transition
+ * methods; no caller supplies them, which is what keeps a cancelled
+ * experiment from being asked to produce a winner.
+ */
+export interface Experiment {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** The workspace's own name for the comparison. Not a rule input. */
+  name: string;
+  /** The one metric §29 names; the vocabulary is closed. */
+  metric: ExperimentMetric;
+  status: ExperimentStatus;
+  /**
+   * The declared analysis window in whole days, counted from `startedAt`.
+   * Declared, never clock-derived: a read never consults the current time.
+   */
+  durationDays: number;
+  /** Server-derived: who declared the experiment. */
+  createdBy: EntityId;
+  /** Server-derived: when it was declared. */
+  createdAt: DateTime;
+  /** Server-derived: who started it. `null` while it is a draft. */
+  startedBy: EntityId | null;
+  /** Server-derived: the window opens here. `null` while it is a draft. */
+  startedAt: DateTime | null;
+  /** Server-derived: who closed it. Set exactly when status is `closed`. */
+  closedBy: EntityId | null;
+  /** Server-derived: the window freezes here on close. */
+  closedAt: DateTime | null;
+  /** Server-derived: who cancelled it. Set exactly when status is `cancelled`. */
+  cancelledBy: EntityId | null;
+  /** Server-derived: when it was cancelled. */
+  cancelledAt: DateTime | null;
+  /** The workspace's own reason for cancelling. Optional, capped, audit-only. */
+  cancelReason: string | null;
+  /** Server-derived: last lifecycle write. Never client-controlled. */
+  updatedAt: DateTime;
+}
+
+/**
+ * Phase 22 — one arm of a declared experiment.
+ *
+ * Message A vs Message B is two of these rows: each names the exact draft
+ * (by id — drafts are immutable, so an arm pins one immutable text) and its
+ * declared position, which is the arm's identity in every derived answer.
+ *
+ * `draftId` deliberately carries **no foreign key**: a draft cannot be
+ * rewritten, and the arm must survive as history even if a later phase ever
+ * allowed a draft lineage to be removed. Existence is validated in the store
+ * at arm-creation time against this workspace's own drafts, and never again.
+ */
+export interface ExperimentArm {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** The experiment this arm belongs to; the arm cannot outlive it. */
+  experimentId: EntityId;
+  /** 1-based declared order. Unique within the experiment. Never reassigned. */
+  position: number;
+  /** The exact immutable draft this arm sends. Validated at creation. */
+  draftId: EntityId;
+  /** The workspace's own label, e.g. "A" or "B". Display only. */
+  label: string;
+  /** Server-derived: when the arm was declared. */
+  createdAt: DateTime;
+}
+
+/**
+ * Phase 22 — one append-only lifecycle event for an experiment.
+ *
+ * Declared, started, closed, cancelled: who and when, written by the server
+ * and never edited, so a comparison can always be explained without trusting
+ * the experiment's current status alone.
+ */
+export interface ExperimentEvent {
+  id: EntityId;
+  workspaceId: EntityId;
+  /** Denormalized so events can never outlive their tenant boundary. */
+  experimentId: EntityId;
+  /** Server-derived: who made the transition. */
+  actorUserId: EntityId;
+  kind: ExperimentEventKind;
+  /** The transition's reason in the actor's words. Optional, capped. */
+  detail: string | null;
+  /** Server-derived: when the transition happened. */
+  createdAt: DateTime;
+}

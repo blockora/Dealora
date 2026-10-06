@@ -1,0 +1,20 @@
+{
+  "name": "@dealora/experiment",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DEALORA Phase 22 Experiment Engine (ROADMAP.md §29): declares controlled comparisons between immutable drafts, attributes exposures and replies to the arm that sent them, and derives sample size, conversion, confidence, cost and revenue impact on read. The engine never claims a winning experiment when the evidence is insufficient, never sends anything itself, and never stores a derived result.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "dependencies": {
+    "@dealora/core": "workspace:*",
+    "@dealora/db": "workspace:*",
+    "@dealora/cost": "workspace:*",
+    "@dealora/meeting": "workspace:*"
+  },
+  "devDependencies": {}
+}

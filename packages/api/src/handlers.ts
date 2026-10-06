@@ -34,6 +34,7 @@ import type { DashboardError, DashboardService } from "@dealora/dashboard";
 import type { AgentError, AgentService } from "@dealora/agent";
 import type { EvaluationError, EvaluationService } from "@dealora/evaluation";
 import { TraceService, type TraceError } from "@dealora/trace";
+import type { ExperimentError, ExperimentService } from "@dealora/experiment";
 import type { RevenueGoalStatus as GoalStatus } from "@dealora/db";
 import type { RevenuePlanStatus as PlanStatus } from "@dealora/db";
 import type { AccountStatus, ContactStatus } from "@dealora/db";
@@ -500,6 +501,34 @@ function fromCostError(error: CostError): ApiError {
 }
 
 /**
+ * Map an experiment domain error onto the transport vocabulary.
+ *
+ * The mapping is exhaustive over the domain's closed error codes, and the
+ * internal `UNAVAILABLE` is reported generically, so a storage failure never
+ * leaks its message to a caller — the same rule every phase's mapping follows.
+ */
+function fromExperimentError(error: ExperimentError): ApiError {
+  const code: ApiErrorCode = ((): ApiErrorCode => {
+    switch (error.code) {
+      case "NOT_FOUND":
+        return "NOT_FOUND";
+      case "UNAUTHORIZED":
+        return "UNAUTHORIZED";
+      case "VALIDATION_ERROR":
+        return "VALIDATION_ERROR";
+      case "CONFLICT":
+        return "CONFLICT";
+      case "UNAVAILABLE":
+        return "SERVER_ERROR";
+    }
+  })();
+  const message = error.code === "UNAVAILABLE" ? "unexpected failure" : error.message;
+  const mapped: ApiError = { code, message };
+  if (error.details) mapped.details = [...error.details];
+  return mapped;
+}
+
+/**
  * Map a dashboard domain error onto the transport vocabulary. The mapping is
  * exhaustive: `UNAVAILABLE` — the only code that means an internal condition —
  * becomes a generic `SERVER_ERROR`, so storage internals never reach a client.
@@ -644,6 +673,7 @@ export interface HandlerDeps {
   agent: AgentService;
   evaluation: EvaluationService;
   trace: TraceService;
+  experiment: ExperimentService;
   resolveSession: SessionResolver;
 }
 
@@ -3489,6 +3519,153 @@ export function createHandlers(deps: HandlerDeps) {
       return { ok: true, value: ok(result.value) };
     });
 
+  // -------------------------------------------------------------------------
+  // Phase 22 — Experiment Engine
+  //
+  // These handlers answer ROADMAP.md §29: declare controlled comparisons,
+  // open and freeze their windows, and read the derived comparison — sample
+  // size, conversion, confidence, cost and revenue impact — without ever
+  // being able to hand the engine a winner. The lifecycle routes carry the
+  // experiment id and the session and nothing else: statuses, timestamps and
+  // decisions are the server's, which is what makes §29's critical rule hold
+  // at the transport layer.
+  // -------------------------------------------------------------------------
+
+  /** Declare one controlled experiment in this workspace. */
+  const createExperimentHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.experiment.create(workspaceId, actor.userId, {
+        name: body.name,
+        metric: body.metric,
+        durationDays: body.durationDays,
+      });
+      if (!result.ok) return { ok: false, error: fromExperimentError(result.error) };
+      return { ok: true, value: ok({ experiment: result.value }) };
+    });
+
+  /** Pin one arm of the comparison to an exact immutable draft. */
+  const addExperimentArmHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const experimentId = param(req, "experimentId");
+      if (isApiError(experimentId)) return { ok: false, error: experimentId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.experiment.addArm(workspaceId, actor.userId, experimentId, {
+        draftId: body.draftId,
+        label: body.label,
+      });
+      if (!result.ok) return { ok: false, error: fromExperimentError(result.error) };
+      return { ok: true, value: ok({ arm: result.value }) };
+    });
+
+  /** Every experiment in this workspace, oldest declaration first. */
+  const listExperimentsHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.experiment.list(workspaceId, actor.userId, req.query.status);
+      if (!result.ok) return { ok: false, error: fromExperimentError(result.error) };
+      return { ok: true, value: ok({ experiments: result.value }) };
+    });
+
+  /**
+   * One experiment read back complete — the declaration, the arms, the
+   * lifecycle trail and the whole derived comparison. Every number here is
+   * recomputed from this request's rows; the read stores nothing.
+   */
+  const getExperimentHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const experimentId = param(req, "experimentId");
+      if (isApiError(experimentId)) return { ok: false, error: experimentId };
+
+      const result = deps.experiment.get(workspaceId, actor.userId, experimentId);
+      if (!result.ok) return { ok: false, error: fromExperimentError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
+  /** Open the declared window. The open instant is the server's clock. */
+  const startExperimentHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const experimentId = param(req, "experimentId");
+      if (isApiError(experimentId)) return { ok: false, error: experimentId };
+
+      // No body is read: there is no field a caller could contribute here.
+      const result = deps.experiment.start(workspaceId, actor.userId, experimentId);
+      if (!result.ok) return { ok: false, error: fromExperimentError(result.error) };
+      return { ok: true, value: ok({ experiment: result.value }) };
+    });
+
+  /**
+   * Freeze the window. Like the Phase 20 close route, this handler carries a
+   * run id and does not read its body at all — there is no winner argument to
+   * pass, because the decision is derived on read and never accepted.
+   */
+  const closeExperimentHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const experimentId = param(req, "experimentId");
+      if (isApiError(experimentId)) return { ok: false, error: experimentId };
+
+      const result = deps.experiment.close(workspaceId, actor.userId, experimentId);
+      if (!result.ok) return { ok: false, error: fromExperimentError(result.error) };
+      return { ok: true, value: ok({ experiment: result.value }) };
+    });
+
+  /** Withdraw the experiment, keeping every collected row for audit. */
+  const cancelExperimentHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const experimentId = param(req, "experimentId");
+      if (isApiError(experimentId)) return { ok: false, error: experimentId };
+      const body = await parseBody(req);
+      if (isApiError(body)) return { ok: false, error: body };
+
+      const result = deps.experiment.cancel(workspaceId, actor.userId, experimentId, {
+        reason: body.reason ?? null,
+      });
+      if (!result.ok) return { ok: false, error: fromExperimentError(result.error) };
+      return { ok: true, value: ok({ experiment: result.value }) };
+    });
+
+  /** One experiment's lifecycle trail, oldest first. */
+  const getExperimentHistoryHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+      const experimentId = param(req, "experimentId");
+      if (isApiError(experimentId)) return { ok: false, error: experimentId };
+
+      const result = deps.experiment.history(workspaceId, actor.userId, experimentId);
+      if (!result.ok) return { ok: false, error: fromExperimentError(result.error) };
+      return { ok: true, value: ok({ events: result.value }) };
+    });
+
+  /** The experiment rule set this deployment publishes, and what it refuses. */
+  const getExperimentPolicyHandler: ApiHandler = (req) =>
+    authenticated(req, deps, async (actor) => {
+      const workspaceId = param(req, "workspaceId");
+      if (isApiError(workspaceId)) return { ok: false, error: workspaceId };
+
+      const result = deps.experiment.policy(workspaceId, actor.userId);
+      if (!result.ok) return { ok: false, error: fromExperimentError(result.error) };
+      return { ok: true, value: ok(result.value) };
+    });
+
   return {
     signupHandler,
     authenticateHandler,
@@ -3664,6 +3841,19 @@ export function createHandlers(deps: HandlerDeps) {
     listAgentTraceStepsHandler,
     listAgentTraceRunsHandler,
     getAgentTracePolicyHandler,
+
+    // -------------------------------------------------------------------------
+    // Phase 22 — Experiment Engine
+    // -------------------------------------------------------------------------
+    createExperimentHandler,
+    getExperimentHandler,
+    listExperimentsHandler,
+    addExperimentArmHandler,
+    startExperimentHandler,
+    closeExperimentHandler,
+    cancelExperimentHandler,
+    getExperimentHistoryHandler,
+    getExperimentPolicyHandler,
   };
 }
 

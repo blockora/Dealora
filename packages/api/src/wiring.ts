@@ -64,6 +64,8 @@ import { createEvaluationService, createProductionGate } from "@dealora/evaluati
 import type { EvaluationLookup } from "@dealora/evaluation";
 import { createTraceService } from "@dealora/trace";
 import type { TraceLookup } from "@dealora/trace";
+import { createExperimentService } from "@dealora/experiment";
+import type { ExperimentStoreAdapter } from "@dealora/experiment";
 
 import { createHandlers } from "./handlers.js";
 import type { HandlerDeps } from "./handlers.js";
@@ -279,6 +281,41 @@ export function createDefaultHandlers(options?: {
   };
 
   const trace = createTraceService(traceLookup);
+
+  /**
+   * The experiment boundary: it declares comparisons, opens and freezes their
+   * windows, and derives every answer on read from rows the earlier phases
+   * already stored.
+   *
+   * It is given **no sender, no approver, no scheduler and no network**: an
+   * experiment measures the sends Phases 9–12 produced under Phase 10's
+   * approval — it never produces one. The population is Phase 8's own
+   * qualification state, conversions are Phase 12's own classifications read
+   * through Phase 13's meetable-intent set, cost is Phase 16's own facts
+   * totaled by the Cost Engine's derivation, and revenue impact refuses a
+   * monetary figure because no stored row records one.
+   */
+  const experimentStore: ExperimentStoreAdapter = {
+    authorize: store.authorize.bind(store),
+    createExperiment: store.createExperiment.bind(store),
+    getExperiment: store.getExperiment.bind(store),
+    listExperiments: store.listExperiments.bind(store),
+    addExperimentArm: store.addExperimentArm.bind(store),
+    listExperimentArms: store.listExperimentArms.bind(store),
+    startExperiment: store.startExperiment.bind(store),
+    closeExperiment: store.closeExperiment.bind(store),
+    cancelExperiment: store.cancelExperiment.bind(store),
+    listExperimentEvents: store.listExperimentEvents.bind(store),
+    listAccounts: store.listAccounts.bind(store),
+    listContacts: store.listContacts.bind(store),
+    listQualifications: store.listQualifications.bind(store),
+    listOutboundActions: store.listOutboundActions.bind(store),
+    listConversationClassifications: store.listConversationClassifications.bind(store),
+    listMeetings: store.listMeetings.bind(store),
+    listCostEvents: store.listCostEvents.bind(store),
+  };
+
+  const experiment = createExperimentService(experimentStore);
 
   const deps: HandlerDeps = {
     identity,
@@ -639,6 +676,7 @@ export function createDefaultHandlers(options?: {
      * invoker, no model client and no network.
      */
     trace,
+    experiment,
     resolveSession: (token) => {
       try {
         const verified = verifySession(token, getSessionIndex());

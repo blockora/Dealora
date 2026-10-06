@@ -47,6 +47,7 @@
         "@dealora/db": "workspace:*",
         "@dealora/evaluation": "workspace:*",
         "@dealora/evidence": "workspace:*",
+        "@dealora/experiment": "workspace:*",
         "@dealora/goal": "workspace:*",
         "@dealora/meeting": "workspace:*",
         "@dealora/nextaction": "workspace:*",
@@ -139,6 +140,16 @@
         "@dealora/core": "workspace:*",
         "@dealora/db": "workspace:*",
         "@dealora/research": "workspace:*",
+      },
+    },
+    "packages/experiment": {
+      "name": "@dealora/experiment",
+      "version": "0.1.0",
+      "dependencies": {
+        "@dealora/core": "workspace:*",
+        "@dealora/cost": "workspace:*",
+        "@dealora/db": "workspace:*",
+        "@dealora/meeting": "workspace:*",
       },
     },
     "packages/goal": {
@@ -268,6 +279,8 @@
     "@dealora/evaluation": ["@dealora/evaluation@workspace:packages/evaluation"],
 
     "@dealora/evidence": ["@dealora/evidence@workspace:packages/evidence"],
+
+    "@dealora/experiment": ["@dealora/experiment@workspace:packages/experiment"],
 
     "@dealora/goal": ["@dealora/goal@workspace:packages/goal"],
 

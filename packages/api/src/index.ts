@@ -250,6 +250,30 @@ export type {
 } from "@dealora/trace";
 
 /**
+ * The Experiment domain's public surface, re-exported so API consumers can
+ * type an experiment response without depending on the domain package
+ * directly.
+ *
+ * Note what is *not* here: no execution type, no assignment type and no
+ * winner input, because `ROADMAP.md` §29's critical rule is structural — a
+ * winner exists only inside a derived decision, and no request can supply one.
+ */
+export type {
+  ExperimentArmResult,
+  ExperimentArmView,
+  ExperimentComparison,
+  ExperimentConfidence,
+  ExperimentDecision,
+  ExperimentDecisionStatus,
+  ExperimentError,
+  ExperimentErrorCode,
+  ExperimentEventView,
+  ExperimentPolicyView,
+  ExperimentRead,
+  ExperimentView,
+} from "@dealora/experiment";
+
+/**
  * The Qualification domain's public surface, re-exported so API consumers can
  * type a qualification response without depending on the domain package
  * directly.

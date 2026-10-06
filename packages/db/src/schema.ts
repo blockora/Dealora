@@ -316,6 +316,16 @@ export const COLUMNS = {
   approvalRequired: "approval_required",
   expectedOutcome: "expected_outcome",
   gaps: "gaps",
+  position: "position",
+  label: "label",
+  experimentId: "experiment_id",
+  durationDays: "duration_days",
+  startedBy: "started_by",
+  // `closedBy` and `closedAt` are already declared above for the trace run's
+  // close pair and are reused for the experiment's, for the same reason: one
+  // concept, one column name.
+  cancelledBy: "cancelled_by",
+  cancelReason: "cancel_reason",
   // `title`, `state`, `decisionReason`, `approvedBy`, `approvedAt`,
   // `qualificationId`, `intent`, `claimIds`, `evidenceIds`, `timezone`,
   // `channel`, `rendererVersion` and `riskLevel` are already declared above
@@ -722,6 +732,32 @@ export const agentEvaluationObservationTable = "agent_evaluation_observations" a
 export const agentTraceRunTable = "agent_trace_runs" as const;
 export const agentTraceEventTable = "agent_trace_events" as const;
 
+/**
+ * Phase 22 — Experiment Engine (`ROADMAP.md` §29, `DEALORA_BLUEPRINT.md` §27).
+ *
+ * `experiments` is one row per **declared** comparison — which immutable drafts
+ * are compared on which metric over how many days. It holds no result: sample
+ * size, conversion, confidence, cost, revenue impact and the decision are all
+ * recomputed on read from the rows earlier phases already stored, so there is
+ * deliberately no column for a rate, a total or a winner. The CHECK on the
+ * status vocabulary is what makes §29's critical rule structural: an
+ * experiment that is not `closed` cannot be asked to have a verdict, and a
+ * cancelled experiment keeps its rows for audit while the domain refuses to
+ * crown it.
+ *
+ * `experiment_arms` pins each side of the comparison to an exact immutable
+ * draft, unique per experiment by position and by draft. `draft_id` carries no
+ * foreign key on purpose — an arm is history, and history must survive even if
+ * a draft lineage were ever removable; existence was validated in the store
+ * when the arm was declared.
+ *
+ * `experiment_events` is the append-only lifecycle trail: declared, started,
+ * closed, cancelled — who and when, written by the server, never edited.
+ */
+export const experimentTable = "experiments" as const;
+export const experimentArmTable = "experiment_arms" as const;
+export const experimentEventTable = "experiment_events" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -764,6 +800,9 @@ export const tables = [
   agentEvaluationObservationTable,
   agentTraceRunTable,
   agentTraceEventTable,
+  experimentTable,
+  experimentArmTable,
+  experimentEventTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -1009,6 +1048,30 @@ export const indexes = {
     `${COLUMN(agentTraceEventTable, COLUMNS.outcome)} NOT NULL`,
     `${COLUMN(agentTraceEventTable, COLUMNS.recordedBy)} NOT NULL`,
     `UNIQUE(${COLUMN(agentTraceEventTable, COLUMNS.runId)}, ${COLUMN(agentTraceEventTable, COLUMNS.sequence)})`,
+  ],
+  experiments: [
+    `${COLUMN(experimentTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(experimentTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(experimentTable, COLUMNS.createdBy)} NOT NULL`,
+    `${COLUMN(experimentTable, COLUMNS.metric)} NOT NULL`,
+    `${COLUMN(experimentTable, COLUMNS.status)} NOT NULL`,
+    `${COLUMN(experimentTable, COLUMNS.durationDays)} NOT NULL`,
+  ],
+  experimentArms: [
+    `${COLUMN(experimentArmTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(experimentArmTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(experimentArmTable, COLUMNS.experimentId)} NOT NULL`,
+    `${COLUMN(experimentArmTable, COLUMNS.position)} NOT NULL`,
+    `${COLUMN(experimentArmTable, COLUMNS.draftId)} NOT NULL`,
+    `UNIQUE(${COLUMN(experimentArmTable, COLUMNS.experimentId)}, ${COLUMN(experimentArmTable, COLUMNS.position)})`,
+    `UNIQUE(${COLUMN(experimentArmTable, COLUMNS.experimentId)}, ${COLUMN(experimentArmTable, COLUMNS.draftId)})`,
+  ],
+  experimentEvents: [
+    `${COLUMN(experimentEventTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(experimentEventTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(experimentEventTable, COLUMNS.experimentId)} NOT NULL`,
+    `${COLUMN(experimentEventTable, COLUMNS.actorUserId)} NOT NULL`,
+    `${COLUMN(experimentEventTable, COLUMNS.kind)} NOT NULL`,
   ],
 };
 
@@ -1960,6 +2023,81 @@ ${COLUMN(agentTraceEventTable, COLUMNS.modelName)} CHECK (${COLUMN(agentTraceEve
 ${COLUMN(agentTraceEventTable, COLUMNS.recordedAt)} CHECK (${COLUMN(agentTraceEventTable, COLUMNS.recordedAt)} IS NOT NULL),
 UNIQUE(${COLUMN(agentTraceEventTable, COLUMNS.runId)}, ${COLUMN(agentTraceEventTable, COLUMNS.sequence)}),
 UNIQUE(${COLUMN(agentTraceEventTable, COLUMNS.runId)}, ${COLUMN(agentTraceEventTable, COLUMNS.stepId)}, ${COLUMN(agentTraceEventTable, COLUMNS.attempt)})`,
+  ),
+  createTableSql(
+    experimentTable,
+    [
+      COLUMN(experimentTable, COLUMNS.id),
+      COLUMN(experimentTable, COLUMNS.workspaceId),
+      COLUMN(experimentTable, COLUMNS.name),
+      COLUMN(experimentTable, COLUMNS.metric),
+      COLUMN(experimentTable, COLUMNS.status),
+      COLUMN(experimentTable, COLUMNS.durationDays),
+      COLUMN(experimentTable, COLUMNS.createdBy),
+      COLUMN(experimentTable, COLUMNS.startedBy),
+      COLUMN(experimentTable, COLUMNS.startedAt),
+      COLUMN(experimentTable, COLUMNS.closedBy),
+      COLUMN(experimentTable, COLUMNS.closedAt),
+      COLUMN(experimentTable, COLUMNS.cancelledBy),
+      COLUMN(experimentTable, COLUMNS.cancelledAt),
+      COLUMN(experimentTable, COLUMNS.cancelReason),
+    ],
+    `${COLUMN(experimentTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(experimentTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(experimentTable, COLUMNS.createdBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(experimentTable, COLUMNS.startedBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(experimentTable, COLUMNS.closedBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(experimentTable, COLUMNS.cancelledBy)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(experimentTable, COLUMNS.metric)} CHECK (${COLUMN(experimentTable, COLUMNS.metric)} IN ('positive_reply_rate')),
+${COLUMN(experimentTable, COLUMNS.status)} CHECK (${COLUMN(experimentTable, COLUMNS.status)} IN ('draft','running','closed','cancelled')),
+${COLUMN(experimentTable, COLUMNS.durationDays)} CHECK (${COLUMN(experimentTable, COLUMNS.durationDays)} > 0),
+${COLUMN(experimentTable, COLUMNS.name)} CHECK (length(${COLUMN(experimentTable, COLUMNS.name)}) > 0),
+${COLUMN(experimentTable, COLUMNS.startedAt)} CHECK (
+  (${COLUMN(experimentTable, COLUMNS.status)} = 'draft' AND ${COLUMN(experimentTable, COLUMNS.startedAt)} IS NULL AND ${COLUMN(experimentTable, COLUMNS.startedBy)} IS NULL)
+  OR (${COLUMN(experimentTable, COLUMNS.status)} <> 'draft' AND ${COLUMN(experimentTable, COLUMNS.startedAt)} IS NOT NULL AND ${COLUMN(experimentTable, COLUMNS.startedBy)} IS NOT NULL)
+),
+${COLUMN(experimentTable, COLUMNS.closedAt)} CHECK (
+  (${COLUMN(experimentTable, COLUMNS.status)} = 'closed' AND ${COLUMN(experimentTable, COLUMNS.closedAt)} IS NOT NULL AND ${COLUMN(experimentTable, COLUMNS.closedBy)} IS NOT NULL)
+  OR (${COLUMN(experimentTable, COLUMNS.status)} <> 'closed' AND ${COLUMN(experimentTable, COLUMNS.closedAt)} IS NULL AND ${COLUMN(experimentTable, COLUMNS.closedBy)} IS NULL)
+),
+${COLUMN(experimentTable, COLUMNS.cancelledAt)} CHECK (
+  (${COLUMN(experimentTable, COLUMNS.status)} = 'cancelled' AND ${COLUMN(experimentTable, COLUMNS.cancelledAt)} IS NOT NULL AND ${COLUMN(experimentTable, COLUMNS.cancelledBy)} IS NOT NULL)
+  OR (${COLUMN(experimentTable, COLUMNS.status)} <> 'cancelled' AND ${COLUMN(experimentTable, COLUMNS.cancelledAt)} IS NULL AND ${COLUMN(experimentTable, COLUMNS.cancelledBy)} IS NULL)
+)`,
+  ),
+  createTableSql(
+    experimentArmTable,
+    [
+      COLUMN(experimentArmTable, COLUMNS.id),
+      COLUMN(experimentArmTable, COLUMNS.workspaceId),
+      COLUMN(experimentArmTable, COLUMNS.experimentId),
+      COLUMN(experimentArmTable, COLUMNS.position),
+      COLUMN(experimentArmTable, COLUMNS.draftId),
+      COLUMN(experimentArmTable, COLUMNS.label),
+    ],
+    `${COLUMN(experimentArmTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(experimentArmTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(experimentArmTable, COLUMNS.experimentId)} REFERENCES "${experimentTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(experimentArmTable, COLUMNS.position)} CHECK (${COLUMN(experimentArmTable, COLUMNS.position)} > 0),
+${COLUMN(experimentArmTable, COLUMNS.label)} CHECK (length(${COLUMN(experimentArmTable, COLUMNS.label)}) > 0),
+UNIQUE(${COLUMN(experimentArmTable, COLUMNS.experimentId)}, ${COLUMN(experimentArmTable, COLUMNS.position)}),
+UNIQUE(${COLUMN(experimentArmTable, COLUMNS.experimentId)}, ${COLUMN(experimentArmTable, COLUMNS.draftId)})`,
+  ),
+  createTableSql(
+    experimentEventTable,
+    [
+      COLUMN(experimentEventTable, COLUMNS.id),
+      COLUMN(experimentEventTable, COLUMNS.workspaceId),
+      COLUMN(experimentEventTable, COLUMNS.experimentId),
+      COLUMN(experimentEventTable, COLUMNS.actorUserId),
+      COLUMN(experimentEventTable, COLUMNS.kind),
+      COLUMN(experimentEventTable, COLUMNS.detail),
+    ],
+    `${COLUMN(experimentEventTable, COLUMNS.id)} PRIMARY KEY,
+${COLUMN(experimentEventTable, COLUMNS.workspaceId)} REFERENCES "${workspaceTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(experimentEventTable, COLUMNS.experimentId)} REFERENCES "${experimentTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(experimentEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
+${COLUMN(experimentEventTable, COLUMNS.kind)} CHECK (${COLUMN(experimentEventTable, COLUMNS.kind)} IN ('created','started','closed','cancelled'))`,
   ),
 ].join("\n\n");
 

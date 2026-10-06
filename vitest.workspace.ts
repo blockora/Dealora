@@ -101,6 +101,10 @@ export default defineConfig({
         find: "@dealora/optimization",
         replacement: new URL("./packages/optimization/src/index.ts", import.meta.url).pathname,
       },
+      {
+        find: "@dealora/experiment",
+        replacement: new URL("./packages/experiment/src/index.ts", import.meta.url).pathname,
+      },
     ],
   },
 });

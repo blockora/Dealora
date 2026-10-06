@@ -58,6 +58,12 @@ import type {
   AgentTraceRunStatus,
   AgentTraceStage,
   AgentTraceOutcome,
+  Experiment,
+  ExperimentArm,
+  ExperimentEvent,
+  ExperimentEventKind,
+  ExperimentMetric,
+  ExperimentStatus,
   NextBestAction,
   NextBestActionKind,
   NextBestActionRiskLevel,
@@ -370,6 +376,44 @@ function isOptionalCount(value: number | null): boolean {
   return value === null || (Number.isSafeInteger(value) && value >= 0);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 22 storage vocabulary — Experiment Engine (ROADMAP.md §29)
+// ---------------------------------------------------------------------------
+
+/**
+ * The one metric this phase derives, enforced independently of any caller.
+ * The vocabulary is closed on the roadmap's own example: a metric no stored
+ * row can feed is refused at the boundary with its owning phase rather than
+ * published as a promise.
+ */
+const EXPERIMENT_METRICS: readonly ExperimentMetric[] = ["positive_reply_rate"];
+
+const EXPERIMENT_STATUS_VALUES: readonly ExperimentStatus[] = [
+  "draft",
+  "running",
+  "closed",
+  "cancelled",
+];
+
+/** Row caps, mirroring the trace phase: a row stays a fact or is refused. */
+const MAX_EXPERIMENT_NAME_LENGTH = 120;
+const MAX_EXPERIMENT_LABEL_LENGTH = 80;
+const MAX_EXPERIMENT_DETAIL_LENGTH = 280;
+
+/** Declared limits, re-checked by the domain; storage refuses out-of-range. */
+const MIN_EXPERIMENT_ARMS = 2;
+const MAX_EXPERIMENT_ARMS = 4;
+const MIN_EXPERIMENT_DURATION_DAYS = 1;
+const MAX_EXPERIMENT_DURATION_DAYS = 90;
+
+function isStoredExperimentMetric(value: string): value is ExperimentMetric {
+  return (EXPERIMENT_METRICS as readonly string[]).includes(value);
+}
+
+function isStoredExperimentStatus(value: string): value is ExperimentStatus {
+  return (EXPERIMENT_STATUS_VALUES as readonly string[]).includes(value);
+}
+
 /**
  * Phase 2 migration.
  *
@@ -380,7 +424,7 @@ function isOptionalCount(value: number | null): boolean {
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 18;
+export const LATEST_SCHEMA_VERSION = 19;
 
 export interface DbState {
   schemaVersion?: number;
@@ -424,6 +468,9 @@ export interface DbState {
   agentEvaluationObservations?: AgentEvaluationObservation[];
   agentTraceRuns?: AgentTraceRun[];
   agentTraceEvents?: AgentTraceEvent[];
+  experiments?: Experiment[];
+  experimentArms?: ExperimentArm[];
+  experimentEvents?: ExperimentEvent[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -472,6 +519,9 @@ export function emptyState(): CompleteDbState {
     agentEvaluationObservations: [],
     agentTraceRuns: [],
     agentTraceEvents: [],
+    experiments: [],
+    experimentArms: [],
+    experimentEvents: [],
   };
 }
 
@@ -746,6 +796,24 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.agentTraceEvents;
   }
 
+  // Phase 22 adds the declared comparisons the Experiment Engine measures: one
+  // row per experiment, one per immutable arm, one append-only row per
+  // lifecycle transition. Additive like every step before it: a Phase 21
+  // document gains three empty tables and keeps every optimization answer it
+  // could already derive, because the upgrade adds no way to *send* anything —
+  // an experiment measures the sends Phases 9–12 already produced. Nothing
+  // before it is touched, no row is rewritten, and no stored result appears:
+  // every comparison number is derived on read, so there is nothing to migrate.
+  if (version >= 19) {
+    state.experiments = Array.isArray(input.experiments) ? input.experiments : base.experiments;
+    state.experimentArms = Array.isArray(input.experimentArms)
+      ? input.experimentArms
+      : base.experimentArms;
+    state.experimentEvents = Array.isArray(input.experimentEvents)
+      ? input.experimentEvents
+      : base.experimentEvents;
+  }
+
   return state;
 }
 
@@ -805,6 +873,9 @@ type RowTable =
   | "agentEvaluationObservations"
   | "agentTraceRuns"
   | "agentTraceEvents"
+  | "experiments"
+  | "experimentArms"
+  | "experimentEvents"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -5503,6 +5574,432 @@ export class Store {
       ),
     };
   }
+
+  // -------------------------------------------------------------------------
+  // Phase 22 — Experiment Engine (ROADMAP.md §29)
+  //
+  // The experiment row is a declaration, not a result: it records what is
+  // compared, on which metric, over how many days. No caller supplies a status,
+  // a timestamp or an identity — every lifecycle write resolves both from the
+  // session and the server's clock, and the CHECK constraints keep the row's
+  // timestamps in agreement with its status. Sample size, conversion,
+  // confidence, cost, revenue impact and the decision are derived on read by
+  // the domain; storage deliberately stores none of them.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Declare one controlled experiment in this workspace.
+   *
+   * Created `draft`: an experiment nobody has started claims nothing. Arms
+   * are declared separately through `addExperimentArm` against **this**
+   * workspace's own immutable drafts, and starting requires at least two of
+   * them — a comparison of one side is not a comparison.
+   */
+  createExperiment(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    name: string;
+    metric: string;
+    durationDays: number;
+  }): Result<Experiment, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    if (name === "" || name.length > MAX_EXPERIMENT_NAME_LENGTH) {
+      return {
+        ok: false,
+        error: toError("INVALID", `name must be 1 to ${MAX_EXPERIMENT_NAME_LENGTH} characters`),
+      };
+    }
+    if (typeof input.metric !== "string" || !isStoredExperimentMetric(input.metric)) {
+      return { ok: false, error: toError("INVALID", "unknown experiment metric") };
+    }
+    if (
+      !Number.isSafeInteger(input.durationDays) ||
+      input.durationDays < MIN_EXPERIMENT_DURATION_DAYS ||
+      input.durationDays > MAX_EXPERIMENT_DURATION_DAYS
+    ) {
+      return {
+        ok: false,
+        error: toError(
+          "INVALID",
+          `durationDays must be a whole number from ${MIN_EXPERIMENT_DURATION_DAYS} to ${MAX_EXPERIMENT_DURATION_DAYS}`,
+        ),
+      };
+    }
+
+    const stamp = toDateTime(now());
+    const row: Experiment = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      name,
+      metric: input.metric,
+      status: "draft",
+      durationDays: input.durationDays,
+      createdBy: input.userId,
+      createdAt: stamp,
+      startedBy: null,
+      startedAt: null,
+      closedBy: null,
+      closedAt: null,
+      cancelledBy: null,
+      cancelledAt: null,
+      cancelReason: null,
+      updatedAt: stamp,
+    };
+    this.mutate("experiments", (rows) => (rows as Experiment[]).push(row));
+    this.appendExperimentEvent(input.workspaceId, input.userId, row.id, "created", null);
+    return { ok: true, value: row };
+  }
+
+  /** One experiment in this workspace, or `null` when it does not exist here. */
+  getExperiment(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    experimentId: EntityId;
+  }): Result<Experiment | null, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const found = this.rows("experiments").find(
+      (row) => row.id === input.experimentId && row.workspaceId === input.workspaceId,
+    );
+    return { ok: true, value: found ?? null };
+  }
+
+  /** Every experiment in this workspace, oldest first by declaration. */
+  listExperiments(
+    workspaceId: EntityId,
+    userId: EntityId,
+    filter?: { status?: ExperimentStatus },
+  ): Result<Experiment[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    if (filter?.status !== undefined && !isStoredExperimentStatus(filter.status)) {
+      return { ok: false, error: toError("INVALID", "unknown experiment status") };
+    }
+    const scoped = this.rows("experiments").filter(
+      (row) =>
+        row.workspaceId === workspaceId &&
+        (filter?.status === undefined || row.status === filter.status),
+    );
+    // Stable total order: declared-at, then id, so two experiments declared in
+    // one millisecond still read in a deterministic order that does not depend
+    // on array insertion or a random id alone.
+    return {
+      ok: true,
+      value: [...scoped].sort((a, b) => {
+        if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      }),
+    };
+  }
+
+  /**
+   * Pin one arm of the comparison to an exact immutable draft.
+   *
+   * The draft must exist in this workspace — resolved through storage, never
+   * accepted from the caller — and an experiment accepts at most
+   * `MAX_EXPERIMENT_ARMS` arms with unique positions and unique drafts. Arms
+   * are declared against a `draft` experiment only: once the window opens,
+   * the comparison is fixed, because changing the sides mid-flight would
+   * silently invalidate what was already measured.
+   */
+  addExperimentArm(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    experimentId: EntityId;
+    draftId: EntityId;
+    label: string;
+  }): Result<ExperimentArm, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+
+    const experiment = this.rows("experiments").find(
+      (row) => row.id === input.experimentId && row.workspaceId === input.workspaceId,
+    );
+    if (!experiment) {
+      return { ok: false, error: toError("NOT_FOUND", "experiment not found") };
+    }
+    if (experiment.status !== "draft") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this experiment is already ${experiment.status}`),
+      };
+    }
+
+    // The arm's draft is resolved through the caller's own authorization, so a
+    // foreign or unknown draft id is NOT_FOUND either way and another tenant's
+    // draft ids stay undiscoverable through this route.
+    const draft = this.rows("personalizedDrafts").find(
+      (row) => row.id === input.draftId && row.workspaceId === input.workspaceId,
+    );
+    if (!draft) {
+      return { ok: false, error: toError("NOT_FOUND", "draft not found") };
+    }
+
+    const label = typeof input.label === "string" ? input.label.trim() : "";
+    if (label === "" || label.length > MAX_EXPERIMENT_LABEL_LENGTH) {
+      return {
+        ok: false,
+        error: toError("INVALID", `label must be 1 to ${MAX_EXPERIMENT_LABEL_LENGTH} characters`),
+      };
+    }
+
+    const existing = this.rows("experimentArms").filter(
+      (row) => row.workspaceId === input.workspaceId && row.experimentId === experiment.id,
+    );
+    if (existing.length >= MAX_EXPERIMENT_ARMS) {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this experiment already has ${MAX_EXPERIMENT_ARMS} arms`),
+      };
+    }
+    if (existing.some((row) => row.draftId === input.draftId)) {
+      return { ok: false, error: toError("CONFLICT", "this draft is already an arm") };
+    }
+    // The position is server-derived: one past the highest declared, so an arm
+    // cannot jump ahead of or behind a side the workspace already named.
+    const position =
+      existing.reduce((max, row) => (row.position > max ? row.position : max), 0) + 1;
+
+    const row: ExperimentArm = {
+      id: newId(),
+      workspaceId: input.workspaceId,
+      experimentId: experiment.id,
+      position,
+      draftId: input.draftId,
+      label,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("experimentArms", (rows) => (rows as ExperimentArm[]).push(row));
+    return { ok: true, value: row };
+  }
+
+  /** Every arm of one experiment, in declared order (position ascending). */
+  listExperimentArms(
+    workspaceId: EntityId,
+    userId: EntityId,
+    experimentId: EntityId,
+  ): Result<ExperimentArm[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const experiment = this.rows("experiments").find(
+      (row) => row.id === experimentId && row.workspaceId === workspaceId,
+    );
+    if (!experiment) {
+      return { ok: false, error: toError("NOT_FOUND", "experiment not found") };
+    }
+    return {
+      ok: true,
+      value: this.rows("experimentArms")
+        .filter((row) => row.workspaceId === workspaceId && row.experimentId === experimentId)
+        .sort((a, b) => a.position - b.position),
+    };
+  }
+
+  /**
+   * Start the experiment's declared window.
+   *
+   * Requires at least two arms (a comparison of one side is not a comparison)
+   * and a `draft` status. The open instant is the server's clock; the caller
+   * supplies nothing but the experiment id.
+   */
+  startExperiment(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    experimentId: EntityId;
+  }): Result<Experiment, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const experiment = this.rows("experiments").find(
+      (row) => row.id === input.experimentId && row.workspaceId === input.workspaceId,
+    );
+    if (!experiment) {
+      return { ok: false, error: toError("NOT_FOUND", "experiment not found") };
+    }
+    if (experiment.status !== "draft") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this experiment is already ${experiment.status}`),
+      };
+    }
+    const armCount = this.rows("experimentArms").filter(
+      (row) => row.workspaceId === input.workspaceId && row.experimentId === experiment.id,
+    ).length;
+    if (armCount < MIN_EXPERIMENT_ARMS) {
+      return {
+        ok: false,
+        error: toError(
+          "CONFLICT",
+          `an experiment needs at least ${MIN_EXPERIMENT_ARMS} arms before it can start`,
+        ),
+      };
+    }
+    const stamp = toDateTime(now());
+    const started: Experiment = {
+      ...experiment,
+      status: "running",
+      startedBy: input.userId,
+      startedAt: stamp,
+      updatedAt: stamp,
+    };
+    this.replaceExperiment(started);
+    this.appendExperimentEvent(input.workspaceId, input.userId, experiment.id, "started", null);
+    return { ok: true, value: started };
+  }
+
+  /**
+   * Close the experiment's window, freezing the analysis instant.
+   *
+   * A `running` experiment only: the close instant is the server's clock, and
+   * the decision it implies is derived by the domain from the rows, never
+   * accepted from the caller — there is no `winner` argument here, by design.
+   */
+  closeExperiment(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    experimentId: EntityId;
+  }): Result<Experiment, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const experiment = this.rows("experiments").find(
+      (row) => row.id === input.experimentId && row.workspaceId === input.workspaceId,
+    );
+    if (!experiment) {
+      return { ok: false, error: toError("NOT_FOUND", "experiment not found") };
+    }
+    if (experiment.status !== "running") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this experiment is ${experiment.status}, not running`),
+      };
+    }
+    const stamp = toDateTime(now());
+    const closed: Experiment = {
+      ...experiment,
+      status: "closed",
+      closedBy: input.userId,
+      closedAt: stamp,
+      updatedAt: stamp,
+    };
+    this.replaceExperiment(closed);
+    this.appendExperimentEvent(input.workspaceId, input.userId, experiment.id, "closed", null);
+    return { ok: true, value: closed };
+  }
+
+  /**
+   * Cancel the experiment.
+   *
+   * Terminal and audit-preserving: every row collected so far stays exactly
+   * where it is, and the domain refuses to derive a winner from a cancelled
+   * comparison. A `draft` or `running` experiment may be cancelled; a `closed`
+   * or `cancelled` one is already terminal.
+   */
+  cancelExperiment(input: {
+    workspaceId: EntityId;
+    userId: EntityId;
+    experimentId: EntityId;
+    reason: string | null;
+  }): Result<Experiment, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const experiment = this.rows("experiments").find(
+      (row) => row.id === input.experimentId && row.workspaceId === input.workspaceId,
+    );
+    if (!experiment) {
+      return { ok: false, error: toError("NOT_FOUND", "experiment not found") };
+    }
+    if (experiment.status === "closed" || experiment.status === "cancelled") {
+      return {
+        ok: false,
+        error: toError("CONFLICT", `this experiment is already ${experiment.status}`),
+      };
+    }
+    const reason = readOptionalText(input.reason, MAX_EXPERIMENT_DETAIL_LENGTH);
+    if (!reason.ok) {
+      return {
+        ok: false,
+        error: toError(
+          "INVALID",
+          `reason must be at most ${MAX_EXPERIMENT_DETAIL_LENGTH} characters`,
+        ),
+      };
+    }
+    const stamp = toDateTime(now());
+    const cancelled: Experiment = {
+      ...experiment,
+      status: "cancelled",
+      cancelledBy: input.userId,
+      cancelledAt: stamp,
+      cancelReason: reason.value,
+      updatedAt: stamp,
+    };
+    this.replaceExperiment(cancelled);
+    this.appendExperimentEvent(
+      input.workspaceId,
+      input.userId,
+      experiment.id,
+      "cancelled",
+      reason.value,
+    );
+    return { ok: true, value: cancelled };
+  }
+
+  /** Every lifecycle event of one experiment, oldest first by (time, id). */
+  listExperimentEvents(
+    workspaceId: EntityId,
+    userId: EntityId,
+    experimentId: EntityId,
+  ): Result<ExperimentEvent[], StorageError> {
+    const auth = this.requireWorkspace(workspaceId, userId);
+    if (!auth.ok) return auth;
+    const experiment = this.rows("experiments").find(
+      (row) => row.id === experimentId && row.workspaceId === workspaceId,
+    );
+    if (!experiment) {
+      return { ok: false, error: toError("NOT_FOUND", "experiment not found") };
+    }
+    const events = this.rows("experimentEvents")
+      .filter((row) => row.workspaceId === workspaceId && row.experimentId === experimentId)
+      .sort((a, b) => {
+        if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      });
+    return { ok: true, value: events };
+  }
+
+  /** Append one lifecycle event. Internal: identity and clock are server-side. */
+  private appendExperimentEvent(
+    workspaceId: EntityId,
+    actorUserId: EntityId,
+    experimentId: EntityId,
+    kind: ExperimentEventKind,
+    detail: string | null,
+  ): void {
+    const row: ExperimentEvent = {
+      id: newId(),
+      workspaceId,
+      experimentId,
+      actorUserId,
+      kind,
+      detail,
+      createdAt: toDateTime(now()),
+    };
+    this.mutate("experimentEvents", (rows) => (rows as ExperimentEvent[]).push(row));
+  }
+
+  /** Replace one experiment row in place, preserving insertion order. */
+  private replaceExperiment(next: Experiment): void {
+    this.mutate("experiments", (rows) => {
+      const typed = rows as Experiment[];
+      typed.splice(
+        typed.findIndex((row) => row.id === next.id),
+        1,
+        next,
+      );
+    });
+  }
 }
 
 /** Default single-process store for local runs. */
@@ -5667,6 +6164,16 @@ export const db = {
   closeAgentTraceRun: store.closeAgentTraceRun.bind(store),
   createAgentTraceEvent: store.createAgentTraceEvent.bind(store),
   listAgentTraceEvents: store.listAgentTraceEvents.bind(store),
+
+  createExperiment: store.createExperiment.bind(store),
+  getExperiment: store.getExperiment.bind(store),
+  listExperiments: store.listExperiments.bind(store),
+  addExperimentArm: store.addExperimentArm.bind(store),
+  listExperimentArms: store.listExperimentArms.bind(store),
+  startExperiment: store.startExperiment.bind(store),
+  closeExperiment: store.closeExperiment.bind(store),
+  cancelExperiment: store.cancelExperiment.bind(store),
+  listExperimentEvents: store.listExperimentEvents.bind(store),
 
   authorize: store.authorize.bind(store),
   resolveWorkspace: store.resolveWorkspace.bind(store),

@@ -129,6 +129,12 @@ export type {
   AgentEvaluationRun,
   AgentTraceRun,
   AgentTraceEvent,
+  Experiment,
+  ExperimentArm,
+  ExperimentEvent,
+  ExperimentEventKind,
+  ExperimentMetric,
+  ExperimentStatus,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -177,6 +183,9 @@ export {
   agentEvaluationObservationTable,
   agentTraceRunTable,
   agentTraceEventTable,
+  experimentTable,
+  experimentArmTable,
+  experimentEventTable,
   createTableSql,
   slugify,
   capString,
