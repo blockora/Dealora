@@ -54,20 +54,27 @@ When there is a conflict between a new feature and the core revenue workflow, pr
 
 ---
 
-3. CURRENT REPOSITORY STATE
+3. CURRENT REPOSITORY STATE (HISTORICAL BASELINE)
 
-The repository currently contains:
+This section is a historical baseline. It records the repository as it
+existed when this roadmap was written, before any phase had been
+implemented, and is kept for provenance only. It does not describe the
+current repository.
+
+At that time the repository contained:
 
 Dealora/
 ├── DEALORA_BLUEPRINT.md
 ├── LICENSE
 └── README.md
 
-The repository is currently a product foundation repository.
+It was then a product foundation repository, and the application
+architecture had not yet been fully implemented — so the next work was to
+establish a clean engineering foundation before building advanced
+autonomous capabilities.
 
-The application architecture has not yet been fully implemented.
-
-The next work should therefore focus on establishing a clean engineering foundation before building advanced autonomous capabilities.
+The current repository state is tracked in the "Repository status" section
+of README.md and against each phase in this document.
 
 ---
 

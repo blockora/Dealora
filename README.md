@@ -28,8 +28,9 @@ Engine**, **Phase 13 — Meeting Workflow**, **Phase 14 — Next Best Action**,
 **Phase 15 — Revenue Graph**, **Phase 16 — Cost Engine**,
 **Phase 17 — Revenue Dashboard**, **Phase 18 — Agent System**,
 **Phase 19 — Agent Evaluation**, **Phase 20 — Agent Trace &
-Observability**, **Phase 21 — Optimization Engine** and
-**Phase 22 — Experiment Engine** (see [`ROADMAP.md`](./ROADMAP.md)).
+Observability**, **Phase 21 — Optimization Engine**,
+**Phase 22 — Experiment Engine** and **Phase 23 — CRM Integrations**
+(see [`ROADMAP.md`](./ROADMAP.md)).
 
 Phase 1 delivers the minimum multi-tenant SaaS infrastructure: user identity
 with scrypt-hashed credentials, opaque bearer sessions, workspaces as the
@@ -613,7 +614,33 @@ end over a real journey (both messages genuinely sent through the approval
 and send path, one positive reply, the comparison refusing a winner at this
 sample) by `tests/phases9-22-integration.test.ts`.
 
-Next is **Phase 23 — CRM Integrations**.
+Phase 23 adds CRM Integrations: `ROADMAP.md` §30's two requirements — clear
+permission scopes and standardized adapter interfaces, with no product
+hard-coded around one vendor — become a closed catalog of seven scopes with
+each of the six CRM operations mapped to exactly one of them, all six
+potential systems published whether or not a deployment has an adapter for
+one, and an adapter registry that product code resolves **by id only**: a
+system with no registered adapter fails closed as "not configured" instead
+of falling back to a default vendor. A change-set is always derived from
+this workspace's stored rows — never supplied by a caller, never carrying
+an opportunity value, never including an archived account — and frozen
+under a digest that is re-derived when a person decides and re-checked,
+along with the connection's revocation and its granted scopes, again before
+execution, so an approval can only mean "I approved *this payload*." Only
+the adapter's own confirmation writes `executed`; a refusal is recorded as
+`failed` with a closed code. The shipped adapter is a **sandbox that
+performs no network I/O** — no CRM credential exists in this repository,
+and `ROADMAP.md` §18's OAuth/credential requirement stays open for the
+first real adapter. The phase adds `integration_connections`,
+`crm_sync_requests` and `crm_sync_events` (schema v20) with an append-only
+lifecycle trail, twelve workspace-scoped routes whose write bodies carry no
+status, decision or identity, and one new Phase 16 execution kind,
+`crm_sync`, for cost attribution. Its gate — the published scopes and
+refusals, adapter resolution by id, digest-bound decisions, revocation
+re-checks, tenant isolation, byte-identical derivations and the negative
+space — is covered by `tests/phase23-gate.test.ts`.
+
+Next is **Phase 24 — Workflow Engine**.
 
 | Source of truth | Purpose                        |
 | --------------- | ------------------------------ |
@@ -679,7 +706,12 @@ Engine ([0012](./docs/adr/0012-conversation-engine.md)), the Meeting Workflow
 ([0016](./docs/adr/0016-cost-engine.md)), the Revenue Dashboard
 ([0017](./docs/adr/0017-revenue-dashboard.md)), the Agent System
 ([0018](./docs/adr/0018-agent-system.md)), and Agent Evaluation
-([0019](./docs/adr/0019-agent-evaluation.md)).
+([0019](./docs/adr/0019-agent-evaluation.md)), the Agent Trace &
+Observability decision
+([0020](./docs/adr/0020-agent-trace-observability.md)), the Optimization
+Engine ([0021](./docs/adr/0021-optimization-engine.md)), the Experiment
+Engine ([0022](./docs/adr/0022-experiment-engine.md)) and CRM Integrations
+([0023](./docs/adr/0023-crm-integrations.md)).
 
 ## Getting started
 
