@@ -1,0 +1,13 @@
+{
+  "name": "@dealora/workflows",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DEALORA Phase 24 workflow domain types and validation rules.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": "./dist/index.js" },
+  "dependencies": {},
+  "devDependencies": {}
+}
