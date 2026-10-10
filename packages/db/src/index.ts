@@ -156,6 +156,10 @@ export type {
   CrmSyncRequest,
   CrmSyncEventKind,
   CrmSyncEvent,
+  WorkflowDefinitionRecord,
+  WorkflowRunRecord,
+  WorkflowStepExecutionRecord,
+  WorkflowAuditEventRecord,
 } from "./types.js";
 export { toDateTime } from "./types.js";
 
@@ -210,6 +214,10 @@ export {
   integrationConnectionTable,
   crmSyncTable,
   crmSyncEventTable,
+  workflowDefinitionTable,
+  workflowRunTable,
+  workflowStepExecutionTable,
+  workflowAuditEventTable,
   createTableSql,
   slugify,
   capString,

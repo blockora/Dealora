@@ -5291,7 +5291,7 @@ describe("agent trace runs and events", () => {
   it("keeps the migration chain contiguous from 2 to the latest version", () => {
     // Phase 23 appended schema v20; the pin is the current latest, so each
     // additive migration phase updates it rather than rewriting history.
-    expect(LATEST_SCHEMA_VERSION).toBe(20);
+    expect(LATEST_SCHEMA_VERSION).toBe(21);
     // Every intermediate version migrates without throwing, so no step in the
     // chain is skipped.
     for (let version = 1; version <= LATEST_SCHEMA_VERSION; version += 1) {
@@ -5311,6 +5311,105 @@ describe("agent trace runs and events", () => {
       expect(migrated.integrationConnections).toEqual([]);
       expect(migrated.crmSyncRequests).toEqual([]);
       expect(migrated.crmSyncEvents).toEqual([]);
+      expect(migrated.workflowDefinitions).toEqual([]);
+      expect(migrated.workflowRuns).toEqual([]);
+      expect(migrated.workflowStepExecutions).toEqual([]);
+      expect(migrated.workflowAuditEvents).toEqual([]);
     }
+  });
+});
+
+describe("Phase 24 workflow persistence", () => {
+  it("isolates definitions/runs by workspace and pins immutable versions", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const other = makeOwner(store, "other@example.com");
+    const workspaceId = makeWorkspace(store, owner.id, "Workflow Tenant");
+    const otherWorkspaceId = makeWorkspace(store, other.id, "Other Tenant");
+    const definition = { id: "flow", name: "Initial", nodes: [{ id: "start", kind: "trigger" }], edges: [] };
+    const v1 = store.createWorkflowDefinition({ workspaceId, userId: owner.id, workflowId: "flow", name: "Initial", definition });
+    expect(isOk(v1)).toBe(true);
+    if (!isOk(v1)) return;
+    const v2 = store.createWorkflowDefinition({ workspaceId, userId: owner.id, workflowId: "flow", name: "Updated", definition: { ...definition, name: "Updated" } });
+    expect(isOk(v2) && v2.value.version).toBe(2);
+    expect(store.getWorkflowDefinition({ workspaceId: otherWorkspaceId, userId: other.id, workflowId: "flow" })).toMatchObject({ ok: true, value: null });
+    const run = store.createWorkflowRun({ workspaceId, userId: owner.id, workflowId: "flow", version: 1, currentNodeId: "start" });
+    expect(isOk(run) && run.value.workflowVersion).toBe(1);
+    if (isOk(run)) expect(store.getWorkflowRun({ workspaceId: otherWorkspaceId, userId: other.id, runId: run.value.id })).toMatchObject({ ok: true, value: null });
+  });
+
+  it("isolates stored definition versions from create, duplicate, and get results", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Immutable Tenant");
+    const definition = { id: "immutable", name: "Original", nodes: [{ id: "node", kind: "trigger" }], edges: [] };
+    const input = { workspaceId, userId: owner.id, workflowId: "immutable", name: "Original", definition };
+
+    const created = store.createWorkflowDefinition(input);
+    if (!isOk(created)) throw new Error("definition setup failed");
+    created.value.definition.name = "Changed from create";
+    created.value.definition.nodes[0]!.id = "changed-node";
+
+    const fetchedAfterCreate = store.getWorkflowDefinition({ workspaceId, userId: owner.id, workflowId: "immutable", version: 1 });
+    expect(fetchedAfterCreate).toMatchObject({ ok: true, value: { definition: { name: "Original", nodes: [{ id: "node" }] } } });
+    if (!isOk(fetchedAfterCreate) || fetchedAfterCreate.value === null) throw new Error("definition fetch failed");
+    fetchedAfterCreate.value.definition.name = "Changed from get";
+
+    const duplicate = store.createWorkflowDefinition(input);
+    if (!isOk(duplicate)) throw new Error("duplicate definition setup failed");
+    duplicate.value.definition.name = "Changed from duplicate";
+
+    expect(store.getWorkflowDefinition({ workspaceId, userId: owner.id, workflowId: "immutable", version: 1 })).toMatchObject({
+      ok: true, value: { version: 1, definition: { name: "Original", nodes: [{ id: "node" }] } },
+    });
+  });
+
+  it("keeps workflow audit events append-only through repository APIs", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Audit Tenant");
+    const definition = store.createWorkflowDefinition({ workspaceId, userId: owner.id, workflowId: "audit-flow", name: "Audit flow", definition: { id: "audit-flow", name: "Audit flow", nodes: [], edges: [] } });
+    if (!isOk(definition)) throw new Error("definition setup failed");
+    const run = store.createWorkflowRun({ workspaceId, userId: owner.id, workflowId: "audit-flow", version: 1, currentNodeId: null });
+    if (!isOk(run)) throw new Error("run setup failed");
+
+    expect(store.appendWorkflowAuditEvent({ workspaceId, userId: owner.id, runId: run.value.id, kind: "started", nodeId: null, attempt: null, detail: null })).toMatchObject({ ok: true });
+    expect(typeof store.updateWorkflowAuditEvent).toBe("undefined");
+    expect(typeof store.deleteWorkflowAuditEvent).toBe("undefined");
+    const events = store.listWorkflowAuditEvents({ workspaceId, userId: owner.id, runId: run.value.id });
+    expect(events).toMatchObject({ ok: true, value: [{ kind: "started" }] });
+  });
+
+  it("returns the matching immutable definition version when an older version is reinserted", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Version Tenant");
+    const definitionA = { id: "versioned", name: "A", nodes: [{ id: "a", kind: "trigger" }], edges: [] };
+    const definitionB = { id: "versioned", name: "B", nodes: [{ id: "b", kind: "action" }], edges: [] };
+    const v1 = store.createWorkflowDefinition({ workspaceId, userId: owner.id, workflowId: "versioned", name: "A", definition: definitionA });
+    const v2 = store.createWorkflowDefinition({ workspaceId, userId: owner.id, workflowId: "versioned", name: "B", definition: definitionB });
+    const duplicateA = store.createWorkflowDefinition({ workspaceId, userId: owner.id, workflowId: "versioned", name: "A", definition: definitionA });
+    expect(isOk(v1) && v1.value.version).toBe(1);
+    expect(isOk(v2) && v2.value.version).toBe(2);
+    expect(isOk(duplicateA) && duplicateA.value.version).toBe(1);
+  });
+
+  it("persists attempts, audit events, and terminal run state", () => {
+    const store = seed();
+    const owner = makeOwner(store);
+    const workspaceId = makeWorkspace(store, owner.id, "Run Tenant");
+    const definition = store.createWorkflowDefinition({ workspaceId, userId: owner.id, workflowId: "f", name: "Flow", definition: { id: "f", name: "Flow", nodes: [{ id: "n", kind: "action" }], edges: [] } });
+    if (!isOk(definition)) throw new Error("definition setup failed");
+    const run = store.createWorkflowRun({ workspaceId, userId: owner.id, workflowId: "f", version: 1, currentNodeId: "n" });
+    if (!isOk(run)) throw new Error("run setup failed");
+    const step = store.recordWorkflowStepExecution({ workspaceId, userId: owner.id, runId: run.value.id, nodeId: "n", attempt: 1, status: "failed", input: null, output: null, error: "failed", startedAt: null, completedAt: null });
+    expect(isOk(step)).toBe(true);
+    expect(store.recordWorkflowStepExecution({ workspaceId, userId: owner.id, runId: run.value.id, nodeId: "n", attempt: 1, status: "failed", input: null, output: null, error: "failed", startedAt: null, completedAt: null })).toMatchObject({ ok: false });
+    const event = store.appendWorkflowAuditEvent({ workspaceId, userId: owner.id, runId: run.value.id, kind: "step_failed", nodeId: "n", attempt: 1, detail: "recorded failure" });
+    expect(isOk(event)).toBe(true);
+    expect(store.listWorkflowAuditEvents({ workspaceId, userId: owner.id, runId: run.value.id })).toMatchObject({ ok: true, value: [{ kind: "step_failed" }] });
+    const closed = store.updateWorkflowRun({ workspaceId, userId: owner.id, runId: run.value.id, status: "failed", currentNodeId: "n" });
+    expect(closed).toMatchObject({ ok: true, value: { status: "failed" } });
+    expect(store.updateWorkflowRun({ workspaceId, userId: owner.id, runId: run.value.id, status: "running", currentNodeId: "n" })).toMatchObject({ ok: false });
   });
 });

@@ -76,6 +76,10 @@ import type {
   CrmOperationKind,
   CrmLifecycleStage,
   CrmOpportunityStatus,
+  WorkflowDefinitionRecord,
+  WorkflowRunRecord,
+  WorkflowStepExecutionRecord,
+  WorkflowAuditEventRecord,
   CrmChangeSet,
   NextBestAction,
   NextBestActionKind,
@@ -727,7 +731,7 @@ function validateCrmChangeSet(value: unknown, accountId: EntityId): string | nul
  * Migrations are additive and ordered by `LATEST_SCHEMA_VERSION`; a future
  * schema change appends a new step rather than rewriting this one.
  */
-export const LATEST_SCHEMA_VERSION = 20;
+export const LATEST_SCHEMA_VERSION = 21;
 
 export interface DbState {
   schemaVersion?: number;
@@ -777,6 +781,10 @@ export interface DbState {
   integrationConnections?: IntegrationConnection[];
   crmSyncRequests?: CrmSyncRequest[];
   crmSyncEvents?: CrmSyncEvent[];
+  workflowDefinitions?: WorkflowDefinitionRecord[];
+  workflowRuns?: WorkflowRunRecord[];
+  workflowStepExecutions?: WorkflowStepExecutionRecord[];
+  workflowAuditEvents?: WorkflowAuditEventRecord[];
 }
 
 /** A fully-populated store state: every table present, no optional tables. */
@@ -831,6 +839,10 @@ export function emptyState(): CompleteDbState {
     integrationConnections: [],
     crmSyncRequests: [],
     crmSyncEvents: [],
+    workflowDefinitions: [],
+    workflowRuns: [],
+    workflowStepExecutions: [],
+    workflowAuditEvents: [],
   };
 }
 
@@ -1145,6 +1157,13 @@ export function migrateState(input: DbState): CompleteDbState {
       : base.crmSyncEvents;
   }
 
+  // Phase 24 adds immutable workflow definitions/versions, run state, step attempts,
+  // and append-only audit events. Existing versions remain untouched.
+  state.workflowDefinitions = Array.isArray(input.workflowDefinitions) ? input.workflowDefinitions : base.workflowDefinitions;
+  state.workflowRuns = Array.isArray(input.workflowRuns) ? input.workflowRuns : base.workflowRuns;
+  state.workflowStepExecutions = Array.isArray(input.workflowStepExecutions) ? input.workflowStepExecutions : base.workflowStepExecutions;
+  state.workflowAuditEvents = Array.isArray(input.workflowAuditEvents) ? input.workflowAuditEvents : base.workflowAuditEvents;
+
   return state;
 }
 
@@ -1210,6 +1229,10 @@ type RowTable =
   | "integrationConnections"
   | "crmSyncRequests"
   | "crmSyncEvents"
+  | "workflowDefinitions"
+  | "workflowRuns"
+  | "workflowStepExecutions"
+  | "workflowAuditEvents"
   | keyof BrainTables;
 
 interface BrainTables {
@@ -5541,6 +5564,107 @@ export class Store {
           event.workspaceId === workspaceId && (agentId === undefined || event.agentId === agentId),
       ),
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 24 — Workflow persistence (ROADMAP.md §31)
+  // -------------------------------------------------------------------------
+
+  createWorkflowDefinition(input: {
+    workspaceId: EntityId; userId: EntityId; workflowId?: EntityId;
+    name: string; definition: WorkflowDefinitionRecord["definition"];
+  }): Result<WorkflowDefinitionRecord, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const workflowId = input.workflowId ?? newId();
+    if (!input.name.trim() || input.name.length > 200 || input.definition.name.trim() === "") {
+      return { ok: false, error: toError("INVALID", "workflow name is required and must be at most 200 characters") };
+    }
+    const prior = this.rows("workflowDefinitions").filter((row) => row.workspaceId === input.workspaceId && row.id === workflowId);
+    const identical = prior.find((row) => JSON.stringify(row.definition) === JSON.stringify(input.definition));
+    if (identical !== undefined) return { ok: true, value: structuredClone(identical) };
+    const row: WorkflowDefinitionRecord = {
+      id: workflowId, workspaceId: input.workspaceId, version: prior.reduce((v, r) => Math.max(v, r.version), 0) + 1,
+      name: input.name.trim(), definition: structuredClone(input.definition), createdBy: input.userId, createdAt: toDateTime(now()),
+    };
+    this.mutate("workflowDefinitions", (rows) => (rows as WorkflowDefinitionRecord[]).push(row));
+    return { ok: true, value: structuredClone(row) };
+  }
+
+  getWorkflowDefinition(input: { workspaceId: EntityId; userId: EntityId; workflowId: EntityId; version?: number }): Result<WorkflowDefinitionRecord | null, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const rows = this.rows("workflowDefinitions").filter((row) => row.workspaceId === input.workspaceId && row.id === input.workflowId && (input.version === undefined || row.version === input.version));
+    const definition = rows.sort((a, b) => b.version - a.version)[0];
+    return { ok: true, value: definition === undefined ? null : structuredClone(definition) };
+  }
+
+  createWorkflowRun(input: { workspaceId: EntityId; userId: EntityId; workflowId: EntityId; version: number; currentNodeId: string | null }): Result<WorkflowRunRecord, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const definition = this.rows("workflowDefinitions").find((row) => row.workspaceId === input.workspaceId && row.id === input.workflowId && row.version === input.version);
+    if (!definition) return { ok: false, error: toError("NOT_FOUND", "workflow version not found") };
+    if (input.currentNodeId !== null && !definition.definition.nodes.some((node) => node.id === input.currentNodeId)) return { ok: false, error: toError("INVALID", "current node is not in the workflow version") };
+    const timestamp = toDateTime(now());
+    const row: WorkflowRunRecord = { id: newId(), workspaceId: input.workspaceId, workflowId: input.workflowId, workflowVersion: input.version, status: "pending", currentNodeId: input.currentNodeId, createdBy: input.userId, createdAt: timestamp, updatedAt: timestamp };
+    this.mutate("workflowRuns", (rows) => (rows as WorkflowRunRecord[]).push(row));
+    return { ok: true, value: row };
+  }
+
+  updateWorkflowRun(input: { workspaceId: EntityId; userId: EntityId; runId: EntityId; status: WorkflowRunRecord["status"]; currentNodeId: string | null }): Result<WorkflowRunRecord, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const run = this.rows("workflowRuns").find((row) => row.id === input.runId && row.workspaceId === input.workspaceId);
+    if (!run) return { ok: false, error: toError("NOT_FOUND", "workflow run not found") };
+    if (["completed", "failed", "stopped"].includes(run.status)) return { ok: false, error: toError("CONFLICT", "terminal workflow run cannot be updated") };
+    const updated = { ...run, status: input.status, currentNodeId: input.currentNodeId, updatedAt: toDateTime(now()) };
+    this.mutate("workflowRuns", (rows) => { const list = rows as WorkflowRunRecord[]; list.splice(list.findIndex((row) => row.id === run.id), 1, updated); });
+    return { ok: true, value: updated };
+  }
+
+  getWorkflowRun(input: { workspaceId: EntityId; userId: EntityId; runId: EntityId }): Result<WorkflowRunRecord | null, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    return { ok: true, value: this.rows("workflowRuns").find((row) => row.id === input.runId && row.workspaceId === input.workspaceId) ?? null };
+  }
+
+  recordWorkflowStepExecution(input: Omit<WorkflowStepExecutionRecord, "id" | "createdAt" | "workflowId" | "workflowVersion"> & { userId: EntityId }): Result<WorkflowStepExecutionRecord, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const run = this.rows("workflowRuns").find((row) => row.id === input.runId && row.workspaceId === input.workspaceId);
+    if (!run) return { ok: false, error: toError("NOT_FOUND", "workflow run not found") };
+    if (["completed", "failed", "stopped"].includes(run.status)) return { ok: false, error: toError("CONFLICT", "terminal workflow run cannot accept steps") };
+    if (!Number.isInteger(input.attempt) || input.attempt < 1 || !this.rows("workflowDefinitions").find((row) => row.workspaceId === run.workspaceId && row.id === run.workflowId && row.version === run.workflowVersion)?.definition.nodes.some((node) => node.id === input.nodeId)) return { ok: false, error: toError("INVALID", "invalid workflow node or attempt") };
+    if (this.rows("workflowStepExecutions").some((row) => row.workspaceId === input.workspaceId && row.runId === run.id && row.nodeId === input.nodeId && row.attempt === input.attempt)) return { ok: false, error: toError("CONFLICT", "step attempt already exists") };
+    const { userId: _userId, ...data } = input;
+    const row: WorkflowStepExecutionRecord = { ...data, workflowId: run.workflowId, workflowVersion: run.workflowVersion, id: newId(), createdAt: toDateTime(now()) };
+    this.mutate("workflowStepExecutions", (rows) => (rows as WorkflowStepExecutionRecord[]).push(row));
+    return { ok: true, value: row };
+  }
+
+  listWorkflowStepExecutions(input: { workspaceId: EntityId; userId: EntityId; runId: EntityId }): Result<WorkflowStepExecutionRecord[], StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    if (!this.rows("workflowRuns").some((row) => row.id === input.runId && row.workspaceId === input.workspaceId)) return { ok: false, error: toError("NOT_FOUND", "workflow run not found") };
+    return { ok: true, value: this.rows("workflowStepExecutions").filter((row) => row.runId === input.runId && row.workspaceId === input.workspaceId).sort((a, b) => a.nodeId.localeCompare(b.nodeId) || a.attempt - b.attempt) };
+  }
+
+  appendWorkflowAuditEvent(input: Omit<WorkflowAuditEventRecord, "id" | "createdAt"> & { userId: EntityId }): Result<WorkflowAuditEventRecord, StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    const run = this.rows("workflowRuns").find((row) => row.id === input.runId && row.workspaceId === input.workspaceId);
+    if (!run) return { ok: false, error: toError("NOT_FOUND", "workflow run not found") };
+    const { userId: _userId, ...data } = input;
+    const row: WorkflowAuditEventRecord = { ...data, actorUserId: input.userId, id: newId(), createdAt: toDateTime(now()) };
+    this.mutate("workflowAuditEvents", (rows) => (rows as WorkflowAuditEventRecord[]).push(row));
+    return { ok: true, value: row };
+  }
+
+  listWorkflowAuditEvents(input: { workspaceId: EntityId; userId: EntityId; runId: EntityId }): Result<WorkflowAuditEventRecord[], StorageError> {
+    const auth = this.requireWorkspace(input.workspaceId, input.userId);
+    if (!auth.ok) return auth;
+    if (!this.rows("workflowRuns").some((row) => row.id === input.runId && row.workspaceId === input.workspaceId)) return { ok: false, error: toError("NOT_FOUND", "workflow run not found") };
+    return { ok: true, value: this.rows("workflowAuditEvents").filter((row) => row.runId === input.runId && row.workspaceId === input.workspaceId) };
   }
 
   // -------------------------------------------------------------------------

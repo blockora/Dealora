@@ -2804,3 +2804,62 @@ export interface CrmSyncEvent {
   detail: string | null;
   createdAt: DateTime;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 24 — Workflow persistence
+// ---------------------------------------------------------------------------
+
+export type StoredWorkflowRunStatus = "pending" | "running" | "paused" | "waiting" | "failed" | "completed" | "stopped";
+export type StoredWorkflowStepStatus = "pending" | "running" | "succeeded" | "failed" | "waiting" | "paused";
+
+/** Immutable snapshot of one workspace workflow definition version. */
+export interface WorkflowDefinitionRecord {
+  id: EntityId;
+  workspaceId: EntityId;
+  version: number;
+  name: string;
+  definition: { id: string; name: string; nodes: readonly { id: string; kind: string; name?: string; config?: Readonly<Record<string, unknown>> }[]; edges: readonly { from: string; to: string }[] };
+  createdBy: EntityId;
+  createdAt: DateTime;
+}
+
+export interface WorkflowRunRecord {
+  id: EntityId;
+  workspaceId: EntityId;
+  workflowId: EntityId;
+  workflowVersion: number;
+  status: StoredWorkflowRunStatus;
+  currentNodeId: string | null;
+  createdBy: EntityId;
+  createdAt: DateTime;
+  updatedAt: DateTime;
+}
+
+export interface WorkflowStepExecutionRecord {
+  id: EntityId;
+  workspaceId: EntityId;
+  runId: EntityId;
+  workflowId: EntityId;
+  workflowVersion: number;
+  nodeId: string;
+  attempt: number;
+  status: StoredWorkflowStepStatus;
+  input: unknown;
+  output: unknown;
+  error: string | null;
+  startedAt: DateTime | null;
+  completedAt: DateTime | null;
+  createdAt: DateTime;
+}
+
+export interface WorkflowAuditEventRecord {
+  id: EntityId;
+  workspaceId: EntityId;
+  runId: EntityId;
+  actorUserId: EntityId;
+  kind: "started" | "step_started" | "step_succeeded" | "step_failed" | "paused" | "resumed" | "waiting" | "retried" | "completed" | "stopped" | "failed";
+  nodeId: string | null;
+  attempt: number | null;
+  detail: string | null;
+  createdAt: DateTime;
+}

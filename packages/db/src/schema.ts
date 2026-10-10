@@ -810,6 +810,12 @@ export const integrationConnectionTable = "integration_connections" as const;
 export const crmSyncTable = "crm_sync_requests" as const;
 export const crmSyncEventTable = "crm_sync_events" as const;
 
+/** Phase 24 — immutable workflow versions, runs, attempts, and append-only events. */
+export const workflowDefinitionTable = "workflow_definitions" as const;
+export const workflowRunTable = "workflow_runs" as const;
+export const workflowStepExecutionTable = "workflow_step_executions" as const;
+export const workflowAuditEventTable = "workflow_audit_events" as const;
+
 /** All tables, in creation order — the canonical table list. */
 export const tables = [
   userTable,
@@ -858,6 +864,10 @@ export const tables = [
   integrationConnectionTable,
   crmSyncTable,
   crmSyncEventTable,
+  workflowDefinitionTable,
+  workflowRunTable,
+  workflowStepExecutionTable,
+  workflowAuditEventTable,
 ] as const;
 
 function COLUMN(table: string, column: string): string {
@@ -1137,6 +1147,27 @@ export const indexes = {
     `${COLUMN(integrationConnectionTable, COLUMNS.status)} NOT NULL`,
     `UNIQUE(${COLUMN(integrationConnectionTable, COLUMNS.workspaceId)}, ${COLUMN(integrationConnectionTable, COLUMNS.adapterId)})`,
   ],
+  workflowDefinitions: [
+    `${COLUMN(workflowDefinitionTable, COLUMNS.id)} NOT NULL`,
+    `${COLUMN(workflowDefinitionTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(workflowDefinitionTable, COLUMNS.version)} NOT NULL`,
+    `UNIQUE(${COLUMN(workflowDefinitionTable, COLUMNS.workspaceId)}, ${COLUMN(workflowDefinitionTable, COLUMNS.id)}, ${COLUMN(workflowDefinitionTable, COLUMNS.version)})`,
+  ],
+  workflowRuns: [
+    `${COLUMN(workflowRunTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(workflowRunTable, COLUMNS.workspaceId)} NOT NULL`,
+    `${COLUMN(workflowRunTable, COLUMNS.status)} NOT NULL`,
+  ],
+  workflowStepExecutions: [
+    `${COLUMN(workflowStepExecutionTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(workflowStepExecutionTable, COLUMNS.runId)} NOT NULL`,
+    `${COLUMN(workflowStepExecutionTable, COLUMNS.attempt)} NOT NULL`,
+  ],
+  workflowAuditEvents: [
+    `${COLUMN(workflowAuditEventTable, COLUMNS.id)} PRIMARY KEY`,
+    `${COLUMN(workflowAuditEventTable, COLUMNS.runId)} NOT NULL`,
+    `${COLUMN(workflowAuditEventTable, COLUMNS.workspaceId)} NOT NULL`,
+  ],
   crmSyncs: [
     `${COLUMN(crmSyncTable, COLUMNS.id)} PRIMARY KEY`,
     `${COLUMN(crmSyncTable, COLUMNS.workspaceId)} NOT NULL`,
@@ -1169,6 +1200,35 @@ export function createTableSql(
     `     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),`,
     `     deleted_at TIMESTAMPTZ)`,
     `;`,
+    `CREATE INDEX IF NOT EXISTS idx_${table}_deleted ON "${table}"("deleted_at") WHERE "deleted_at" IS NULL;`,
+  ].join("\n");
+}
+
+/** SQLite-safe DDL for workflow v21 tables; older schema generation stays unchanged. */
+function createWorkflowTableSql(table: string, columns: readonly string[], constraints: string): string {
+  const definitions = columns
+    .filter((column) => !["created_at", "updated_at", "deleted_at"].includes(column))
+    .map((column) => {
+      const type = ["version", "workflow_version", "attempt"].includes(column) ? "INTEGER" : "TEXT";
+      const nullable = table === workflowRunTable
+        ? column === "current_node_id"
+        : table === workflowStepExecutionTable
+          ? ["input", "output", "error", "started_at", "completed_at"].includes(column)
+          : table === workflowAuditEventTable
+            ? ["node_id", "attempt", "detail"].includes(column)
+            : false;
+      return `  "${column}" ${type}${nullable ? "" : " NOT NULL"}`;
+    });
+  definitions.push(
+    "  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+    "  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+    "  deleted_at TEXT",
+  );
+  const constraintsList = constraints.split("\n").map((line) => `  ${line}`);
+  return [
+    `CREATE TABLE IF NOT EXISTS "${table}" (`,
+    [...definitions, ...constraintsList].join(",\n"),
+    ");",
     `CREATE INDEX IF NOT EXISTS idx_${table}_deleted ON "${table}"("deleted_at") WHERE "deleted_at" IS NULL;`,
   ].join("\n");
 }
@@ -2268,7 +2328,53 @@ ${COLUMN(crmSyncEventTable, COLUMNS.crmSyncId)} REFERENCES "${crmSyncTable}"("${
 ${COLUMN(crmSyncEventTable, COLUMNS.actorUserId)} REFERENCES "${userTable}"("${COLUMNS.id}") ON DELETE CASCADE,
 ${COLUMN(crmSyncEventTable, COLUMNS.kind)} CHECK (${COLUMN(crmSyncEventTable, COLUMNS.kind)} IN ('prepared','approved','rejected','cancelled','executed','failed'))`,
   ),
-].join("\n\n");
+  createWorkflowTableSql(
+    workflowDefinitionTable,
+    ["id", "workspace_id", "version", "name", "definition", "created_by"],
+    `PRIMARY KEY("workspace_id", "id", "version")
+FOREIGN KEY("workspace_id") REFERENCES "workspaces"("id") ON DELETE CASCADE
+FOREIGN KEY("created_by") REFERENCES "users"("id") ON DELETE CASCADE
+CHECK ("version" > 0)
+CHECK (length("name") > 0)`,
+  ),
+  createWorkflowTableSql(
+    workflowRunTable,
+    ["id", "workspace_id", "workflow_id", "workflow_version", "status", "current_node_id", "created_by"],
+    `PRIMARY KEY("id")
+UNIQUE("workspace_id", "id")
+FOREIGN KEY("workspace_id") REFERENCES "workspaces"("id") ON DELETE CASCADE
+FOREIGN KEY("created_by") REFERENCES "users"("id") ON DELETE CASCADE
+FOREIGN KEY("workspace_id", "workflow_id", "workflow_version") REFERENCES "workflow_definitions"("workspace_id", "id", "version") ON DELETE RESTRICT
+CHECK ("status" IN ('pending','running','paused','waiting','failed','completed','stopped'))`,
+  ),
+  createWorkflowTableSql(
+    workflowStepExecutionTable,
+    ["id", "workspace_id", "run_id", "workflow_id", "workflow_version", "node_id", "attempt", "status", "input", "output", "error", "started_at", "completed_at"],
+    `PRIMARY KEY("id")
+UNIQUE("workspace_id", "run_id", "node_id", "attempt")
+FOREIGN KEY("workspace_id") REFERENCES "workspaces"("id") ON DELETE CASCADE
+FOREIGN KEY("workspace_id", "run_id") REFERENCES "workflow_runs"("workspace_id", "id") ON DELETE CASCADE
+FOREIGN KEY("workspace_id", "workflow_id", "workflow_version") REFERENCES "workflow_definitions"("workspace_id", "id", "version") ON DELETE RESTRICT
+CHECK (length("node_id") > 0)
+CHECK ("attempt" > 0)
+CHECK ("status" IN ('pending','running','succeeded','failed','waiting','paused'))`,
+  ),
+  createWorkflowTableSql(
+    workflowAuditEventTable,
+    ["id", "workspace_id", "run_id", "actor_user_id", "kind", "node_id", "attempt", "detail"],
+    `PRIMARY KEY("id")
+FOREIGN KEY("workspace_id") REFERENCES "workspaces"("id") ON DELETE CASCADE
+FOREIGN KEY("workspace_id", "run_id") REFERENCES "workflow_runs"("workspace_id", "id") ON DELETE CASCADE
+FOREIGN KEY("actor_user_id") REFERENCES "users"("id") ON DELETE CASCADE
+CHECK ("attempt" IS NULL OR "attempt" > 0)
+CHECK ("kind" IN ('started','step_started','step_succeeded','step_failed','paused','resumed','waiting','retried','completed','stopped','failed'))`,
+  ),
+ ].join("\n\n") + `
+CREATE INDEX IF NOT EXISTS idx_workflow_definitions_workspace ON workflow_definitions(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_workspace ON workflow_runs(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_workspace_status ON workflow_runs(workspace_id, status);
+CREATE INDEX IF NOT EXISTS idx_workflow_step_executions_run_node_attempt ON workflow_step_executions(run_id, node_id, attempt);
+CREATE INDEX IF NOT EXISTS idx_workflow_audit_events_run_created ON workflow_audit_events(run_id, created_at, id);`;
 
 /** Normalize a workspace slug from a display name. */
 export function slugify(name: string): string {
